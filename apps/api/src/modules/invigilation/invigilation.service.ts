@@ -1,0 +1,203 @@
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ExamInvigilator, ExamSessionStatus, Prisma } from '@exam-sync/db';
+import { PrismaService } from '../../common/prisma/prisma.service';
+import { AuditHookService } from '../../common/audit/audit-hook.service';
+import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
+import {
+  cursorFindManyArgs,
+  PaginatedResult,
+  resolveLimit,
+  toPaginatedResult,
+} from '../../common/pagination/paginate';
+import { ExamSessionsService } from '../exam-session';
+import { FacultyService } from '../faculty';
+import { ConflictEngineService } from '../conflict-engine';
+import { CreateInvigilatorDto } from './dto/create-invigilator.dto';
+
+export interface ListDutiesParams {
+  cursor?: string;
+  limit?: number;
+}
+
+/**
+ * Owns `exam_invigilators` (ARCHITECTURE.md §W, IMPLEMENTATION_PLAN.md
+ * Phase 16: "exam_invigilators, overlap prevention").
+ *
+ * BR-030: a faculty member may invigilate any room regardless of subject
+ * taught — no subject/batch authorization check exists here, unlike quiz
+ * creation (BR-010). The only constraint is BR-020/BR-031 (no faculty
+ * double-booked across overlapping session time windows), enforced by
+ * `ConflictEngineService.checkInvigilatorAssignment`.
+ *
+ * No session-status precondition is documented for this action (unlike
+ * room allocation's `ASSIGNING_STUDENTS` gate or seating's own status
+ * chain) — ARCHITECTURE.md's Exam Session state machine table (§AD-2) has
+ * no "assign invigilator" row at all, so invigilator assignment is
+ * modeled here as an action orthogonal to the session's own state
+ * machine, not one of its transitions. The one guard actually applied —
+ * rejecting a CANCELLED session — is a disclosed, narrow addition: nothing
+ * documents it explicitly, but assigning a real person's time to a
+ * session that can never run is a plain waste with no legitimate use
+ * case, and EC-024/§AC's "cascades logically" language for cancelled
+ * sessions treats their child records (including invigilators) as
+ * already-historical, not as a target for new writes.
+ */
+@Injectable()
+export class InvigilationService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditHook: AuditHookService,
+    private readonly examSessionsService: ExamSessionsService,
+    private readonly facultyService: FacultyService,
+    private readonly conflictEngine: ConflictEngineService,
+  ) {}
+
+  /**
+   * `POST /exam-sessions/{id}/invigilators` (ADMIN). The target `room_id`
+   * must actually be allocated to this session (`exam_session_rooms`) —
+   * undocumented as an explicit BR, but the only sensible reading of
+   * "invigilator for a room within a session" (FR-035): a room the
+   * session never uses cannot meaningfully have an invigilator for it.
+   *
+   * Concurrency (BR-020/BR-031, EC-014 "checked at insert time, not just
+   * initially"): the target FACULTY row is locked (`SELECT ... FOR
+   * UPDATE`) before the conflict check runs, inside the same transaction
+   * as the insert — mirrors `RoomAllocationService.allocate`'s "lock
+   * first, check second, write third" structure (ADR-003 mechanism (a)),
+   * with the faculty row standing in for the room row as the thing being
+   * serialized on. Locking the faculty row itself (rather than their
+   * EXISTING `exam_invigilators` rows, as ARCHITECTURE.md §W's prose
+   * literally suggests) is a deliberate refinement: a faculty member's
+   * FIRST-ever invigilation assignment has no existing row to lock, so
+   * two concurrent first-assignments for the same faculty would both pass
+   * an empty-row-set lock and race straight through — locking the parent
+   * `faculty` row closes that gap regardless of how many prior
+   * assignments exist.
+   */
+  async assign(
+    examSessionId: string,
+    dto: CreateInvigilatorDto,
+    actor: AuthenticatedUser,
+  ): Promise<ExamInvigilator> {
+    const session = await this.examSessionsService.findById(examSessionId);
+    if (session.status === ExamSessionStatus.CANCELLED) {
+      throw new ConflictException('This exam session is CANCELLED and cannot receive new invigilator assignments.');
+    }
+
+    await this.facultyService.findById(dto.faculty_id);
+
+    const allocatedRoom = await this.prisma.examSessionRoom.findUnique({
+      where: { roomId_examSessionId: { roomId: dto.room_id, examSessionId } },
+    });
+    if (!allocatedRoom) {
+      throw new NotFoundException('This room is not allocated to this exam session.');
+    }
+
+    const created = await this.prisma
+      .$transaction(async (tx) => {
+        const lockedFaculty = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`SELECT id FROM faculty WHERE id = ${dto.faculty_id}::uuid FOR UPDATE`,
+        );
+        if (lockedFaculty.length === 0) {
+          throw new NotFoundException();
+        }
+
+        const existing = await tx.examInvigilator.findUnique({
+          where: {
+            examSessionId_roomId_facultyId: {
+              examSessionId,
+              roomId: dto.room_id,
+              facultyId: dto.faculty_id,
+            },
+          },
+        });
+        if (existing) {
+          throw new ConflictException('This faculty is already assigned as an invigilator for this room and session.');
+        }
+
+        const conflictResult = await this.conflictEngine.checkInvigilatorAssignment(
+          {
+            facultyId: dto.faculty_id,
+            examSessionId,
+            roomId: dto.room_id,
+            sessionDate: session.sessionDate,
+            startTime: session.startTime,
+            endTime: session.endTime,
+          },
+          tx,
+        );
+        if (conflictResult.hard.length > 0) {
+          throw new ConflictException({
+            message: 'This faculty is already invigilating an overlapping session (BR-031).',
+            details: conflictResult.hard,
+          });
+        }
+
+        const invigilator = await tx.examInvigilator.create({
+          data: {
+            examSessionId,
+            roomId: dto.room_id,
+            facultyId: dto.faculty_id,
+            role: dto.role,
+          },
+        });
+
+        await this.auditHook.record(
+          {
+            actor,
+            action: 'CREATE',
+            entityType: 'ExamInvigilator',
+            entityId: invigilator.id,
+            newValue: invigilator,
+          },
+          tx,
+        );
+
+        return invigilator;
+      })
+      .catch((err) => this.mapUniqueViolation(err));
+
+    return created;
+  }
+
+  /**
+   * `GET /faculty/{id}/invigilation-duties` — self (the faculty's own
+   * duties) or ADMIN. 404, not 403, for anyone else — same IDOR-safe
+   * posture as every other resource-level check in this codebase
+   * (`QuizzesService.getApprovalHistory`'s own doc comment describes the
+   * identical pattern).
+   */
+  async listDuties(
+    facultyId: string,
+    actor: AuthenticatedUser,
+    params: ListDutiesParams,
+  ): Promise<PaginatedResult<ExamInvigilator>> {
+    const isAdmin = actor.roles.includes(ROLE.ADMIN);
+    if (!isAdmin) {
+      const actingFaculty = await this.facultyService.findByUserId(actor.id);
+      if (!actingFaculty || actingFaculty.id !== facultyId) {
+        throw new NotFoundException();
+      }
+    } else {
+      // Still validate the faculty exists for an ADMIN caller, so a
+      // nonexistent id 404s rather than silently returning an empty page.
+      await this.facultyService.findById(facultyId);
+    }
+
+    const limit = resolveLimit(params.limit);
+    const rows = await this.prisma.examInvigilator.findMany({
+      where: { facultyId },
+      orderBy: { assignedAt: 'desc' },
+      ...cursorFindManyArgs(params.cursor, limit),
+    });
+    return toPaginatedResult(rows, limit);
+  }
+
+  /** Maps a concurrent unique-constraint race on `(exam_session_id, room_id, faculty_id)` to a clean 409 — the app-level `existing` check above is the primary UX path; this is the ADR-003-style backstop for the tiny window between that read and the insert. */
+  private mapUniqueViolation(err: unknown): never {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      throw new ConflictException('This faculty is already assigned as an invigilator for this room and session.');
+    }
+    throw err;
+  }
+}

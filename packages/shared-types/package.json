@@ -1,0 +1,15 @@
+{
+  "name": "@exam-sync/shared-types",
+  "private": true,
+  "version": "0.0.0",
+  "description": "DTOs shared between apps/api and apps/web (ARCHITECTURE.md §AW). Empty in Phase 0 — populated as each domain module ships.",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "echo \"@exam-sync/shared-types: no tests yet (Phase 0 — no types defined)\" && exit 0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  }
+}

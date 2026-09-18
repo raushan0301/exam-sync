@@ -1,0 +1,20 @@
+{
+  "name": "@exam-sync/domain-logic",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Pure, framework-independent domain functions: state machines, constraint engine, allocation algorithm (ARCHITECTURE.md §AW, §T/§U). Seating engine (generation + validation) lands in Phase 13.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.5.4"
+  }
+}

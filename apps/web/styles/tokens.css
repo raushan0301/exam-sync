@@ -1,0 +1,16 @@
+/**
+ * Tokens that Tailwind's theme system cannot express directly.
+ * Named z-index layers are duplicated here as CSS custom properties (in
+ * addition to the `zIndex` entries in tailwind.config.ts) so non-utility
+ * contexts (e.g. Radix `Portal`-rendered elements, third-party overlays)
+ * can reference the same named scale via `var(--z-modal)` etc.
+ */
+:root {
+  --z-dropdown: 1000;
+  --z-sticky: 1100;
+  --z-drawer: 1200;
+  --z-modal-backdrop: 1300;
+  --z-modal: 1310;
+  --z-toast: 1400;
+  --z-tooltip: 1500;
+}

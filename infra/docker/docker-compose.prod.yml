@@ -1,0 +1,126 @@
+# Production topology for Exam-Sync (Phase 24).
+#
+# Uses official Postgres/Redis images with persistent volumes — this is NOT
+# a substitute for a managed cloud database, it is the honest "you can run
+# this yourself on a VM/box you control" topology. Every secret/URL comes
+# from the environment (.env.production, copied from .env.production.example
+# in this same directory) — nothing security-sensitive has a default here.
+#
+# Usage:
+#   cp infra/docker/.env.production.example infra/docker/.env.production
+#   # fill in real values, then:
+#   docker compose -f infra/docker/docker-compose.prod.yml --env-file infra/docker/.env.production up -d
+#   docker compose -f infra/docker/docker-compose.prod.yml --env-file infra/docker/.env.production run --rm migrate
+#
+# `name:` below is REQUIRED, not cosmetic: Compose derives its default
+# project name from the containing directory, and `docker-compose.dev.yml`
+# lives in this SAME directory — without an explicit distinct name, both
+# files resolve to the same project ("docker") and share one container
+# namespace. Running this prod file with no override was confirmed to
+# silently STOP AND REPLACE the real, already-running dev `docker-redis-1`
+# container (recreated under the same name, on a fresh empty volume) during
+# this phase's own smoke test. The dev Redis instance holds only transient
+# BullMQ queue/cache state (ADR-009 — never a source of truth), so no
+# durable data was lost, but the collision itself is a real bug, now fixed.
+name: exam-sync-prod
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - exam_sync_postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - exam_sync_redis_prod_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot job: `docker compose run --rm migrate` before starting/updating
+  # the api service. Deliberately a separate service, not part of api's
+  # entrypoint — a container that fails to become "ready" because a
+  # migration is mid-flight is a worse failure mode under an orchestrator's
+  # restart policy than a migration step that runs to completion (or fails
+  # loudly) before anything tries to serve traffic.
+  migrate:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+      target: build
+    working_dir: /repo
+    entrypoint: ['npx', 'prisma', 'migrate', 'deploy', '--schema', 'packages/db/prisma/schema.prisma']
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Liveness-style check reachable from inside the container without
+      # extra tooling (no curl in the slim runtime image) — Node's built-in
+      # http module against the pure liveness route (Phase 24 addition).
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "require('http').get('http://127.0.0.1:3000/health/live', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  web:
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+    ports:
+      - '3001:3001'
+    depends_on:
+      - api
+
+volumes:
+  exam_sync_postgres_prod_data:
+  exam_sync_redis_prod_data:

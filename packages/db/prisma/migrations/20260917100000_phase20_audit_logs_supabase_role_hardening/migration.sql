@@ -1,0 +1,36 @@
+-- Phase 20 follow-up / Supabase-specific hardening.
+--
+-- The original Phase 20 migration (20260915180108_phase20_audit_logs)
+-- revoked DELETE on "audit_logs" from CURRENT_USER at migration-apply time
+-- (the application's own connection role — "exam_sync" locally, "postgres"
+-- on Supabase). That correctly hardened the application's own role, but a
+-- Supabase-hosted database also auto-provisions three additional built-in
+-- roles — "anon", "authenticated", "service_role" — with broad default
+-- grants on public-schema tables, including DELETE on "audit_logs". Those
+-- roles are outside the scope CURRENT_USER could reach at apply time, so
+-- the append-only guarantee did not cover access paths going through them
+-- (e.g. Supabase's PostgREST API or any client using the anon/service-role
+-- keys). Confirmed present via a real Supabase Session Pooler connection
+-- (information_schema.role_table_grants showed DELETE granted to all
+-- three) and confirmed fixed by applying this same REVOKE directly against
+-- that database before this migration file was written.
+--
+-- UPDATE is deliberately NOT revoked here, for the same reason it is left
+-- granted in the original Phase 20 migration: the role-agnostic
+-- "audit_logs_no_update" BEFORE UPDATE trigger (created in
+-- 20260915180108_phase20_audit_logs) already unconditionally rejects any
+-- UPDATE statement against this table regardless of which role issues it,
+-- so anon/authenticated/service_role's UPDATE grant is already inert.
+-- Revoking UPDATE would not add protection and risks the same FOR KEY
+-- SHARE row-lock side effect documented in the original migration.
+--
+-- SELECT and INSERT are intentionally left untouched on these three roles
+-- — both are legitimately required (INSERT for the application's own
+-- audit-write path where it runs through these roles, SELECT for
+-- Supabase-side inspection / the admin audit-log read endpoint).
+--
+-- This migration is idempotent to re-run: PostgreSQL's REVOKE is a no-op
+-- (with a NOTICE, not an error) if the privilege is already absent — safe
+-- to apply to an environment where this fix was manually pre-applied (as
+-- it was here) as well as to a fresh environment that never had it.
+REVOKE DELETE ON "audit_logs" FROM anon, authenticated, service_role;

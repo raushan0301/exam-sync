@@ -1,0 +1,1592 @@
+// Exam-Sync — Prisma schema.
+//
+// Phase 0 established this file with zero models ("initialize migration
+// tooling; no domain tables yet"). Phase 1 (IMPLEMENTATION_PLAN.md) adds the
+// authentication/RBAC tables: users, roles, permissions, user_roles,
+// role_permissions (per ARCHITECTURE.md §AC), plus refresh_tokens (DB-backed
+// per docs/adr/009-caching-strategy.md — Redis is never a source of truth,
+// so refresh-token revocation lives in Postgres, not Redis, despite
+// ARCHITECTURE.md §AG's earlier casual mention of a Redis revocation list;
+// this ADR is the architecture review's authoritative resolution) and
+// auth_audit_events (a Phase-1-scoped authentication audit trail — NOT the
+// general-purpose audit_logs table, which is explicitly Phase 20's scope
+// per IMPLEMENTATION_PLAN.md and covers all domain state changes, not just
+// auth events).
+//
+// ============================================================================
+// RANGE-PARTITIONING-BY-ACADEMIC_YEAR CONVENTION (ADR-002)
+// Established and documented here per IMPLEMENTATION_PLAN.md Phase 2's
+// explicit instruction. No table created in Phase 2 requires partitioning —
+// departments/programs/batches/subjects are catalog data with bounded,
+// slow-growing row counts (hundreds to low thousands of rows even at
+// 100K+ students), not the high-volume transactional tables ADR-002 is
+// about. This section exists purely so the FOUR tables that DO need it are
+// built correctly from their first migration, not retrofitted later:
+//
+//   Table                 | Created in | Partition key
+//   ----------------------|------------|------------------------------------
+//   attendance             | Phase 17   | academic_year (via the exam
+//                           |            | session's academic_year, since
+//                           |            | attendance rows don't carry their
+//                           |            | own academic_year column directly
+//                           |            | — derive/denormalize it at
+//                           |            | creation time)
+//   notifications           | Phase 15   | academic_year is not naturally on
+//                           |            | this table either — partition by
+//                           |            | created_at (range) instead, since
+//                           |            | notifications are retention-bound
+//                           |            | by time, not by academic term
+//   seating_assignments     | Phase 13   | academic_year, via the owning
+//                           |            | exam_session
+//   audit_logs               | Phase 20   | academic_year where the audited
+//                           |            | entity has one, else created_at
+//
+// IMPORTANT — Prisma cannot declare a PostgreSQL native partitioned table
+// (`PARTITION BY RANGE (...)`) in schema.prisma; that DDL must be written by
+// hand as raw SQL inside that table's own migration (a Prisma-generated
+// `CREATE TABLE` followed by hand-edited `PARTITION BY RANGE` + per-partition
+// `CREATE TABLE ... PARTITION OF ...` statements, before the migration is
+// applied). Each of the four phases above must edit its generated migration
+// file accordingly — this is not automatic and must not be skipped.
+//
+// None of Phase 2's four tables (Department, Program, Batch, Subject) apply
+// this convention — flagged explicitly so a future reader doesn't wonder why
+// they're plain, unpartitioned tables.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A person who can authenticate. Identity is deliberately separate from
+/// domain identity (Student, Faculty rows land in Phases 3/4) — Phase 1 only
+/// needs to know who can log in and what roles they hold.
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  roles               UserRole[]
+  refreshTokens       RefreshToken[]
+  student             Student?
+  faculty             Faculty?
+  quizApprovalActions QuizApprovalHistory[]
+  createdExamSessions ExamSession[]
+  resolvedIncidents   Incident[]        @relation("IncidentResolvedBy")
+  disclosedIncidents  Incident[]        @relation("IncidentDisclosedBy")
+  incidentActions     IncidentHistory[]
+  requestedReportJobs ReportJob[]
+  auditLogEntries     AuditLog[]
+
+  @@map("users")
+}
+
+/// Roles are data-driven, not a hardcoded enum, so DEPARTMENT_ADMIN,
+/// EXAM_COORDINATOR, SUPER_ADMIN etc. (PRD.md §5 "future roles") can be
+/// added later by inserting a row + role_permissions, with zero schema or
+/// authorization-code changes (ARCHITECTURE_REVIEW.md task requirement:
+/// "support adding future roles ... without redesigning the authorization
+/// system").
+model Role {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users       UserRole[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+/// resource:action granularity (ARCHITECTURE.md §AC comment on the
+/// `permissions` table) — e.g. "quiz:create", "audit_log:read". Phase 1
+/// seeds only the permissions needed to demonstrate the model end-to-end;
+/// most domain permissions are added by the phase that owns that domain.
+model Permission {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model UserRole {
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+/// Refresh tokens are stored as a SHA-256 hash, never the raw token
+/// (mirrors password-hash discipline — a DB leak must not yield usable
+/// tokens). Rotation: consuming a token sets consumedAt and links to its
+/// replacement; reuse of an already-consumed token is a theft signal and
+/// revokes the whole chain (see auth.service.ts).
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  tokenHash    String    @unique @map("token_hash")
+  expiresAt    DateTime  @map("expires_at")
+  consumedAt   DateTime? @map("consumed_at")
+  revokedAt    DateTime? @map("revoked_at")
+  replacedById String?   @unique @map("replaced_by_id") @db.Uuid
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+/// Phase-1-scoped authentication audit trail (login success/failure,
+/// logout, refresh, refresh-reuse-detected). Distinct from the general
+/// audit_logs table, which is Phase 20's scope (BUSINESS_RULES.md BR-048)
+/// and covers all domain state changes. userId is nullable because a
+/// failed login against an unknown email has no user to attach to; the
+/// attempted email is still recorded (server-side only, never returned in
+/// any API response) so brute-force/enumeration patterns are visible to
+/// operators without leaking anything to the client.
+model AuthAuditEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  eventType String   @map("event_type")
+  userId    String?  @map("user_id") @db.Uuid
+  email     String?
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([eventType, createdAt])
+  @@map("auth_audit_events")
+}
+
+// ============================================================================
+// PHASE 2 — ACADEMIC STRUCTURE (IMPLEMENTATION_PLAN.md, ARCHITECTURE.md §AC)
+// Department -> Program -> Batch, and Department -> Subject, exactly per
+// DOMAIN_MODEL.md §2/§6. Nothing downstream of these (students, faculty,
+// enrollment, etc.) exists yet — those land in Phases 3-5.
+// ============================================================================
+
+/// Shared active/inactive status for departments, programs, and batches
+/// (BUSINESS_RULES.md BR-003: deactivation blocks new downstream references
+/// but never deletes/hides history). Subjects use a boolean `isActive`
+/// instead, per ARCHITECTURE.md §AC's own literal schema — that asymmetry
+/// is preserved deliberately, not normalized away.
+enum AcademicStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Department {
+  id        String         @id @default(uuid()) @db.Uuid
+  name      String
+  code      String         @unique
+  status    AcademicStatus @default(ACTIVE)
+  metadata  Json?
+  createdAt DateTime       @default(now()) @map("created_at")
+  updatedAt DateTime       @updatedAt @map("updated_at")
+
+  programs Program[]
+  subjects Subject[]
+  faculty  Faculty[]
+
+  @@map("departments")
+}
+
+model Program {
+  id           String         @id @default(uuid()) @db.Uuid
+  departmentId String         @map("department_id") @db.Uuid
+  name         String
+  code         String         @unique
+  status       AcademicStatus @default(ACTIVE)
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+
+  department Department @relation(fields: [departmentId], references: [id])
+  batches    Batch[]
+  subjects   Subject[]
+  students   Student[]
+
+  @@index([departmentId])
+  @@map("programs")
+}
+
+model Batch {
+  id        String         @id @default(uuid()) @db.Uuid
+  programId String         @map("program_id") @db.Uuid
+  year      Int
+  section   String
+  status    AcademicStatus @default(ACTIVE)
+  createdAt DateTime       @default(now()) @map("created_at")
+  updatedAt DateTime       @updatedAt @map("updated_at")
+
+  program     Program                         @relation(fields: [programId], references: [id])
+  students    Student[]
+  assignments FacultySubjectBatchAssignment[]
+  enrollments StudentSubjectEnrollment[]
+  quizBatches QuizBatch[]
+
+  @@unique([programId, year, section])
+  @@index([programId])
+  @@map("batches")
+}
+
+/// program_id is nullable: a subject belongs to an owning department, but
+/// is not necessarily tied to one specific program's curriculum (e.g. a
+/// service subject like "Engineering Mathematics" taught across several
+/// programs) — matches ARCHITECTURE.md §AC's literal
+/// `subjects(... program_id FK NULL ...)` and DOMAIN_MODEL.md's note that
+/// Subject/Batch/Faculty teaching relationships are resolved by the
+/// faculty_subject_batch_assignment junction (Phase 5), never by a subject
+/// having a single fixed program.
+model Subject {
+  id           String   @id @default(uuid()) @db.Uuid
+  departmentId String   @map("department_id") @db.Uuid
+  programId    String?  @map("program_id") @db.Uuid
+  code         String   @unique
+  name         String
+  credits      Int?
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  department  Department                      @relation(fields: [departmentId], references: [id])
+  program     Program?                        @relation(fields: [programId], references: [id])
+  assignments FacultySubjectBatchAssignment[]
+  enrollments StudentSubjectEnrollment[]
+  quizzes     Quiz[]
+
+  @@index([departmentId])
+  @@index([programId])
+  @@map("subjects")
+}
+
+// ============================================================================
+// PHASE 3 — STUDENT MANAGEMENT (IMPLEMENTATION_PLAN.md)
+// ============================================================================
+
+/// Matches ARCHITECTURE.md §AC's literal `students(id, user_id FK UNIQUE,
+/// program_id, batch_id, roll_number UNIQUE, status, created_at,
+/// updated_at)` plus one deliberate, disclosed addition: `name`. Neither
+/// `students` nor `users` has a name field anywhere in the documented
+/// schema — this is a data-completeness gap, not a business rule, so it's
+/// added here rather than silently worked around (see this phase's
+/// pre-implementation plan).
+///
+/// userId is a required, unique 1:1 link to a login-capable User (Phase 1).
+/// Every Student row has exactly one User; POST /students creates both
+/// atomically (see students.service.ts) since no self-registration or
+/// invite flow exists yet.
+model Student {
+  id         String         @id @default(uuid()) @db.Uuid
+  userId     String         @unique @map("user_id") @db.Uuid
+  name       String
+  programId  String         @map("program_id") @db.Uuid
+  batchId    String         @map("batch_id") @db.Uuid
+  rollNumber String         @unique @map("roll_number")
+  status     AcademicStatus @default(ACTIVE)
+  createdAt  DateTime       @default(now()) @map("created_at")
+  updatedAt  DateTime       @updatedAt @map("updated_at")
+
+  user               User                       @relation(fields: [userId], references: [id])
+  program            Program                    @relation(fields: [programId], references: [id])
+  batch              Batch                      @relation(fields: [batchId], references: [id])
+  enrollments        StudentSubjectEnrollment[]
+  quizAssignments    QuizStudentAssignment[]
+  seatingAssignments SeatingAssignment[]
+  incidents          Incident[]
+
+  @@index([programId])
+  @@index([batchId])
+  @@map("students")
+}
+
+/// Generic, resource-agnostic bulk-import job record (IMPLEMENTATION_PLAN.md
+/// Phase 3: "async job scaffold — actual queue wiring can be minimal/
+/// synchronous here, upgraded in Phase 15"). Deliberately not students-
+/// specific (see `resourceType`) so faculty/enrollment/other future bulk
+/// imports reuse this same table and the common/import-jobs/ service rather
+/// than each phase inventing its own. Processing is currently synchronous
+/// (the whole CSV is processed within the POST /students/bulk-import
+/// request before responding), but the row shape and the 202+job_id+poll
+/// API contract already match what Phase 15's real async queue will produce,
+/// so callers never need to change when that swap happens.
+model ImportJob {
+  id              String   @id @default(uuid()) @db.Uuid
+  resourceType    String   @map("resource_type")
+  status          String   @default("COMPLETED") // COMPLETED | FAILED — no PENDING/RUNNING yet since processing is synchronous
+  totalRows       Int      @map("total_rows")
+  successCount    Int      @map("success_count")
+  failureCount    Int      @map("failure_count")
+  results         Json // per-row: [{row, status: "SUCCESS"|"FAILURE", id?, error?}]
+  createdByUserId String   @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([resourceType, createdAt])
+  @@map("import_jobs")
+}
+
+// ============================================================================
+// PHASE 4 — FACULTY MANAGEMENT (IMPLEMENTATION_PLAN.md: "mirrors Phase 3
+// patterns for faculty")
+// ============================================================================
+
+/// Matches ARCHITECTURE.md §AC's literal `faculty(id, user_id FK UNIQUE,
+/// department_id FK, employee_code UNIQUE, status, created_at, updated_at)`
+/// plus the same disclosed `name` addition made for Student in Phase 3 (no
+/// name field exists anywhere in the documented schema for either entity).
+///
+/// Structurally mirrors Student: a required 1:1 link to a login-capable
+/// User (provisioned atomically, same as students.service.ts), a single
+/// owning Department (not program/batch — faculty aren't tied to a batch
+/// the way students are; their subject/batch teaching relationships are
+/// resolved by faculty_subject_batch_assignment in Phase 5, never a direct
+/// FK here), and the same AcademicStatus deactivation pattern.
+model Faculty {
+  id           String         @id @default(uuid()) @db.Uuid
+  userId       String         @unique @map("user_id") @db.Uuid
+  name         String
+  departmentId String         @map("department_id") @db.Uuid
+  employeeCode String         @unique @map("employee_code")
+  status       AcademicStatus @default(ACTIVE)
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+
+  user        User                            @relation(fields: [userId], references: [id])
+  department  Department                      @relation(fields: [departmentId], references: [id])
+  assignments FacultySubjectBatchAssignment[]
+  quizzes     Quiz[]
+  invigilations ExamInvigilator[]
+  attendanceMarked  Attendance[]
+  attendanceChanges AttendanceHistory[]
+  reportedIncidents Incident[]
+
+  @@index([departmentId])
+  @@map("faculty")
+}
+
+// ============================================================================
+// PHASE 5 — SUBJECT/BATCH/ENROLLMENT MAPPING (IMPLEMENTATION_PLAN.md)
+//
+// "the core many-to-many junctions" — DOMAIN_MODEL.md §"Why not Subject ->
+// Faculty or Subject -> Batch direct FKs": both relationships are genuinely
+// M:N, so Subject/Batch stay pure catalog entities with zero teaching or
+// enrollment knowledge embedded. These two tables are the actual source of
+// truth for "who teaches what to whom" and "who is eligible for what quiz."
+// ============================================================================
+
+enum FacultyAssignmentRole {
+  PRIMARY_INSTRUCTOR
+  CO_INSTRUCTOR
+}
+
+/// Matches ARCHITECTURE.md §AC's literal `faculty_subject_batch_assignment(
+/// id, faculty_id, subject_id, batch_id, academic_year, semester, role,
+/// UNIQUE(faculty_id, subject_id, batch_id, academic_year, semester))`
+/// exactly (BR-009, 🔒 DB-enforced below).
+///
+/// `endedAt` is the soft-delete field for `DELETE /faculty-assignments/{id}`
+/// (API_CONTRACT.md: "soft — sets an end date, does not hard-delete if
+/// historical quizzes reference it") — the row is never physically removed;
+/// an assignment is "active" iff `endedAt IS NULL`. Deliberately NOT
+/// excluded from the unique constraint (no partial index): BR-009 states a
+/// global uniqueness rule with no stated exception for ended rows, so
+/// re-creating the exact same (faculty, subject, batch, year, semester)
+/// tuple after ending it is blocked by design, not an oversight — see this
+/// phase's pre-implementation notes for the reasoning and the flagged
+/// product-policy question if that turns out to be too strict in practice.
+model FacultySubjectBatchAssignment {
+  id           String                @id @default(uuid()) @db.Uuid
+  facultyId    String                @map("faculty_id") @db.Uuid
+  subjectId    String                @map("subject_id") @db.Uuid
+  batchId      String                @map("batch_id") @db.Uuid
+  academicYear String                @map("academic_year")
+  semester     Int
+  role         FacultyAssignmentRole
+  createdAt    DateTime              @default(now()) @map("created_at")
+  updatedAt    DateTime              @updatedAt @map("updated_at")
+  endedAt      DateTime?             @map("ended_at")
+
+  faculty Faculty @relation(fields: [facultyId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id])
+  batch   Batch   @relation(fields: [batchId], references: [id])
+
+  @@unique([facultyId, subjectId, batchId, academicYear, semester])
+  @@index([facultyId])
+  @@index([subjectId])
+  @@index([batchId])
+  @@map("faculty_subject_batch_assignment")
+}
+
+enum EnrollmentStatus {
+  ENROLLED
+  DROPPED
+  COMPLETED
+  INACTIVE
+  WITHDRAWN
+}
+
+/// Matches ARCHITECTURE.md §AC's literal `student_subject_enrollment(id,
+/// student_id, subject_id, batch_id, academic_year, semester, status,
+/// enrolled_at, dropped_at NULL, UNIQUE(student_id, subject_id,
+/// academic_year, semester))` exactly (BR-004).
+///
+/// `batchId` is deliberately NOT validated against the student's *current*
+/// `Student.batchId` at creation or any other time — EDGE_CASES.md EC-017
+/// ("Student changes batch") establishes this is an independent, point-in-
+/// time snapshot of the batch context the enrollment was made under, which
+/// can legitimately diverge from the student's batch later. This is the
+/// opposite call from Phase 3's Student.programId/batchId consistency
+/// check (that was about one entity's own two FK fields staying internally
+/// consistent; this is about not forcing an enrollment record to track a
+/// different, mutable entity's current state).
+model StudentSubjectEnrollment {
+  id           String           @id @default(uuid()) @db.Uuid
+  studentId    String           @map("student_id") @db.Uuid
+  subjectId    String           @map("subject_id") @db.Uuid
+  batchId      String           @map("batch_id") @db.Uuid
+  academicYear String           @map("academic_year")
+  semester     Int
+  status       EnrollmentStatus @default(ENROLLED)
+  enrolledAt   DateTime         @default(now()) @map("enrolled_at")
+  droppedAt    DateTime?        @map("dropped_at")
+
+  student Student @relation(fields: [studentId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id])
+  batch   Batch   @relation(fields: [batchId], references: [id])
+
+  @@unique([studentId, subjectId, academicYear, semester])
+  @@index([studentId])
+  @@index([subjectId])
+  @@index([batchId])
+  @@map("student_subject_enrollment")
+}
+
+// ============================================================================
+// PHASE 6 — QUIZ MANAGEMENT (IMPLEMENTATION_PLAN.md: "quiz CRUD +
+// DRAFT/SUBMITTED lifecycle (not yet approval)")
+//
+// DB changes explicitly scoped to `quizzes, quiz_batches` only — the
+// `quiz_approval_history` table (ARCHITECTURE.md §L) is deliberately NOT
+// created here; it is Phase 7's own named DB change. This means the
+// DRAFT->SUBMITTED transition this phase performs is recorded only via the
+// generic AuditHookService (structured log), not a queryable
+// quiz_approval_history row — Phase 7 begins the real ledger from its own
+// first APPROVED/REJECTED/RESUBMITTED action onward.
+// ============================================================================
+
+/// Matches ARCHITECTURE.md §AD-2 #1's Quiz state machine. Only DRAFT and
+/// SUBMITTED are reachable via any Phase 6 code path — APPROVED/REJECTED
+/// exist in the enum now (not added later) purely so Phase 7 never needs a
+/// `ALTER TYPE ... ADD VALUE` migration under transactional constraints;
+/// no Phase 6 endpoint can produce or consume them.
+enum QuizStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+/// Matches ARCHITECTURE.md §AC's literal `quizzes(id, title, subject_id,
+/// created_by_faculty_id, duration_minutes, total_marks, question_count,
+/// instructions, quiz_type, preferred_date, preferred_time, academic_year,
+/// semester, status, version, created_at, updated_at)` exactly.
+/// `quizType` is a free-text field (schema literal: "QUIZ|MIDTERM|FINAL|..."
+/// — the "..." signals an open, not closed, set) rather than a Prisma
+/// enum, since closing it would mean inventing the exact allowed value set
+/// nowhere specified in the documentation.
+model Quiz {
+  id                 String     @id @default(uuid()) @db.Uuid
+  title              String
+  subjectId          String     @map("subject_id") @db.Uuid
+  createdByFacultyId String     @map("created_by_faculty_id") @db.Uuid
+  /// Required at creation (identifying + BR-010 authorization-scoping
+  /// fields — see this phase's design note below). Everything from here
+  /// down is nullable: PRD.md FR-016/017 and this phase's own documented
+  /// test case ("submit fails on incomplete quiz (422)") only make sense
+  /// if a DRAFT can genuinely be incomplete — a faculty starts a quiz with
+  /// the minimum needed to identify and authorize it, fills in the rest
+  /// over one or more PATCH calls, and `POST .../submit` is what actually
+  /// enforces full completeness. Requiring every field at creation (the
+  /// alternative) would make submit's completeness check permanently
+  /// unreachable dead code, contradicting the documented test.
+  durationMinutes    Int?       @map("duration_minutes")
+  totalMarks         Decimal?   @map("total_marks")
+  questionCount      Int?       @map("question_count")
+  /// Instructions stays optional even at submit time — free-text guidance
+  /// is not part of what "completeness" means here; nothing in PRD.md or
+  /// API_CONTRACT.md lists it as submit-blocking.
+  instructions       String?
+  quizType           String?    @map("quiz_type")
+  preferredDate      DateTime?  @map("preferred_date") @db.Date
+  preferredTime      DateTime?  @map("preferred_time") @db.Time
+  academicYear       String     @map("academic_year")
+  semester           Int
+  status             QuizStatus @default(DRAFT)
+  /// Optimistic lock (BR-051) — every PATCH must supply the version it
+  /// last read via `If-Match`; a mismatch is a 409, never a silent
+  /// overwrite.
+  version            Int        @default(1)
+  createdAt          DateTime   @default(now()) @map("created_at")
+  updatedAt          DateTime   @updatedAt @map("updated_at")
+
+  subject                Subject                 @relation(fields: [subjectId], references: [id])
+  createdByFaculty       Faculty                 @relation(fields: [createdByFacultyId], references: [id])
+  batches                QuizBatch[]
+  approvalHistory        QuizApprovalHistory[]
+  sessionAttachments     ExamSessionQuiz[]
+  studentAssignments     QuizStudentAssignment[]
+  examSessionRoomQuizzes ExamSessionRoomQuiz[]
+  seatingAssignments     SeatingAssignment[]
+  incidents              Incident[]
+
+  @@index([subjectId])
+  @@index([createdByFacultyId])
+  @@index([status])
+  @@map("quizzes")
+}
+
+/// Matches ARCHITECTURE.md §AC's literal `quiz_batches(quiz_id, batch_id)`
+/// M:N join — "a quiz can target multiple batches of the same subject."
+model QuizBatch {
+  quizId  String @map("quiz_id") @db.Uuid
+  batchId String @map("batch_id") @db.Uuid
+
+  quiz  Quiz  @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  batch Batch @relation(fields: [batchId], references: [id])
+
+  @@id([quizId, batchId])
+  @@index([batchId])
+  @@map("quiz_batches")
+}
+
+// ============================================================================
+// PHASE 7 — ADMIN APPROVAL (IMPLEMENTATION_PLAN.md: "approve/reject
+// workflow, approval history")
+// ============================================================================
+
+/// The full, closed action set from ARCHITECTURE.md §L's literal comment
+/// (`action TEXT, -- SUBMITTED|APPROVED|REJECTED|RESUBMITTED`) — unlike
+/// Quiz.quizType's genuinely open "..." set, this one is fully enumerated,
+/// so it is a real Prisma enum (stronger, DB-enforced) rather than free
+/// text.
+enum QuizApprovalAction {
+  SUBMITTED
+  APPROVED
+  REJECTED
+  RESUBMITTED
+}
+
+/// Matches ARCHITECTURE.md §L's literal `quiz_approval_history(id, quiz_id,
+/// action, actor_id, reason NULL, previous_status, new_status, created_at)`
+/// exactly. BR-013: append-only — this table has no update/delete path
+/// anywhere in the application (verified by
+/// quiz-approval-history.service.spec.ts's repository-layer inspection
+/// test, per IMPLEMENTATION_PLAN.md Phase 7's own instruction).
+///
+/// `actorId` is a FK to `User`, not `Faculty` or a hypothetical `Admin`
+/// table — the comment "admin or faculty" describes who can appear here,
+/// and `User` (Phase 1's single identity table spanning every role) is the
+/// only entity that can represent both uniformly without an awkward
+/// nullable dual-FK.
+///
+/// BR-012 (reason required on reject) is enforced here at the DB level via
+/// a CHECK constraint hand-added to this table's migration — Prisma has no
+/// declarative CHECK-constraint syntax, so the generated migration.sql is
+/// edited by hand to add it, the same technique already used for this
+/// schema's future range-partitioning notes.
+model QuizApprovalHistory {
+  id             String             @id @default(uuid()) @db.Uuid
+  quizId         String             @map("quiz_id") @db.Uuid
+  action         QuizApprovalAction
+  actorId        String             @map("actor_id") @db.Uuid
+  reason         String?
+  previousStatus QuizStatus         @map("previous_status")
+  newStatus      QuizStatus         @map("new_status")
+  createdAt      DateTime           @default(now()) @map("created_at")
+
+  quiz  Quiz @relation(fields: [quizId], references: [id])
+  actor User @relation(fields: [actorId], references: [id])
+
+  @@index([quizId])
+  @@map("quiz_approval_history")
+}
+
+// ============================================================================
+// PHASE 8 — EXAM SESSIONS (IMPLEMENTATION_PLAN.md: "session creation, quiz
+// attach/detach, reschedule, cancel")
+// ============================================================================
+
+/// The full, finalized state list from ARCHITECTURE.md §AD-2 #2's Exam
+/// Session state machine. Declared in full now (same precedent as
+/// QuizStatus in Phase 6) so no future phase needs an `ALTER TYPE ...
+/// ADD VALUE` migration — but Phase 8's OWN code only ever produces or
+/// consumes DRAFT and CANCELLED. The DRAFT->ASSIGNING_STUDENTS transition
+/// (and its "queue quiz_student_assignment generation" side effect) is
+/// Phase 9's responsibility, not triggered anywhere in this phase — a
+/// Phase 8 session simply stays DRAFT through repeated quiz attach/detach
+/// and reschedule operations until Phase 9 gives that transition real
+/// meaning.
+enum ExamSessionStatus {
+  DRAFT
+  ASSIGNING_STUDENTS
+  ROOM_ALLOCATION
+  SEATING_GENERATION
+  READY_FOR_FINALIZATION
+  FINALIZED
+  NOTIFIED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+/// Matches ARCHITECTURE.md §AC's literal `exam_sessions(id, name,
+/// session_date, start_time, end_time, status, created_by_admin_id,
+/// version, created_at, updated_at)` exactly. `createdByAdminId` is a FK
+/// to `User` (not a hypothetical `Admin` table — ADMIN is a role on User,
+/// same pattern as QuizApprovalHistory.actorId).
+model ExamSession {
+  id               String            @id @default(uuid()) @db.Uuid
+  name             String
+  sessionDate      DateTime          @map("session_date") @db.Date
+  startTime        DateTime          @map("start_time") @db.Time
+  endTime          DateTime          @map("end_time") @db.Time
+  status           ExamSessionStatus @default(DRAFT)
+  createdByAdminId String            @map("created_by_admin_id") @db.Uuid
+  /// Optimistic lock (BR-051 pattern, same as Quiz.version).
+  version          Int               @default(1)
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  createdByAdmin     User                    @relation(fields: [createdByAdminId], references: [id])
+  quizzes            ExamSessionQuiz[]
+  studentAssignments QuizStudentAssignment[]
+  allocatedRooms     ExamSessionRoom[]
+  seatingPlans       SeatingPlan[]
+  invigilators       ExamInvigilator[]
+  incidents          Incident[]
+  reportJobs         ReportJob[]
+
+  @@index([status])
+  @@map("exam_sessions")
+}
+
+/// Matches ARCHITECTURE.md §AC's literal `exam_session_quizzes(exam_session_id,
+/// quiz_id, PRIMARY KEY(exam_session_id, quiz_id))` plus BR-053's
+/// `is_active_attachment` flag (ADR-006) and the partial unique index that
+/// enforces "a quiz may be attached to at most one non-cancelled exam
+/// session at a time" — hand-added to this table's migration.sql (Prisma
+/// has no declarative partial/filtered-unique-index syntax, same
+/// limitation already worked around for QuizApprovalHistory's CHECK
+/// constraint in Phase 7).
+///
+/// `isActiveAttachment` is maintained by APPLICATION-transaction
+/// discipline (ExamSessionsService.cancel, in the same transaction as the
+/// status change) rather than a DB trigger — ADR-006 explicitly allows
+/// either; application discipline is the consistent choice matching every
+/// other soft-delete/status-cascade pattern in this codebase (e.g.
+/// Student/Faculty deactivation syncing User.isActive).
+model ExamSessionQuiz {
+  examSessionId      String    @map("exam_session_id") @db.Uuid
+  quizId             String    @map("quiz_id") @db.Uuid
+  isActiveAttachment Boolean   @default(true) @map("is_active_attachment")
+  attachedAt         DateTime  @default(now()) @map("attached_at")
+  detachedAt         DateTime? @map("detached_at")
+
+  examSession ExamSession @relation(fields: [examSessionId], references: [id])
+  quiz        Quiz        @relation(fields: [quizId], references: [id])
+
+  @@id([examSessionId, quizId])
+  @@index([quizId])
+  @@map("exam_session_quizzes")
+}
+
+/// Phase 9 (IMPLEMENTATION_PLAN.md): "derive eligible students from
+/// enrollment; create quiz_student_assignment rows." Full eventual value
+/// set pre-sized now (same precedent as ExamSessionStatus/QuizStatus) even
+/// though Phase 9's own generation logic only ever produces ASSIGNED —
+/// WAITLISTED is reserved for the capacity-aware allocation Phase 11+ will
+/// add; CANCELLED is used by Phase 9 itself (roster removal, EC-016).
+enum QuizStudentAssignmentStatus {
+  ASSIGNED
+  WAITLISTED
+  CANCELLED
+}
+
+/// Matches ARCHITECTURE.md §P's `quiz_student_assignment(id, quiz_id,
+/// exam_session_id, student_id, status, assigned_at)` with
+/// `UNIQUE(quiz_id, student_id)` — the DB-enforced guarantee that a
+/// student is never double-assigned to the same quiz (ADR-003 item (b):
+/// "the unique constraint alone is sufficient, no explicit locking
+/// needed"). `cancelledAt` mirrors ExamSessionQuiz's `detachedAt` — not
+/// documented explicitly but the same disclosed bookkeeping precedent
+/// (BR-006/EC-016: cancellation is a status change, never a delete, and a
+/// timestamp of when is the obvious audit-relevant companion field).
+model QuizStudentAssignment {
+  id            String                      @id @default(uuid()) @db.Uuid
+  quizId        String                      @map("quiz_id") @db.Uuid
+  examSessionId String                      @map("exam_session_id") @db.Uuid
+  studentId     String                      @map("student_id") @db.Uuid
+  status        QuizStudentAssignmentStatus @default(ASSIGNED)
+  assignedAt    DateTime                    @default(now()) @map("assigned_at")
+  cancelledAt   DateTime?                   @map("cancelled_at")
+  createdAt     DateTime                    @default(now()) @map("created_at")
+  updatedAt     DateTime                    @updatedAt @map("updated_at")
+
+  quiz        Quiz        @relation(fields: [quizId], references: [id])
+  examSession ExamSession @relation(fields: [examSessionId], references: [id])
+  student     Student     @relation(fields: [studentId], references: [id])
+  attendance  Attendance?
+
+  @@unique([quizId, studentId])
+  @@index([studentId])
+  @@index([examSessionId])
+  @@map("quiz_student_assignments")
+}
+
+// ============================================================================
+// PHASE 11 — ROOM MANAGEMENT (IMPLEMENTATION_PLAN.md: "rooms, seats,
+// availability calendar")
+//
+// Scope boundary, disclosed explicitly: IMPLEMENTATION_PLAN.md lists this
+// phase's DB changes as exactly `rooms, room_seats, room_availability` —
+// NOT `exam_session_rooms`. That join table (plus the BR-018 exclusion
+// constraint, which is defined ON its columns and so cannot exist before
+// it does) is explicitly Phase 12's own DB-changes line ("`exam_session_rooms`
+// with the exclusion constraint (BR-018)"), built in ARCHITECTURE.md §S
+// ("Room Allocation Algorithm"), not §R ("Room Management") which this
+// phase implements. Nothing here references any exam session.
+// ============================================================================
+
+/// ARCHITECTURE.md §R's literal `rooms(... status TEXT -- ACTIVE|MAINTENANCE|INACTIVE)`.
+enum RoomStatus {
+  ACTIVE
+  MAINTENANCE
+  INACTIVE
+}
+
+/// Matches ARCHITECTURE.md §R's literal `rooms(id, building, floor,
+/// room_number, capacity, rows, columns, status, accessibility_info,
+/// created_at, updated_at)` with `UNIQUE(building, room_number)` — room
+/// codes are unique PER BUILDING, not globally (two different buildings
+/// may each have a "101"). `rows`/`columns` are immutable after creation
+/// in this phase's API (see rooms.service.ts) — they exist purely to
+/// generate the initial `room_seats` map; nothing in the documentation
+/// specifies a reseed/resize operation, and EC-048 flags that changing a
+/// room's seat layout after a seating plan exists is a cross-phase concern
+/// (Phase 13, not yet built) this phase deliberately does not try to
+/// half-implement.
+model Room {
+  id                String     @id @default(uuid()) @db.Uuid
+  building          String
+  floor             Int
+  roomNumber        String     @map("room_number")
+  capacity          Int
+  rows              Int
+  columns           Int
+  status            RoomStatus @default(ACTIVE)
+  /// Free-form per §R's literal example (`{"wheelchair_seats": ["A1","A2"]}`)
+  /// — no fixed schema is documented for this field.
+  accessibilityInfo Json?      @map("accessibility_info")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+
+  seats              RoomSeat[]
+  availabilityBlocks RoomAvailability[]
+  sessionAllocations ExamSessionRoom[]
+  seatingPlans       SeatingPlan[]
+  invigilators       ExamInvigilator[]
+  incidents          Incident[]
+
+  @@unique([building, roomNumber])
+  @@index([status])
+  @@map("rooms")
+}
+
+/// Matches ARCHITECTURE.md §R's literal `room_seats(id, room_id,
+/// seat_label, row_index, col_index, is_accessible, is_active)` —
+/// "materialized (not computed from rows×columns on the fly) so individual
+/// seats can be disabled, marked accessible, and directly referenced by
+/// `seating_assignments.seat_id` with a real foreign key." `createdAt`/
+/// `updatedAt` are not in that literal schema line but are added here for
+/// the same disclosed, consistent reason every other table in this schema
+/// has them (audit-relevant mutation tracking, matching this codebase's
+/// established convention — see e.g. ExamSessionQuiz's own such note).
+model RoomSeat {
+  id           String   @id @default(uuid()) @db.Uuid
+  roomId       String   @map("room_id") @db.Uuid
+  seatLabel    String   @map("seat_label")
+  rowIndex     Int      @map("row_index")
+  colIndex     Int      @map("col_index")
+  isAccessible Boolean  @default(false) @map("is_accessible")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  room               Room                @relation(fields: [roomId], references: [id])
+  seatingAssignments SeatingAssignment[]
+  attendance         Attendance[]
+  incidents          Incident[]
+
+  @@unique([roomId, seatLabel])
+  @@index([roomId])
+  @@map("room_seats")
+}
+
+/// Matches ARCHITECTURE.md §R's literal `room_availability(id, room_id,
+/// date, start_time, end_time, reason, created_at)` — a maintenance/
+/// blackout calendar independent of any specific exam session (e.g.
+/// `reason: 'MAINTENANCE' | 'RESERVED_OTHER_DEPT'`, free text per the
+/// doc's own "etc"). Consumed read-only by Phase 12's room-allocation
+/// preconditions (BR-022) and by this phase's own `GET /rooms/available`
+/// — no update/delete operation is documented for a block once created,
+/// so none is implemented (a mistaken block is corrected by its date
+/// simply passing, matching how the doc describes it purely as a
+/// calendar of blocks, never as an editable/cancelable reservation).
+model RoomAvailability {
+  id        String   @id @default(uuid()) @db.Uuid
+  roomId    String   @map("room_id") @db.Uuid
+  date      DateTime @db.Date
+  startTime DateTime @map("start_time") @db.Time
+  endTime   DateTime @map("end_time") @db.Time
+  reason    String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  room Room @relation(fields: [roomId], references: [id])
+
+  @@index([roomId, date])
+  @@map("room_availability")
+}
+
+// ============================================================================
+// PHASE 12 — ROOM ALLOCATION (IMPLEMENTATION_PLAN.md: "Best-Fit Decreasing
+// allocation algorithm, exam_session_rooms")
+// ============================================================================
+
+/// Matches ARCHITECTURE.md §S's literal `exam_session_rooms(id,
+/// exam_session_id, room_id, allocated_capacity, created_at)` with
+/// `UNIQUE(room_id, exam_session_id)` plus "an EXCLUDE constraint (via
+/// btree_gist) preventing overlapping time windows per room across
+/// sessions" (BR-018). Postgres EXCLUDE constraints can only reference
+/// columns of the table they're defined on — they cannot reach across a
+/// join to `exam_sessions.session_date/start_time/end_time` — so this
+/// table DENORMALIZES those three fields from the owning session at
+/// allocation time (same category of necessary denormalization as Phase
+/// 7/8's hand-edited constraints; see this table's migration.sql for the
+/// actual `CREATE EXTENSION btree_gist` + `EXCLUDE USING gist` statements,
+/// hand-added the same way BR-053's partial unique index was in Phase 8).
+model ExamSessionRoom {
+  id                String   @id @default(uuid()) @db.Uuid
+  examSessionId     String   @map("exam_session_id") @db.Uuid
+  roomId            String   @map("room_id") @db.Uuid
+  allocatedCapacity Int      @map("allocated_capacity")
+  /// Denormalized copy of the owning session's own fields, snapshotted at
+  /// allocation time — required for the EXCLUDE constraint (see above).
+  /// Never independently updated; a session reschedule after rooms are
+  /// allocated is not a documented Phase 12 flow (no re-allocation/update
+  /// endpoint exists), so no staleness-reconciliation logic is needed here.
+  sessionDate       DateTime @map("session_date") @db.Date
+  startTime         DateTime @map("start_time") @db.Time
+  endTime           DateTime @map("end_time") @db.Time
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  examSession   ExamSession           @relation(fields: [examSessionId], references: [id])
+  room          Room                  @relation(fields: [roomId], references: [id])
+  quizBreakdown ExamSessionRoomQuiz[]
+
+  @@unique([roomId, examSessionId])
+  @@index([examSessionId])
+  @@map("exam_session_rooms")
+}
+
+/// Phase 13 addition to Phase 12's own persistence — NOT a new allocation
+/// feature, just materializing a breakdown Phase 12's Best-Fit Decreasing
+/// packer already computes in memory (`Placement[] = {roomId, quizId,
+/// count}`) but previously discarded after aggregating into
+/// `ExamSessionRoom.allocatedCapacity`. Seating generation (this phase)
+/// needs to know WHICH quiz-cohorts (and how many of each) landed in a
+/// given room — a session whose cohort was split across multiple rooms
+/// (EC-005) has no other way to recover that split, since the aggregate
+/// `allocatedCapacity` alone is ambiguous once more than one quiz/room is
+/// involved. `RoomAllocationService.allocate` (Phase 12) now persists one
+/// row per (room, quiz) placement alongside its existing
+/// `exam_session_rooms` row — same transaction, same data it already had.
+model ExamSessionRoomQuiz {
+  id                String   @id @default(uuid()) @db.Uuid
+  examSessionRoomId String   @map("exam_session_room_id") @db.Uuid
+  quizId            String   @map("quiz_id") @db.Uuid
+  studentCount      Int      @map("student_count")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  examSessionRoom ExamSessionRoom @relation(fields: [examSessionRoomId], references: [id])
+  quiz            Quiz            @relation(fields: [quizId], references: [id])
+
+  @@unique([examSessionRoomId, quizId])
+  @@map("exam_session_room_quizzes")
+}
+
+// ============================================================================
+// PHASE 13 — SEATING ENGINE (IMPLEMENTATION_PLAN.md: "seat map + strategies
+// (Sequential, Random, Alternate-Subject, Batch Alternation, Subject+Batch
+// Mix) — anti-cheating comes in Phase 14")
+// ============================================================================
+
+/// ARCHITECTURE.md §T's strategy enum. `ANTI_CHEATING` is pre-sized here
+/// (same precedent as every other enum in this schema — e.g.
+/// `QuizStudentAssignmentStatus.WAITLISTED`) even though its solver (§U)
+/// is explicitly Phase 14 scope — the DTO layer (not this enum) rejects
+/// `ANTI_CHEATING` for now, so selecting it never reaches this table.
+enum SeatingStrategy {
+  SEQUENTIAL
+  RANDOMIZED
+  ALTERNATE_SUBJECT
+  ALTERNATE_BATCH
+  SUBJECT_BATCH_MIX
+  ANTI_CHEATING
+}
+
+/// ARCHITECTURE.md §AD-2 #4's literal state machine: `(none)->DRAFT ->
+/// VALIDATED | FAILED`; `VALIDATED -> FINALIZED`; `FINALIZED ->
+/// SUPERSEDED` (re-plan).
+enum SeatingPlanStatus {
+  DRAFT
+  VALIDATED
+  FAILED
+  FINALIZED
+  SUPERSEDED
+}
+
+/// Matches ARCHITECTURE.md §T's literal `seating_plans(id,
+/// exam_session_id, room_id, strategy, status, soft_constraint_score,
+/// version, generated_at, finalized_at)`. One plan PER ROOM per session
+/// (DOMAIN_MODEL.md: "one per room" — EC-005: "each room gets its own
+/// seating_plan"), not one plan per whole session. The EC-032 idempotency
+/// guard ("unique partial index (exam_session_id, room_id) WHERE status
+/// IN ('DRAFT','FINALIZED')") is hand-added to this table's migration.sql
+/// — Prisma has no declarative partial-unique-index syntax, same
+/// limitation already worked around for BR-053 (Phase 8) and BR-018
+/// (Phase 12).
+model SeatingPlan {
+  id                  String            @id @default(uuid()) @db.Uuid
+  examSessionId       String            @map("exam_session_id") @db.Uuid
+  roomId              String            @map("room_id") @db.Uuid
+  strategy            SeatingStrategy
+  status              SeatingPlanStatus @default(DRAFT)
+  /// 0-1, share of soft constraints satisfied (ARCHITECTURE.md §T).
+  softConstraintScore Decimal?          @map("soft_constraint_score") @db.Decimal(4, 3)
+  /// HARD violations (when FAILED) or SOFT violations (when VALIDATED) —
+  /// "soft-constraint violations are reported, not hidden" (PRD FR-032).
+  violationReport     Json?             @map("violation_report")
+  version             Int               @default(1)
+  generatedAt         DateTime          @default(now()) @map("generated_at")
+  finalizedAt         DateTime?         @map("finalized_at")
+
+  examSession ExamSession         @relation(fields: [examSessionId], references: [id])
+  room        Room                @relation(fields: [roomId], references: [id])
+  assignments SeatingAssignment[]
+
+  @@index([examSessionId, roomId])
+  @@map("seating_plans")
+}
+
+/// Matches ARCHITECTURE.md §T's literal `seating_assignments(id,
+/// seating_plan_id, student_id, quiz_id, seat_id, created_at)` — note
+/// `student_id`/`quiz_id` are direct FK columns (NOT
+/// `quiz_student_assignment_id`), exactly as the architecture doc's own
+/// schema block specifies. `UNIQUE(seating_plan_id, seat_id)` (BR-024,
+/// "a seat cannot hold two students") and `UNIQUE(seating_plan_id,
+/// student_id)` (BR-025, "a student cannot hold two seats within the
+/// same seating plan") are both DB-enforced, the real backstop beneath
+/// this phase's own pure-function validator (packages/domain-logic).
+model SeatingAssignment {
+  id            String   @id @default(uuid()) @db.Uuid
+  seatingPlanId String   @map("seating_plan_id") @db.Uuid
+  studentId     String   @map("student_id") @db.Uuid
+  quizId        String   @map("quiz_id") @db.Uuid
+  seatId        String   @map("seat_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  seatingPlan SeatingPlan @relation(fields: [seatingPlanId], references: [id])
+  student     Student     @relation(fields: [studentId], references: [id])
+  quiz        Quiz        @relation(fields: [quizId], references: [id])
+  seat        RoomSeat    @relation(fields: [seatId], references: [id])
+
+  @@unique([seatingPlanId, seatId])
+  @@unique([seatingPlanId, studentId])
+  @@index([seatingPlanId])
+  @@map("seating_assignments")
+}
+
+// ============================================================================
+// NOTIFICATIONS (Phase 15) — ARCHITECTURE.md §AB/§AC, docs/adr/005-notification-outbox-reliability.md.
+// ============================================================================
+
+enum NotificationRecipientType {
+  STUDENT
+  FACULTY
+  ADMIN
+}
+
+/// Pre-sized per the enum convention used throughout this schema: every
+/// event type FR-041 names has a value here, even ones with no caller yet.
+/// `INCIDENT_STATUS_UPDATED` has no writer in Phase 15 — Incidents is
+/// Phase 18, not yet implemented (`apps/api/src/modules/incidents` is
+/// still a Phase-0 skeleton) — this value exists so Phase 18 wires into an
+/// already-declared event type instead of amending this enum later.
+enum NotificationEventType {
+  QUIZ_APPROVED
+  QUIZ_REJECTED
+  SEAT_ASSIGNED
+  EXAM_SESSION_RESCHEDULED
+  EXAM_SESSION_CANCELLED
+  INCIDENT_STATUS_UPDATED
+  /// Phase 19 — ARCHITECTURE.md §AV/line 809: exports are "delivered via
+  /// signed URL + notification". Added here (additive enum member, same
+  /// pre-sizing convention this enum already used for
+  /// `INCIDENT_STATUS_UPDATED` in Phase 15 ahead of Phase 18's real
+  /// caller) — Phase 19 is this value's first and only caller.
+  REPORT_READY
+}
+
+/// PUSH is pre-sized (ARCHITECTURE.md §AB's `channel` column lists
+/// IN_APP|EMAIL|PUSH) but has no provider wired in Phase 15 — FR-041
+/// requires only "in-app + email"; no PUSH notification is ever produced.
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  PUSH
+}
+
+/// RETRYING is a real, distinct persisted state (not just an in-memory
+/// worker concept) — ARCHITECTURE.md's own outbox flow diagram (§AB) lists
+/// `SENT|FAILED|RETRYING` as the delivery-result values written back to
+/// this row; DEAD_LETTER is the terminal exhausted-retry state (BR-044).
+/// FAILED itself is intentionally NOT a value here: a single failed
+/// attempt that still has budget left transitions straight to RETRYING
+/// (with `nextAttemptAt` set), never lingering in a bare "FAILED" state —
+/// "FAILED" in the doc's diagram describes the transient outcome of one
+/// delivery attempt, not a row status this schema needs to persist
+/// separately from RETRYING/DEAD_LETTER.
+enum NotificationStatus {
+  PENDING
+  RETRYING
+  SENT
+  DEAD_LETTER
+}
+
+/// notifications(...) — ARCHITECTURE.md §AB/§AC's transactional-outbox row:
+/// written in the SAME DB transaction as the triggering domain event
+/// (BR-042, ADR-005), never mutated by humans (§AC "append-only"), consumed
+/// by a separate relay + BullMQ worker pool. Two fields are
+/// implementation-necessary additions beyond ARCHITECTURE.md's literal DDL
+/// sketch (disclosed, not silent invention): `readAt` — the sketch predates
+/// (and omits) API_CONTRACT.md's `PATCH /me/notifications/{id}/read`,
+/// which needs SOME persisted read/unread state; `nextAttemptAt` — the
+/// relay's poll query needs a concrete due-time to select against, not
+/// just `attempt_count`.
+///
+/// PARTITIONING (ADR-002; this file's header convention table names
+/// `notifications` as partition-by-`created_at`): deliberately NOT
+/// physically partitioned in this migration, consistent with the
+/// precedent already set by Phase 13's `seating_assignments` (also named
+/// in that same convention table, also not partitioned) — PostgreSQL
+/// declarative partitioning requires every unique index, including the
+/// primary key, to include the partition column, which would force `id`
+/// into a composite `(id, created_at)` key and ripple into every
+/// relation/`findUnique` call site for a 100K+/multi-year retention
+/// concern that doesn't affect functional correctness at this phase's
+/// scale. Flagged for Phase 21 (Performance Optimization) to address for
+/// both tables together, rather than silently repeating the gap or
+/// silently fixing out-of-scope Phase 13 work here.
+model Notification {
+  id             String                    @id @default(uuid()) @db.Uuid
+  recipientType  NotificationRecipientType @map("recipient_type")
+  recipientId    String                    @map("recipient_id") @db.Uuid
+  eventType      NotificationEventType     @map("event_type")
+  channel        NotificationChannel
+  payload        Json
+  status         NotificationStatus        @default(PENDING)
+  /// `hash(event_type, recipient_id, entity_id, entity_version)` per
+  /// ARCHITECTURE.md §AB — implemented as a deterministic composed string
+  /// (not a cryptographic hash function; a `UNIQUE` DB constraint needs
+  /// only deterministic uniqueness, not hash properties), additionally
+  /// scoped by `channel` since this table stores one row per channel per
+  /// logical event (BR-043's dedup guarantee applies per delivery
+  /// channel, not across channels — an in-app row and an email row for
+  /// the same event are two distinct, both-expected deliveries).
+  idempotencyKey String                    @unique @map("idempotency_key")
+  attemptCount   Int                       @default(0) @map("attempt_count")
+  lastError      String?                   @map("last_error")
+  nextAttemptAt  DateTime?                 @map("next_attempt_at")
+  createdAt      DateTime                  @default(now()) @map("created_at")
+  sentAt         DateTime?                 @map("sent_at")
+  readAt         DateTime?                 @map("read_at")
+
+  @@index([recipientType, recipientId, createdAt])
+  @@index([status, nextAttemptAt])
+  @@map("notifications")
+}
+
+// ============================================================================
+// INVIGILATION (Phase 16) — ARCHITECTURE.md §W, BUSINESS_RULES.md BR-030/031.
+// ============================================================================
+
+enum InvigilatorRole {
+  LEAD_INVIGILATOR
+  ASSISTANT_INVIGILATOR
+}
+
+/// exam_invigilators(...) per ARCHITECTURE.md §W's literal schema. A
+/// faculty member "acting in a room-assignment capacity for a session, not
+/// a separate person type" (ARCHITECTURE.md role table) — BR-030: may
+/// invigilate any room regardless of subject taught. `UNIQUE(exam_session_id,
+/// room_id, faculty_id)` is the exact-duplicate backstop; the real
+/// correctness guarantee (BR-031/BR-020 — same faculty cannot invigilate
+/// two rooms whose sessions overlap in time) is an application-level
+/// Conflict Engine check inside a row-locked transaction (see
+/// `InvigilationService.assign`), the same "DB constraint is the narrow
+/// backstop, the Conflict Engine is the real check" split already used
+/// for BR-018/BR-019.
+model ExamInvigilator {
+  id            String          @id @default(uuid()) @db.Uuid
+  examSessionId String          @map("exam_session_id") @db.Uuid
+  roomId        String          @map("room_id") @db.Uuid
+  facultyId     String          @map("faculty_id") @db.Uuid
+  role          InvigilatorRole
+  assignedAt    DateTime        @default(now()) @map("assigned_at")
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  examSession ExamSession @relation(fields: [examSessionId], references: [id])
+  room        Room        @relation(fields: [roomId], references: [id])
+  faculty     Faculty     @relation(fields: [facultyId], references: [id])
+
+  @@unique([examSessionId, roomId, facultyId])
+  @@index([facultyId])
+  @@map("exam_invigilators")
+}
+
+// ============================================================================
+// ATTENDANCE (Phase 17) — ARCHITECTURE.md §X/§Y, BUSINESS_RULES.md BR-032/036.
+// ============================================================================
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+  MEDICAL
+  OTHER
+}
+
+/// QR and BIOMETRIC are pre-sized per ARCHITECTURE.md §X's literal column
+/// comment ("QR|BIOMETRIC(reserved)") — no provider/scanner integration
+/// exists in Phase 17; every row this phase can actually produce is
+/// MANUAL or SEAT_BASED.
+enum AttendanceMethod {
+  MANUAL
+  SEAT_BASED
+  QR
+  BIOMETRIC
+}
+
+/// attendance(...) per ARCHITECTURE.md §X's literal schema. One row per
+/// `quiz_student_assignment` (`UNIQUE`, BR-033 — "a student cannot have
+/// duplicate attendance for the same quiz"), lazily created on first mark
+/// (§Y step 1: "lazy creation on first mark ... lower write volume at
+/// scale" — no pre-created NULL-status rows). `locked` flips to `true`
+/// when the owning exam session transitions to `COMPLETED` (BR-034); once
+/// locked, any further status change requires a `reason` and an
+/// `attendance_history` row (BR-035).
+model Attendance {
+  id                      String           @id @default(uuid()) @db.Uuid
+  quizStudentAssignmentId String           @unique @map("quiz_student_assignment_id") @db.Uuid
+  seatId                  String           @map("seat_id") @db.Uuid
+  status                  AttendanceStatus
+  method                  AttendanceMethod
+  markedByFacultyId       String           @map("marked_by_faculty_id") @db.Uuid
+  markedAt                DateTime         @default(now()) @map("marked_at")
+  locked                  Boolean          @default(false)
+  createdAt               DateTime         @default(now()) @map("created_at")
+  updatedAt               DateTime         @updatedAt @map("updated_at")
+
+  quizStudentAssignment QuizStudentAssignment @relation(fields: [quizStudentAssignmentId], references: [id])
+  seat                  RoomSeat              @relation(fields: [seatId], references: [id])
+  markedByFaculty       Faculty               @relation(fields: [markedByFacultyId], references: [id])
+  history               AttendanceHistory[]
+
+  // Phase 21 perf: both AttendanceService.listForSession (admin + the
+  // faculty room-scoped variant, which filters via seat.roomId) and
+  // .getHistoryForStudent ORDER BY markedAt desc. Before these indexes the
+  // table had ZERO non-PK/non-unique indexes, so every list query did a
+  // Seq Scan on attendance regardless of how selective the join was —
+  // confirmed via EXPLAIN ANALYZE against a 5,000-row synthetic dataset:
+  // 6.25ms/15.99ms (Seq Scan + Sort) -> 0.25ms/0.71ms (Index Scan on
+  // markedAt, no seq scan) after adding these two indexes. seatId is
+  // additionally justified because the faculty-scoped listForSession path
+  // filters `seat: { roomId: { in: roomIds } } }`.
+  @@index([markedAt(sort: Desc)])
+  @@index([seatId])
+  @@map("attendance")
+}
+
+/// attendance_history(...) per ARCHITECTURE.md §X — an append-only change
+/// log for every post-creation status change (BR-035), not only ones made
+/// after `locked=true`; `reason` is nullable at the column level but
+/// enforced NOT NULL by the application whenever the parent row is
+/// already `locked` at the time of the change (see
+/// `AttendanceService.update`'s own doc comment — mirrors
+/// `QuizApprovalHistoryService`'s "DB CHECK is the backstop, app is the
+/// real enforcement point for a conditional requirement" split, since a
+/// plain CHECK constraint on this table alone cannot see the PARENT row's
+/// `locked` value at insert time).
+model AttendanceHistory {
+  id                 String           @id @default(uuid()) @db.Uuid
+  attendanceId       String           @map("attendance_id") @db.Uuid
+  changedByFacultyId String           @map("changed_by_faculty_id") @db.Uuid
+  oldStatus          AttendanceStatus @map("old_status")
+  newStatus          AttendanceStatus @map("new_status")
+  reason             String?
+  changedAt          DateTime         @default(now()) @map("changed_at")
+
+  attendance       Attendance @relation(fields: [attendanceId], references: [id])
+  changedByFaculty Faculty    @relation(fields: [changedByFacultyId], references: [id])
+
+  @@index([attendanceId])
+  @@map("attendance_history")
+}
+
+// ============================================================================
+// INCIDENT MANAGEMENT (Phase 18) — ARCHITECTURE.md §Z/§AA, §AD-2 #6,
+// BUSINESS_RULES.md BR-037..041.
+// ============================================================================
+
+enum IncidentType {
+  CHEATING_SUSPICION
+  UNAUTHORIZED_MATERIAL
+  MISCONDUCT
+  MISSING
+  LATE
+  MEDICAL
+  SEATING
+  TECHNICAL
+  ROOM
+  IDENTITY
+  PAPER
+  OTHER
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IncidentStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  DISMISSED
+  ESCALATED
+}
+
+/// `CREATE` is the initial `incident_history` row written atomically with
+/// the incident itself (BR-039: "every incident status transition is
+/// appended to `incident_history`" — read literally to include the
+/// creating OPEN state, not only later Admin-driven transitions, so the
+/// history is a complete record from t=0, not missing its own origin).
+/// The remaining four values are exactly API_CONTRACT.md's literal
+/// `PATCH /incidents/{id}/status` action enum
+/// (`INVESTIGATE|ESCALATE|RESOLVE|DISMISS`) — ARCHITECTURE.md §AA's own
+/// workflow prose additionally mentions a `REQUEST_MORE_INFO` action with
+/// no status change, but that action does not appear in API_CONTRACT.md's
+/// documented request shape for this endpoint; per this codebase's
+/// established precedent of treating API_CONTRACT.md as authoritative for
+/// endpoint request/response shapes, it is deliberately NOT implemented
+/// (disclosed, not an oversight).
+enum IncidentAction {
+  CREATE
+  INVESTIGATE
+  ESCALATE
+  RESOLVE
+  DISMISS
+}
+
+/// incidents(...) per ARCHITECTURE.md §Z's literal schema. Every FK below
+/// `exam_session_id` is nullable per DOMAIN_MODEL.md §6 ("not every
+/// incident involves a specific student, e.g. a general room technical
+/// issue"). `resolved_by_admin_id` references `User`, not `Faculty` —
+/// mirrors `ExamSession.createdByAdminId`/`QuizApprovalHistory.actorId`'s
+/// own established precedent (an ADMIN acting in that capacity is
+/// fundamentally a `users` identity, not necessarily one who also holds a
+/// `faculty` row). `reported_by_faculty_id` DOES reference `Faculty`
+/// specifically — BR-037 requires the reporter to be an assigned
+/// Faculty/Invigilator, who by definition always has a `faculty` row.
+model Incident {
+  id                  String            @id @default(uuid()) @db.Uuid
+  examSessionId       String            @map("exam_session_id") @db.Uuid
+  quizId              String?           @map("quiz_id") @db.Uuid
+  studentId           String?           @map("student_id") @db.Uuid
+  roomId              String?           @map("room_id") @db.Uuid
+  seatId              String?           @map("seat_id") @db.Uuid
+  reportedByFacultyId String            @map("reported_by_faculty_id") @db.Uuid
+  incidentType        IncidentType      @map("incident_type")
+  severity            IncidentSeverity
+  description         String
+  /// Pointers to object storage, not raw files (ARCHITECTURE.md §Z's own
+  /// column comment) — no file-upload endpoint exists in this phase's
+  /// documented scope; the shape of this JSON is caller-supplied and
+  /// unvalidated beyond "is it a JSON value", matching Phase 13's
+  /// `SeatingPlan.violationReport`'s own precedent for an intentionally
+  /// undocumented-shape JSONB column.
+  evidenceMetadata    Json?             @map("evidence_metadata")
+  status              IncidentStatus    @default(OPEN)
+  /// NOT NULL enforced by the application at RESOLVE/DISMISS time (BR-039
+  /// prose: "resolution required"), not a DB CHECK — same "DB is the
+  /// narrow backstop, app is the real conditional-requirement enforcer"
+  /// split already used for BR-012 (quiz reject) and BR-035 (attendance
+  /// post-lock change).
+  resolution          String?
+  resolvedByAdminId   String?           @map("resolved_by_admin_id") @db.Uuid
+  resolvedAt          DateTime?         @map("resolved_at")
+  /// ADR-007 (DEC-009 — incident disclosure): NOT part of ARCHITECTURE.md
+  /// §Z's original DDL sketch — added per that ADR's explicit
+  /// "Implementation Notes": "`incidents.disclosed_at TIMESTAMPTZ NULL`,
+  /// `incidents.disclosed_by_admin_id UUID NULL FK` — nullable, absent =
+  /// never disclosed (current, safe default state)." Ships inert per
+  /// ADR-007/BR-041: nothing in this codebase sets these except an
+  /// explicit `POST /incidents/{id}/disclose` ADMIN call — no automatic
+  /// workflow, no notification side effect, no student-facing read
+  /// endpoint exists anywhere in this phase to even consult these fields
+  /// yet (disclosed for a future phase, per that ADR's own framing).
+  disclosedAt         DateTime?         @map("disclosed_at")
+  disclosedByAdminId  String?           @map("disclosed_by_admin_id") @db.Uuid
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  examSession        ExamSession       @relation(fields: [examSessionId], references: [id])
+  quiz               Quiz?             @relation(fields: [quizId], references: [id])
+  student            Student?          @relation(fields: [studentId], references: [id])
+  room               Room?             @relation(fields: [roomId], references: [id])
+  seat               RoomSeat?         @relation(fields: [seatId], references: [id])
+  reportedByFaculty  Faculty           @relation(fields: [reportedByFacultyId], references: [id])
+  resolvedByAdmin    User?             @relation("IncidentResolvedBy", fields: [resolvedByAdminId], references: [id])
+  disclosedByAdmin   User?             @relation("IncidentDisclosedBy", fields: [disclosedByAdminId], references: [id])
+  history            IncidentHistory[]
+
+  @@index([examSessionId])
+  @@index([status])
+  @@index([reportedByFacultyId])
+  @@map("incidents")
+}
+
+/// incident_history(...) per ARCHITECTURE.md §Z's literal schema —
+/// append-only (BR-039: "the current `incidents.status` is a cache of the
+/// latest state, not the source of truth"), never updated/deleted, same
+/// "structurally impossible to mutate" posture as `QuizApprovalHistory`
+/// and `AttendanceHistory`. `actor_id` references `User` directly
+/// (mirrors `QuizApprovalHistory.actorId`'s exact precedent) since both a
+/// reporting Faculty (CREATE) and a reviewing Admin (every later action)
+/// write rows here, and a `users.id` is the one identity both always have.
+model IncidentHistory {
+  id         String          @id @default(uuid()) @db.Uuid
+  incidentId String          @map("incident_id") @db.Uuid
+  actorId    String          @map("actor_id") @db.Uuid
+  action     IncidentAction
+  oldStatus  IncidentStatus? @map("old_status")
+  newStatus  IncidentStatus  @map("new_status")
+  notes      String?
+  createdAt  DateTime        @default(now()) @map("created_at")
+
+  incident Incident @relation(fields: [incidentId], references: [id])
+  actor    User     @relation(fields: [actorId], references: [id])
+
+  @@index([incidentId])
+  @@map("incident_history")
+}
+
+// ============================================================================
+// REPORTING (Phase 19) — ARCHITECTURE.md line 809/889, API_CONTRACT.md
+// "Reports", PRD.md FR-046. No dedicated schema section exists for this in
+// ARCHITECTURE.md — the `report_jobs` shape below is this phase's own
+// design, following the exact "async job -> signed URL -> notification"
+// prose those docs describe, reusing Phase 15's real BullMQ/Redis queue
+// infrastructure per IMPLEMENTATION_PLAN.md's own stated dependency
+// ("Phase 15: async job pattern reused") rather than Phase 3's
+// `ImportJob` table (a different, synchronous, bulk-import-specific
+// shape — not a fit here, and out of this phase's scope to touch).
+// ============================================================================
+
+/// The 4 report types API_CONTRACT.md's "Reports" table literally
+/// documents (`POST /reports/attendance`, `/reports/seating-plan`,
+/// `/reports/incident-report`, `/reports/room-utilization`). PRD.md
+/// FR-046 additionally names "exam roster" and "student schedule" report
+/// types with NO corresponding API_CONTRACT.md endpoint — per this
+/// codebase's established precedent (API_CONTRACT.md authoritative for
+/// endpoint/request shapes), those two are disclosed as NOT implemented,
+/// not silently invented.
+enum ReportType {
+  ATTENDANCE
+  SEATING_PLAN
+  INCIDENT_REPORT
+  ROOM_UTILIZATION
+}
+
+/// PRD.md FR-046: "Exportable (async, CSV/Excel) reports".
+enum ReportFormat {
+  CSV
+  EXCEL
+}
+
+enum ReportJobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// `result_data`/`result_content_type`/`result_filename` are this
+/// phase's disclosed placeholder for "signed URL delivery" — no object
+/// storage (S3 or otherwise) is wired anywhere in this codebase yet (only
+/// ever referenced as a future integration point, e.g. incidents'
+/// `evidence_metadata` comment), so the generated file is stored directly
+/// in Postgres (bounded size — these are per-session exports, not
+/// unbounded dumps) and served via this app's own
+/// `GET /report-jobs/{id}/download`, with `result_url` holding that
+/// relative path. Same disclosed-placeholder posture as Phase 15's
+/// `ConsoleEmailProvider` standing in for a real email vendor.
+model ReportJob {
+  id                 String          @id @default(uuid()) @db.Uuid
+  reportType         ReportType      @map("report_type")
+  format             ReportFormat
+  examSessionId      String          @map("exam_session_id") @db.Uuid
+  status             ReportJobStatus @default(PENDING)
+  resultUrl          String?         @map("result_url")
+  resultData         Bytes?          @map("result_data")
+  resultContentType  String?         @map("result_content_type")
+  resultFilename     String?         @map("result_filename")
+  errorMessage       String?         @map("error_message")
+  requestedByAdminId String          @map("requested_by_admin_id") @db.Uuid
+  createdAt          DateTime        @default(now()) @map("created_at")
+  completedAt        DateTime?       @map("completed_at")
+
+  examSession      ExamSession @relation(fields: [examSessionId], references: [id])
+  requestedByAdmin User        @relation(fields: [requestedByAdminId], references: [id])
+
+  @@index([status])
+  @@index([examSessionId])
+  @@map("report_jobs")
+}
+
+/// Phase 20 (Audit and Observability). ARCHITECTURE.md §AJ: "Every
+/// state-changing action writes one `audit_logs` row ... in the same
+/// transaction as the domain change." BUSINESS_RULES.md BR-048 (same-
+/// transaction write) / BR-049 (append-only — no UPDATE/DELETE code path
+/// exists against this model anywhere in the application layer; the
+/// generated migration additionally REVOKEs UPDATE/DELETE at the DB-role
+/// level per ARCHITECTURE_REVIEW.md §5/§10 item 7, as a technical backstop
+/// to this application-layer discipline, not a substitute for it).
+///
+/// This is a NEW, additive table — it does not replace or alter any
+/// existing phase-specific history table (`QuizApprovalHistory`,
+/// `AttendanceHistory`, `IncidentHistory`), which remain the authoritative,
+/// domain-scoped audit trails for their own entities per their own
+/// business rules (BR-013, attendance/incident history rules). This table
+/// is the cross-cutting, entity-agnostic trail FR-047/BR-048 describe,
+/// covering every mutating action across every domain — including ones
+/// that already have their own phase-specific history table, so
+/// `GET /audit-logs` gives Admin one consistent, filterable view across
+/// domains without needing to know which phase-specific table to query.
+///
+/// `oldValue`/`newValue` are the caller-supplied before/after snapshots —
+/// `AuditHookService.record()` redacts known-sensitive fields (e.g.
+/// `passwordHash`) from these before they ever reach this table, per the
+/// Phase 20 authorization's explicit "do not expose sensitive information
+/// through ... audit records unless explicitly required" instruction.
+///
+/// Partitioning: schema.prisma's own header (RANGE-PARTITIONING-BY-
+/// ACADEMIC_YEAR CONVENTION) names `audit_logs` as one of the four tables
+/// requiring range partitioning by `academic_year` "where the audited
+/// entity has one, else `created_at`". Unlike `attendance`/
+/// `seating_assignments` (a single, well-defined academic_year via one
+/// owning relation) or `notifications` (uniformly `created_at`),
+/// `audit_logs` covers EVERY entity type in the system, many of which
+/// (User, Department, Room, RoomSeat, Notification, ...) have no
+/// academic-year concept at all — there is no single, well-defined range
+/// partition key column here, only a per-row "whichever applies" rule
+/// that PostgreSQL's native `PARTITION BY RANGE (single-column)` cannot
+/// express directly (it would require a generated/coalesced key column
+/// derived per-entity-type, itself a larger design decision than this
+/// phase's explicit scope). Consistent with the disclosed precedent
+/// already set by `seating_assignments` (Phase 13) and `notifications`
+/// (Phase 15) — both deferred physical partitioning to "Phase 21
+/// (Performance Optimization)" for their own, different Prisma/constraint
+/// conflicts — physical partitioning of `audit_logs` is likewise DEFERRED
+/// to Phase 21, disclosed here rather than silently skipped. The
+/// `academicYear` column below is still populated at write time
+/// (denormalized from the audited entity where determinable) so that,
+/// when Phase 21 designs the actual partitioning migration, the range key
+/// already exists and is backfilled — no separate backfill migration
+/// needed later.
+model AuditLog {
+  id         String     @id @default(uuid()) @db.Uuid
+  actorId    String     @map("actor_id") @db.Uuid
+  action     AuditAction
+  entityType String     @map("entity_type")
+  entityId   String     @map("entity_id")
+  oldValue   Json?      @map("old_value")
+  newValue   Json?      @map("new_value")
+  reason     String?
+  requestId  String?    @map("request_id")
+  academicYear Int?     @map("academic_year")
+  createdAt  DateTime   @default(now()) @map("created_at")
+
+  actor User @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+/// Mirrors `AuditHookService.AuditWriteEvent['action']`'s literal union,
+/// established Phase 2 onward at every call site — kept identical rather
+/// than expanded, since Phase 20's scope is wiring the existing hook to a
+/// real table, not redesigning the action vocabulary those call sites
+/// already use (IMPLEMENTATION_PLAN.md "Do NOT redesign unrelated Phase
+/// 0–19 functionality").
+enum AuditAction {
+  CREATE
+  UPDATE
+  DEACTIVATE
+  REACTIVATE
+}

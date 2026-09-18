@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import './tokens.css';
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-background text-text font-sans text-base antialiased;
+  }
+  * {
+    @apply border-border;
+  }
+}

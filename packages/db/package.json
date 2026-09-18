@@ -1,0 +1,29 @@
+{
+  "name": "@exam-sync/db",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Prisma schema + migrations — source of truth for ARCHITECTURE.md §AC.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "echo \"@exam-sync/db: no tests yet (Phase 1 has migrations but no unit-testable logic here)\" && exit 0",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:seed": "ts-node prisma/seed.ts"
+  },
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.19.1",
+    "argon2": "^0.40.3"
+  },
+  "devDependencies": {
+    "prisma": "^5.19.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  }
+}

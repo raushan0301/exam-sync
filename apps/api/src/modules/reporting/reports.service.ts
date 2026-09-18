@@ -1,0 +1,76 @@
+import { ConflictException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { Queue } from 'bullmq';
+import { ReportJob, ReportJobStatus, ReportType } from '@exam-sync/db';
+import { PrismaService } from '../../common/prisma/prisma.service';
+import { REPORTS_QUEUE } from '../../common/queue/queue.constants';
+import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { ExamSessionsService } from '../exam-session';
+import { CreateReportDto } from './dto/create-report.dto';
+
+/**
+ * Owns `report_jobs` (Phase 19, IMPLEMENTATION_PLAN.md: "async report
+ * generation ... async export jobs, signed URL delivery via
+ * notification"). This class is the producer half only — it creates the
+ * `PENDING` job row and enqueues it; `ReportWorkerService` (this same
+ * process, `common/queue/`-adjacent infrastructure) is the consumer that
+ * actually runs the query + writes the file.
+ *
+ * All 4 report-creation endpoints and the status/download reads are
+ * ADMIN-only per API_CONTRACT.md's "Reports" table — no FACULTY/STUDENT
+ * scoping exists for this module at all (unlike `attendance`/`incidents`
+ * own resource-level scoping), so this service never checks
+ * `actor.roles` beyond what the controller's `@Roles(ROLE.ADMIN)` already
+ * enforces.
+ */
+@Injectable()
+export class ReportsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly examSessionsService: ExamSessionsService,
+    @Inject(REPORTS_QUEUE) private readonly reportsQueue: Queue,
+  ) {}
+
+  async create(reportType: ReportType, dto: CreateReportDto, actor: AuthenticatedUser): Promise<ReportJob> {
+    await this.examSessionsService.findById(dto.exam_session_id); // 404 if the session doesn't exist
+
+    const job = await this.prisma.reportJob.create({
+      data: {
+        reportType,
+        format: dto.format,
+        examSessionId: dto.exam_session_id,
+        requestedByAdminId: actor.id,
+      },
+    });
+
+    await this.reportsQueue.add('generate', { reportJobId: job.id }, { jobId: job.id, attempts: 1 });
+
+    return job;
+  }
+
+  /** `GET /report-jobs/{id}` — "status + download URL when ready" (API_CONTRACT.md). */
+  async findById(id: string): Promise<ReportJob> {
+    const job = await this.prisma.reportJob.findUnique({ where: { id } });
+    if (!job) {
+      throw new NotFoundException();
+    }
+    return job;
+  }
+
+  /**
+   * `GET /report-jobs/{id}/download` — disclosed addition (see
+   * `ReportJob`'s own schema doc comment): the concrete implementation of
+   * the "signed URL" `result_url` points to, since no object storage is
+   * wired anywhere in this codebase.
+   */
+  async download(id: string): Promise<{ data: Buffer; contentType: string; filename: string }> {
+    const job = await this.findById(id);
+    if (job.status !== ReportJobStatus.COMPLETED || !job.resultData) {
+      throw new ConflictException(`Report is in status "${job.status}" — not ready to download.`);
+    }
+    return {
+      data: Buffer.from(job.resultData),
+      contentType: job.resultContentType ?? 'application/octet-stream',
+      filename: job.resultFilename ?? `report-${id}`,
+    };
+  }
+}

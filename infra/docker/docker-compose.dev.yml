@@ -1,0 +1,37 @@
+# Local dev environment (Phase 0 DoD: "deploys to a dev environment").
+# Postgres and Redis are provisioned here now so Phase 1+ can connect
+# immediately; no application containers run domain logic yet since Phase 0
+# has none. The API can be run locally via `npm run start:dev` against these.
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: exam_sync
+      POSTGRES_PASSWORD: exam_sync
+      POSTGRES_DB: exam_sync
+    ports:
+      - '5432:5432'
+    volumes:
+      - exam_sync_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U exam_sync']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  exam_sync_postgres_data:
