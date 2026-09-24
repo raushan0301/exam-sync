@@ -7,6 +7,7 @@ import { QuizApprovalHistoryService } from './quiz-approval-history.service';
 import { AcademicStructureModule } from '../academic-structure';
 import { FacultyModule } from '../faculty';
 import { FacultyAssignmentModule } from '../faculty-assignment';
+import { EnrollmentModule } from '../enrollment';
 
 /**
  * QuizModule — Phase 6 (replaces the Phase 0 empty skeleton), extended in
@@ -19,7 +20,7 @@ import { FacultyAssignmentModule } from '../faculty-assignment';
  * QuizModule back, so no cycle.
  */
 @Module({
-  imports: [AcademicStructureModule, FacultyModule, FacultyAssignmentModule],
+  imports: [AcademicStructureModule, FacultyModule, FacultyAssignmentModule, EnrollmentModule],
   controllers: [QuizzesController],
   providers: [
     QuizzesService,
@@ -27,6 +28,10 @@ import { FacultyAssignmentModule } from '../faculty-assignment';
     QuizAccessRepository,
     QuizApprovalHistoryService,
   ],
-  exports: [QuizzesService],
+  // QuizOwnershipService is exported alongside QuizzesService because
+  // ExamSessionModule needs it directly (ExamSessionsService injects it to
+  // check "does this faculty own/co-instruct the quiz being attached" —
+  // the faculty-lifecycle-ownership change), not just through QuizzesService.
+  exports: [QuizzesService, QuizOwnershipService],
 })
 export class QuizModule {}

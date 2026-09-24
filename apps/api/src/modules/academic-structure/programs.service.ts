@@ -1,5 +1,5 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, Program, AcademicStatus } from '@exam-sync/db';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma, Program, AcademicStatus, ImportJob } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
@@ -9,6 +9,10 @@ import {
   resolveLimit,
   toPaginatedResult,
 } from '../../common/pagination/paginate';
+import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
+import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
+import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
+import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
 import { DepartmentsService } from './departments.service';
 import { CreateProgramDto } from './dto/create-program.dto';
 import { UpdateProgramDto } from './dto/update-program.dto';
@@ -27,6 +31,7 @@ export class ProgramsService {
     private readonly prisma: PrismaService,
     private readonly auditHook: AuditHookService,
     private readonly departmentsService: DepartmentsService,
+    private readonly importJobsService: ImportJobsService,
   ) {}
 
   async create(dto: CreateProgramDto, actor: AuthenticatedUser): Promise<Program> {
@@ -65,6 +70,11 @@ export class ProgramsService {
       throw new NotFoundException();
     }
     return program;
+  }
+
+  /** Non-throwing lookup by code — used by bulk-import to resolve a human-readable code to an id. */
+  async findByCode(code: string): Promise<Program | null> {
+    return this.prisma.program.findUnique({ where: { code } });
   }
 
   async list(params: ListProgramsParams): Promise<PaginatedResult<Program>> {
@@ -151,5 +161,68 @@ export class ProgramsService {
       throw new ConflictException(`Program code "${code}" already exists.`);
     }
     throw err;
+  }
+
+  /** `GET /programs/bulk-import/template` (ADMIN). */
+  /** Example row is a real existing program (+ its department's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
+  async generateBulkImportTemplate(): Promise<Buffer> {
+    const sample = await this.prisma.program.findFirst({
+      where: { status: 'ACTIVE', department: { status: 'ACTIVE' } },
+      orderBy: { createdAt: 'desc' },
+      include: { department: true },
+    });
+    return generateExcelTemplate({
+      entityName: 'Program',
+      uniqueFieldsNote: 'Unique key: code',
+      columns: [
+        { header: 'department_code', example: sample?.department.code ?? 'CSE', note: 'Must match an existing Department\'s code.' },
+        { header: 'code', example: sample?.code ?? 'BTECH-CSE', note: 'Unique — cannot repeat an existing program code.' },
+        { header: 'name', example: sample?.name ?? 'B.Tech Computer Science', note: 'Display name.' },
+      ],
+    });
+  }
+
+  /** `POST /programs/bulk-import` (ADMIN). Resolves `department_code` -> `department_id` per row. */
+  async bulkImport(buffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
+    const records = await parseExcelBuffer(buffer, ['department_code', 'code', 'name']);
+
+    const results: ImportRowResult[] = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (let i = 0; i < records.length; i++) {
+      const rowNumber = i + 2;
+      const record = records[i];
+      try {
+        const department = await this.departmentsService.findByCode(record.department_code);
+        if (!department) {
+          throw new BadRequestException(`Department code '${record.department_code}' not found`);
+        }
+        const dto: CreateProgramDto = {
+          department_id: department.id,
+          code: record.code,
+          name: record.name,
+        };
+        const program = await this.create(dto, actor);
+        results.push({ row: rowNumber, status: 'SUCCESS', id: program.id });
+        successCount++;
+      } catch (err) {
+        results.push({
+          row: rowNumber,
+          status: 'FAILURE',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        });
+        failureCount++;
+      }
+    }
+
+    return this.importJobsService.create({
+      resourceType: 'programs',
+      totalRows: records.length,
+      successCount,
+      failureCount,
+      results,
+      createdByUserId: actor.id,
+    });
   }
 }

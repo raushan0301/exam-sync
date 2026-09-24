@@ -9,10 +9,6 @@ import type { Attendance, AttendanceStatus, SeatingAssignment } from '@/lib/quer
 const STATUS_OPTIONS: { value: AttendanceStatus; label: string }[] = [
   { value: 'PRESENT', label: 'Present' },
   { value: 'ABSENT', label: 'Absent' },
-  { value: 'LATE', label: 'Late' },
-  { value: 'EXCUSED', label: 'Excused' },
-  { value: 'MEDICAL', label: 'Medical' },
-  { value: 'OTHER', label: 'Other' },
 ];
 
 export interface AttendanceQuickMarkPanelProps {
@@ -25,13 +21,14 @@ export interface AttendanceQuickMarkPanelProps {
 /**
  * The single most important mobile interaction in this milestone
  * (FRONTEND_UX_ARCHITECTURE.md §8/§12): "attendance marking IS clicking a
- * seat, not filling a separate form." Large (≥44px) status buttons, no
- * dropdown. First mark uses `useMarkAttendance` (method: SEAT_BASED, since
- * this is driven entirely by a seat-map click); a re-mark of an existing
- * record uses `useUpdateAttendance`, which proactively shows the reason
- * field once `attendance.locked` is true rather than waiting for the 423
- * round trip (same "require it client-side once you know" convention
- * BR-035 calls for here, mirroring M5/M7's reason-required precedent).
+ * seat, not filling a separate form." Only Present/Absent — the other
+ * `AttendanceStatus` values (LATE/EXCUSED/MEDICAL/OTHER) remain valid on
+ * the backend/existing data but are no longer offered from this UI. For
+ * the common (unlocked) case, `RoomAttendanceCard` skips this panel
+ * entirely and toggles Present/Absent directly on seat click; this panel
+ * only renders for a LOCKED record, where BR-035 requires a reason before
+ * the change is allowed — proactively shown once `attendance.locked` is
+ * true, rather than waiting for the 423 round trip.
  */
 export function AttendanceQuickMarkPanel({ examSessionId, assignment, attendance, onClose }: AttendanceQuickMarkPanelProps) {
   const [reason, setReason] = useState('');
@@ -74,7 +71,7 @@ export function AttendanceQuickMarkPanel({ examSessionId, assignment, attendance
     <div role="dialog" aria-label={`Mark attendance for ${assignment.student.name}`} className="flex w-full max-w-sm flex-col gap-3 rounded border border-border bg-surface p-4 text-sm shadow-sm">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <p className="font-medium text-text">{assignment.student.name}</p>
+          <p className="font-medium text-text">{assignment.student.name} ({assignment.student.rollNumber})</p>
           <p className="text-xs text-text-muted">{assignment.quiz.title}</p>
         </div>
         <button type="button" onClick={onClose} className="text-xs text-text-muted hover:text-text" aria-label="Close">

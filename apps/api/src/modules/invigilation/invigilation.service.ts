@@ -9,7 +9,7 @@ import {
   resolveLimit,
   toPaginatedResult,
 } from '../../common/pagination/paginate';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { FacultyService } from '../faculty';
 import { ConflictEngineService } from '../conflict-engine';
 import { CreateInvigilatorDto } from './dto/create-invigilator.dto';
@@ -17,6 +17,19 @@ import { CreateInvigilatorDto } from './dto/create-invigilator.dto';
 export interface ListDutiesParams {
   cursor?: string;
   limit?: number;
+}
+
+/**
+ * `ExamInvigilator` plus the human-readable bits the frontend needs to
+ * display a duty without a separate lookup — an invigilator assigned to
+ * someone ELSE's session cannot call `GET /exam-sessions/{id}` themselves
+ * (`ExamSessionsAccessRepository` only grants the creating faculty, not
+ * co-instructors or invigilators), so this denormalizes the session
+ * name/schedule and room label directly onto each row instead.
+ */
+export interface InvigilatorDuty extends ExamInvigilator {
+  examSession: { name: string; sessionDate: Date; startTime: Date; endTime: Date; status: ExamSessionStatus };
+  room: { building: string; roomNumber: string };
 }
 
 /**
@@ -50,6 +63,7 @@ export class InvigilationService {
     private readonly examSessionsService: ExamSessionsService,
     private readonly facultyService: FacultyService,
     private readonly conflictEngine: ConflictEngineService,
+    private readonly examSessionOwnershipService: ExamSessionOwnershipService,
   ) {}
 
   /**
@@ -80,6 +94,9 @@ export class InvigilationService {
     actor: AuthenticatedUser,
   ): Promise<ExamInvigilator> {
     const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (session.status === ExamSessionStatus.CANCELLED) {
       throw new ConflictException('This exam session is CANCELLED and cannot receive new invigilator assignments.');
     }
@@ -157,7 +174,82 @@ export class InvigilationService {
       })
       .catch((err) => this.mapUniqueViolation(err));
 
+    // Outside the transaction, same pattern SeatingEngineService uses
+    // after validating/finalizing a plan — this assignment may be the
+    // LAST piece (every room already had a validated/finalized seating
+    // plan, just not an invigilator yet) that makes the session ready to
+    // finalize; a no-op read-only check otherwise.
+    await this.examSessionsService.maybeAdvanceToReadyForFinalization(examSessionId);
+
     return created;
+  }
+
+  /**
+   * `DELETE /exam-sessions/{id}/invigilators/{invigilatorId}` (FACULTY,
+   * ownership-gated) — undocumented addition alongside `listForSession`:
+   * there was previously no way to change an assignment at all once made
+   * (wrong faculty, wrong room, wrong role) short of leaving it wrong.
+   * Hard-deletes the row (no soft-delete column on `ExamInvigilator`,
+   * unlike e.g. `QuizStudentAssignment`'s CANCELLED status) — the generic
+   * audit hook still records the removal. To actually change who's
+   * invigilating, the caller removes the wrong assignment then calls
+   * `assign` again with the corrected room/faculty/role.
+   */
+  async remove(examSessionId: string, invigilatorId: string, actor: AuthenticatedUser): Promise<void> {
+    await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
+
+    const invigilator = await this.prisma.examInvigilator.findUnique({ where: { id: invigilatorId } });
+    if (!invigilator || invigilator.examSessionId !== examSessionId) {
+      throw new NotFoundException();
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.examInvigilator.delete({ where: { id: invigilatorId } });
+      // AuditAction has no DELETE member (this codebase's audit log is
+      // otherwise append-only over soft-deletes/status changes) — UPDATE
+      // with a null newValue is the closest honest mapping for this one
+      // genuinely hard-deleted row.
+      await this.auditHook.record(
+        {
+          actor,
+          action: 'UPDATE',
+          entityType: 'ExamInvigilator',
+          entityId: invigilatorId,
+          oldValue: invigilator,
+          newValue: null,
+        },
+        tx,
+      );
+    });
+  }
+
+  /**
+   * `GET /exam-sessions/{id}/invigilators` — ADMIN (unscoped) or the
+   * owning/co-instructing FACULTY (scoped, via
+   * `ExamSessionsService.findByIdScoped` — same rule every other
+   * session-scoped GET in this feature uses). Added alongside the
+   * faculty-lifecycle-ownership change's own UI work: `InvigilatorPanel`
+   * previously had no way to recover its "current assignments" list
+   * across a page reload (its own doc comment disclosed this — the
+   * assignments were always saved server-side, just never re-listable).
+   */
+  async listForSession(
+    examSessionId: string,
+    actor: AuthenticatedUser,
+    params: ListDutiesParams,
+  ): Promise<PaginatedResult<ExamInvigilator>> {
+    await this.examSessionsService.findByIdScoped(examSessionId, actor);
+
+    const limit = resolveLimit(params.limit);
+    const rows = await this.prisma.examInvigilator.findMany({
+      where: { examSessionId },
+      orderBy: { assignedAt: 'desc' },
+      ...cursorFindManyArgs(params.cursor, limit),
+    });
+    return toPaginatedResult(rows, limit);
   }
 
   /**
@@ -171,7 +263,7 @@ export class InvigilationService {
     facultyId: string,
     actor: AuthenticatedUser,
     params: ListDutiesParams,
-  ): Promise<PaginatedResult<ExamInvigilator>> {
+  ): Promise<PaginatedResult<InvigilatorDuty>> {
     const isAdmin = actor.roles.includes(ROLE.ADMIN);
     if (!isAdmin) {
       const actingFaculty = await this.facultyService.findByUserId(actor.id);
@@ -188,9 +280,13 @@ export class InvigilationService {
     const rows = await this.prisma.examInvigilator.findMany({
       where: { facultyId },
       orderBy: { assignedAt: 'desc' },
+      include: {
+        examSession: { select: { name: true, sessionDate: true, startTime: true, endTime: true, status: true } },
+        room: { select: { building: true, roomNumber: true } },
+      },
       ...cursorFindManyArgs(params.cursor, limit),
     });
-    return toPaginatedResult(rows, limit);
+    return toPaginatedResult(rows as InvigilatorDuty[], limit);
   }
 
   /** Maps a concurrent unique-constraint race on `(exam_session_id, room_id, faculty_id)` to a clean 409 — the app-level `existing` check above is the primary UX path; this is the ADR-003-style backstop for the tiny window between that read and the insert. */

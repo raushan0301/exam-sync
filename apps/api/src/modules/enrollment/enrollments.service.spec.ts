@@ -23,8 +23,8 @@ function buildPrismaMock() {
   } as any;
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
-const faculty: AuthenticatedUser = { id: 'faculty-user-1', email: 'f@example.com', roles: ['FACULTY'] };
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
+const faculty: AuthenticatedUser = { id: 'faculty-user-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
 
 describe('EnrollmentsService — BR-004/005/006 (the highest-leverage correctness surface in this phase)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
@@ -231,7 +231,7 @@ describe('EnrollmentsService — BR-004/005/006 (the highest-leverage correctnes
       studentsService.findById.mockResolvedValue({ id: 's1', userId: 'student-user-1', batchId: 'b1' });
       prisma.studentSubjectEnrollment.findMany.mockResolvedValue([]);
 
-      const actor: AuthenticatedUser = { id: 'student-user-1', email: 's@b.com', roles: ['STUDENT'] };
+      const actor: AuthenticatedUser = { id: 'student-user-1', email: 's@b.com', roles: ['STUDENT'], mustChangePassword: false };
       await expect(service.listForStudent('s1', actor)).resolves.toEqual([]);
       expect(facultyAssignmentsService.isFacultyTeachingBatch).not.toHaveBeenCalled();
     });
@@ -264,7 +264,7 @@ describe('EnrollmentsService — BR-004/005/006 (the highest-leverage correctnes
 
     it('blocks an unrelated STUDENT with 404', async () => {
       studentsService.findById.mockResolvedValue({ id: 's1', userId: 'the-real-owner', batchId: 'b1' });
-      const otherStudent: AuthenticatedUser = { id: 'a-different-student', email: 'x@b.com', roles: ['STUDENT'] };
+      const otherStudent: AuthenticatedUser = { id: 'a-different-student', email: 'x@b.com', roles: ['STUDENT'], mustChangePassword: false };
 
       await expect(service.listForStudent('s1', otherStudent)).rejects.toThrow(NotFoundException);
     });

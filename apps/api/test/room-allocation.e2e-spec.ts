@@ -107,7 +107,7 @@ describe('Room Allocation (e2e) — Phase 12', () => {
   });
 
   async function createIsolatedBatch() {
-    const batch = await prisma.batch.create({ data: { programId, year: 2026, section: `P12-${Date.now()}-${Math.random()}` } });
+    const batch = await prisma.batch.create({ data: { programId, year: '2026', section: `P12-${Date.now()}-${Math.random()}`, subsection: `P12-${Date.now()}-${Math.random()}` } });
     for (const subjectId of [dbmsSubjectId, osSubjectId]) {
       await request(app.getHttpServer())
         .post('/faculty-assignments')
@@ -150,14 +150,23 @@ describe('Room Allocation (e2e) — Phase 12', () => {
     const created = await request(app.getHttpServer())
       .post('/quizzes')
       .set('Authorization', `Bearer ${facultyToken}`)
-      .send({ title: `P12 Quiz ${suffix}-${quizCounter}`, subject_id: subjectId, batch_ids: [batchId], academic_year: '2026', semester: 1 })
+      .send({
+        title: `P12 Quiz ${suffix}-${quizCounter}`,
+        subject_id: subjectId,
+        batch_ids: [batchId],
+        academic_year: '2026',
+        semester: 1,
+        student_count: 60,
+        preferred_date: '2026-05-01',
+        preferred_time: '10:00',
+      })
       .expect(201);
 
     await request(app.getHttpServer())
       .patch(`/quizzes/${created.body.id}`)
       .set('Authorization', `Bearer ${facultyToken}`)
       .set('If-Match', String(created.body.version))
-      .send({ duration_minutes: 60, total_marks: 100, question_count: 20, quiz_type: 'QUIZ', preferred_date: '2026-05-01', preferred_time: '10:00' })
+      .send({ duration_minutes: 60, quiz_type: 'QUIZ' })
       .expect(200);
 
     const submitted = await request(app.getHttpServer())

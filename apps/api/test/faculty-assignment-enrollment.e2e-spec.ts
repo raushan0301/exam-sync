@@ -81,11 +81,11 @@ describe('Faculty-Subject-Batch Assignment + Enrollment (e2e) — Phase 5', () =
     departmentId = dept.id;
     const prog = await prisma.program.create({ data: { departmentId, name: 'B.Tech CSE', code: progCode } });
     programId = prog.id;
-    const batchA = await prisma.batch.create({ data: { programId, year: 2026, section: 'A' } });
+    const batchA = await prisma.batch.create({ data: { programId, year: '2026', section: 'A', subsection: 'A' } });
     batchAId = batchA.id;
-    const batchB = await prisma.batch.create({ data: { programId, year: 2026, section: 'B' } });
+    const batchB = await prisma.batch.create({ data: { programId, year: '2026', section: 'B', subsection: 'B' } });
     batchBId = batchB.id;
-    const batchC = await prisma.batch.create({ data: { programId, year: 2026, section: 'C' } });
+    const batchC = await prisma.batch.create({ data: { programId, year: '2026', section: 'C', subsection: 'C' } });
     batchCId = batchC.id;
     const dbms = await prisma.subject.create({
       data: { departmentId, code: `DBMS-${suffix}`, name: 'Database Management Systems' },

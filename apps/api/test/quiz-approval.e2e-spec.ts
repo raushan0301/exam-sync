@@ -65,7 +65,7 @@ describe('Quiz Admin Approval (e2e) — Phase 7', () => {
     departmentId = dept.id;
     const prog = await prisma.program.create({ data: { departmentId, name: 'B.Tech CSE', code: progCode } });
     programId = prog.id;
-    const batchA = await prisma.batch.create({ data: { programId, year: 2026, section: 'A' } });
+    const batchA = await prisma.batch.create({ data: { programId, year: '2026', section: 'A', subsection: 'A' } });
     batchAId = batchA.id;
     const dbms = await prisma.subject.create({
       data: { departmentId, code: `DBMS-${suffix}`, name: 'Database Management Systems' },
@@ -157,7 +157,16 @@ describe('Quiz Admin Approval (e2e) — Phase 7', () => {
     const created = await request(app.getHttpServer())
       .post('/quizzes')
       .set('Authorization', `Bearer ${token}`)
-      .send({ title: `DBMS Quiz ${roll}`, subject_id: dbmsSubjectId, batch_ids: [batchAId], academic_year: '2026', semester: 1 })
+      .send({
+        title: `DBMS Quiz ${roll}`,
+        subject_id: dbmsSubjectId,
+        batch_ids: [batchAId],
+        academic_year: '2026',
+        semester: 1,
+        student_count: 60,
+        preferred_date: '2026-05-01',
+        preferred_time: '10:00',
+      })
       .expect(201);
 
     await request(app.getHttpServer())
@@ -166,8 +175,7 @@ describe('Quiz Admin Approval (e2e) — Phase 7', () => {
       .set('If-Match', String(created.body.version))
       .send({
         duration_minutes: 60,
-        total_marks: 100,
-        question_count: 20,
+        student_count: 60,
         quiz_type: 'QUIZ',
         preferred_date: '2026-05-01',
         preferred_time: '10:00',

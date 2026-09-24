@@ -9,6 +9,7 @@ function buildClientMock() {
     room: { findMany: jest.fn() },
     examSessionRoom: { findMany: jest.fn() },
     examInvigilator: { findMany: jest.fn() },
+    faculty: { findUnique: jest.fn() },
   } as any;
 }
 
@@ -85,7 +86,12 @@ describe('ConflictEngineService — Phase 10 (real BR-019 student-overlap detect
           endTime: { gt: START_10 },
         },
       },
-      select: { studentId: true, examSessionId: true },
+      select: {
+        studentId: true,
+        examSessionId: true,
+        student: { select: { name: true, rollNumber: true } },
+        examSession: { select: { name: true } },
+      },
       distinct: ['studentId'],
     });
     const calledWith = client.quizStudentAssignment.findMany.mock.calls[0][0];
@@ -97,7 +103,7 @@ describe('ConflictEngineService — Phase 10 (real BR-019 student-overlap detect
     quizzesService.getBatchIds.mockResolvedValue(['batch-A']);
     enrollmentsService.findEligibleStudentIds.mockResolvedValue(['student-1', 'student-2']);
     client.quizStudentAssignment.findMany.mockResolvedValue([
-      { studentId: 'student-1', examSessionId: 'other-session-1' },
+      { studentId: 'student-1', examSessionId: 'other-session-1', student: { name: 'Jane Doe', rollNumber: 'R001' }, examSession: { name: 'Midterm' } },
     ]);
 
     const result = await service.checkSessionAssembly(
@@ -120,7 +126,7 @@ describe('ConflictEngineService — Phase 10 (real BR-019 student-overlap detect
     quizzesService.getBatchIds.mockResolvedValue(['batch-A']);
     enrollmentsService.findEligibleStudentIds.mockResolvedValue(['student-1']);
     client.quizStudentAssignment.findMany.mockResolvedValue([
-      { studentId: 'student-1', examSessionId: 'other-session-1' },
+      { studentId: 'student-1', examSessionId: 'other-session-1', student: { name: 'Jane Doe', rollNumber: 'R001' }, examSession: { name: 'Midterm' } },
     ]);
 
     const input = { examSessionId: 's1', quizIds: ['quiz-1'], sessionDate: SESSION_DATE, startTime: START_10, endTime: END_11 };
@@ -189,7 +195,14 @@ describe('ConflictEngineService.checkRoomAllocation — Phase 12 (BR-018 room do
 
   it('reports ROOM_OVERLAP for a room already allocated to a DIFFERENT overlapping session', async () => {
     client.room.findMany.mockResolvedValue([{ id: 'room-1', status: RoomStatus.ACTIVE, availabilityBlocks: [] }]);
-    client.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1', examSessionId: 'other-session' }]);
+    client.examSessionRoom.findMany.mockResolvedValue([
+      {
+        roomId: 'room-1',
+        examSessionId: 'other-session',
+        room: { building: 'B', roomNumber: '101' },
+        examSession: { name: 'Other Exam' },
+      },
+    ]);
 
     const result = await service.checkRoomAllocation(input, client);
 
@@ -204,8 +217,14 @@ describe('ConflictEngineService.checkRoomAllocation — Phase 12 (BR-018 room do
         sessionDate: SESSION_DATE,
         startTime: { lt: END_11 },
         endTime: { gt: START_10 },
+        examSession: { status: { not: ExamSessionStatus.CANCELLED } },
       },
-      select: { roomId: true, examSessionId: true },
+      select: {
+        roomId: true,
+        examSessionId: true,
+        room: { select: { building: true, roomNumber: true } },
+        examSession: { select: { name: true } },
+      },
     });
   });
 
@@ -259,7 +278,15 @@ describe('ConflictEngineService.checkInvigilatorAssignment — Phase 16 (BR-020/
   });
 
   it('reports FACULTY_OVERLAP for an overlapping assignment in a DIFFERENT session', async () => {
-    client.examInvigilator.findMany.mockResolvedValue([{ examSessionId: 'other-session', roomId: 'room-9' }]);
+    client.examInvigilator.findMany.mockResolvedValue([
+      {
+        examSessionId: 'other-session',
+        roomId: 'room-9',
+        room: { building: 'B', roomNumber: '209' },
+        examSession: { name: 'Other Exam' },
+      },
+    ]);
+    client.faculty.findUnique.mockResolvedValue({ name: 'Dr. Kapoor' });
 
     const result = await service.checkInvigilatorAssignment(input, client);
 
@@ -269,12 +296,21 @@ describe('ConflictEngineService.checkInvigilatorAssignment — Phase 16 (BR-020/
         facultyId: 'fac-1',
         roomId: 'room-9',
         conflictingExamSessionId: 'other-session',
+        message: expect.stringContaining('Dr. Kapoor'),
       }),
     ]);
   });
 
   it('reports FACULTY_OVERLAP for a DIFFERENT room within the SAME session (identical time window)', async () => {
-    client.examInvigilator.findMany.mockResolvedValue([{ examSessionId: 's1', roomId: 'room-2' }]);
+    client.examInvigilator.findMany.mockResolvedValue([
+      {
+        examSessionId: 's1',
+        roomId: 'room-2',
+        room: { building: 'B', roomNumber: '210' },
+        examSession: { name: 'Test Exam' },
+      },
+    ]);
+    client.faculty.findUnique.mockResolvedValue({ name: 'Dr. Kapoor' });
 
     const result = await service.checkInvigilatorAssignment(input, client);
 
@@ -299,7 +335,12 @@ describe('ConflictEngineService.checkInvigilatorAssignment — Phase 16 (BR-020/
           endTime: { gt: START_10 },
         },
       },
-      select: { examSessionId: true, roomId: true },
+      select: {
+        examSessionId: true,
+        roomId: true,
+        room: { select: { building: true, roomNumber: true } },
+        examSession: { select: { name: true } },
+      },
     });
   });
 

@@ -1,9 +1,10 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { useState } from 'react';
 import { Plus } from 'lucide-react';
-import { Button, StatusBadge, Select, FilterBar, Pagination } from '@/components/ui';
+import { Button, Card, StatusBadge, Select, FilterBar, Pagination } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
 import { useQuizzes } from '@/lib/queries/useQuizzes';
@@ -42,9 +43,30 @@ export default function FacultyQuizzesPage() {
     { key: 'title', header: 'Title', render: (q) => q.title },
     { key: 'subject', header: 'Subject', render: (q) => subjectById.get(q.subjectId)?.name ?? q.subjectId },
     { key: 'status', header: 'Status', render: (q) => <StatusBadge status={q.status} /> },
+    {
+      key: 'session',
+      header: 'Exam Session',
+      render: (q) =>
+        q.examSession ? (
+          <Link href={`/faculty/exam-sessions/${q.examSession.id}`} className="flex items-center gap-2 text-primary-600 hover:underline">
+            <StatusBadge status={q.examSession.status} />
+          </Link>
+        ) : (
+          <span className="text-text-muted">Not scheduled</span>
+        ),
+    },
     { key: 'term', header: 'Year / Semester', render: (q) => `${q.academicYear} / Sem ${q.semester}` },
     { key: 'updatedAt', header: 'Updated', render: (q) => new Date(q.updatedAt).toLocaleDateString() },
   ];
+
+  const items = data?.items ?? [];
+  // Same split already used for "My Exam Sessions" and "My Invigilation
+  // Duties" — once the quiz's own exam session is COMPLETED or
+  // CANCELLED, there's nothing left to act on for it. A quiz with no
+  // exam session yet (or one still in progress) stays in the active list.
+  const isHistorical = (q: Quiz) => q.examSession?.status === 'COMPLETED' || q.examSession?.status === 'CANCELLED';
+  const activeQuizzes = items.filter((q) => !isHistorical(q));
+  const historyQuizzes = items.filter(isHistorical);
 
   return (
     <div className="flex flex-col gap-4">
@@ -72,7 +94,7 @@ export default function FacultyQuizzesPage() {
 
       <DataTable
         columns={columns}
-        data={data?.items ?? []}
+        data={activeQuizzes}
         getRowKey={(q) => q.id}
         isLoading={isLoading}
         isError={isError}
@@ -89,7 +111,25 @@ export default function FacultyQuizzesPage() {
         )}
       />
 
-      {(data?.items?.length ?? 0) > 0 && (
+      {historyQuizzes.length > 0 && (
+        <Card header={<h2 className="text-sm font-semibold text-text">History</h2>} padding="dense">
+          <DataTable
+            columns={columns}
+            data={historyQuizzes}
+            getRowKey={(q) => q.id}
+            isLoading={false}
+            isError={false}
+            emptyTitle="No past quizzes yet"
+            renderActions={(q) => (
+              <Button size="sm" variant="secondary" onClick={() => router.push(`/faculty/quizzes/${q.id}`)}>
+                View
+              </Button>
+            )}
+          />
+        </Card>
+      )}
+
+      {items.length > 0 && (
         <Pagination hasNext={!!data?.next_cursor} hasPrev={pager.hasPrev} onNext={() => pager.goNext(data?.next_cursor)} onPrev={pager.goPrev} />
       )}
     </div>

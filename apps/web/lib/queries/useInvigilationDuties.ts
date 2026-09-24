@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { Invigilator, PaginatedResult } from './types';
+import type { Invigilator, InvigilatorDuty, PaginatedResult } from './types';
 
 export interface UseInvigilationDutiesParams {
   cursor?: string;
@@ -14,19 +14,15 @@ export interface UseInvigilationDutiesParams {
 /**
  * GET /faculty/{id}/invigilation-duties — self (the calling faculty's own
  * duties) or ADMIN, verified against `InvigilationService.listDuties`.
+ * Returns `InvigilatorDuty` rows (session name/schedule + room label
+ * denormalized onto each one — see that type's own comment for why).
  *
  * `facultyId` is REQUIRED as a path param even for the "self" case — the
  * backend resolves "is this really you" via `facultyService.findByUserId`
  * server-side, but the URL itself still needs the Faculty row's id, not
- * the caller's User id. `GET /users/me` (the only self-identity endpoint
- * on this backend) returns exactly `{id, email, isActive, roles,
- * createdAt}` — no `facultyId` — so this hook cannot resolve its own
- * `facultyId` from the current session. This is the SAME gap
- * `app/faculty/dashboard/page.tsx` already documented for M3 ("My
- * Assignments"/"My Invigilation Duties" omitted for the identical
- * reason). Callers pass `facultyId: undefined` when it is unknown, which
- * disables the query — the caller then renders an honest EmptyState
- * rather than attempting a request that has no valid URL to hit.
+ * the caller's User id. Resolve it first via `useMyFaculty` (`GET
+ * /faculty/me`); callers pass `facultyId: undefined` while that's still
+ * loading/unavailable, which disables this query.
  */
 export function useInvigilationDuties(facultyId: string | undefined, params: UseInvigilationDutiesParams = {}) {
   const query: Record<string, string | undefined> = {
@@ -36,8 +32,29 @@ export function useInvigilationDuties(facultyId: string | undefined, params: Use
 
   return useQuery({
     queryKey: queryKeys.invigilationDuties(facultyId ?? '', query),
-    queryFn: () => apiFetch<PaginatedResult<Invigilator>>(`/faculty/${facultyId}/invigilation-duties`, { query }),
+    queryFn: () => apiFetch<PaginatedResult<InvigilatorDuty>>(`/faculty/${facultyId}/invigilation-duties`, { query }),
     enabled: hasStoredSession() && !!facultyId,
     staleTime: 30_000,
+  });
+}
+
+/**
+ * GET /exam-sessions/{id}/invigilators — ADMIN (unscoped) or the
+ * owning/co-instructing FACULTY (scoped, 404 otherwise). Lets
+ * `InvigilatorPanel` recover its "current assignments" list across a page
+ * reload — it previously tracked assignments in local component state
+ * only, since this endpoint didn't exist yet.
+ */
+export function useSessionInvigilators(examSessionId: string, params: UseInvigilationDutiesParams = {}) {
+  const query: Record<string, string | undefined> = {
+    cursor: params.cursor,
+    limit: params.limit ? String(params.limit) : undefined,
+  };
+
+  return useQuery({
+    queryKey: queryKeys.sessionInvigilators(examSessionId, query),
+    queryFn: () => apiFetch<PaginatedResult<Invigilator>>(`/exam-sessions/${examSessionId}/invigilators`, { query }),
+    enabled: hasStoredSession() && !!examSessionId,
+    staleTime: 10_000,
   });
 }

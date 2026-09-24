@@ -1,5 +1,5 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, Department, AcademicStatus } from '@exam-sync/db';
+import { Prisma, Department, AcademicStatus, ImportJob } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
@@ -9,6 +9,10 @@ import {
   resolveLimit,
   toPaginatedResult,
 } from '../../common/pagination/paginate';
+import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
+import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
+import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
+import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
 import { CreateDepartmentDto } from './dto/create-department.dto';
 import { UpdateDepartmentDto } from './dto/update-department.dto';
 
@@ -24,6 +28,7 @@ export class DepartmentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditHook: AuditHookService,
+    private readonly importJobsService: ImportJobsService,
   ) {}
 
   async create(dto: CreateDepartmentDto, actor: AuthenticatedUser): Promise<Department> {
@@ -71,6 +76,11 @@ export class DepartmentsService {
       throw new NotFoundException();
     }
     return department;
+  }
+
+  /** Non-throwing lookup by code — used by bulk-import to resolve a human-readable code to an id, producing a friendly per-row error instead of a 404 crash. */
+  async findByCode(code: string): Promise<Department | null> {
+    return this.prisma.department.findUnique({ where: { code } });
   }
 
   async list(params: ListDepartmentsParams): Promise<PaginatedResult<Department>> {
@@ -162,5 +172,77 @@ export class DepartmentsService {
       throw new ConflictException(`Department code "${code}" already exists.`);
     }
     throw err;
+  }
+
+  /** `GET /departments/bulk-import/template` (ADMIN). */
+  /**
+   * The example row is a REAL existing department (falls back to a
+   * plainly-fictional placeholder only when the table is genuinely empty)
+   * — a real code always resolves against the real FK targets downstream
+   * bulk imports validate against, so the example is never accidentally
+   * invalid, and an admin who forgets to delete it before uploading gets
+   * a clean "already exists" failure instead of a confusing FK error.
+   *
+   * `status: ACTIVE` + newest-first: a stale/deactivated/inconsistently-
+   * coded row (e.g. an early duplicate created before a real catalog
+   * import, with a different naming convention than everything since)
+   * must never be the one picked — a real incident this exact template
+   * hit: an old duplicate Program row ("BECOE", no hyphen, unused) was
+   * `findFirst({orderBy: 'asc'})`'s pick over the real, hyphenated
+   * "BE-COE" every other program/batch/student actually uses. Every
+   * `generateBulkImportTemplate` in this codebase now filters the same
+   * way for the same reason (see each one's own reference to this note).
+   */
+  async generateBulkImportTemplate(): Promise<Buffer> {
+    const sample = await this.prisma.department.findFirst({ where: { status: 'ACTIVE' }, orderBy: { createdAt: 'desc' } });
+    return generateExcelTemplate({
+      entityName: 'Department',
+      uniqueFieldsNote: 'Unique key: code',
+      columns: [
+        { header: 'code', example: sample?.code ?? 'CSE', note: 'Unique — cannot repeat an existing department code.' },
+        { header: 'name', example: sample?.name ?? 'Computer Science & Engineering', note: 'Display name.' },
+      ],
+    });
+  }
+
+  /**
+   * `POST /departments/bulk-import` (ADMIN). Parses the uploaded .xlsx,
+   * processes rows independently via the existing `create()` method — one
+   * bad row never aborts the rest — and records the outcome via the
+   * generic ImportJobsService (same pattern as students.service.ts).
+   */
+  async bulkImport(buffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
+    const records = await parseExcelBuffer(buffer, ['code', 'name']);
+
+    const results: ImportRowResult[] = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (let i = 0; i < records.length; i++) {
+      const rowNumber = i + 2;
+      const record = records[i];
+      try {
+        const dto: CreateDepartmentDto = { code: record.code, name: record.name };
+        const department = await this.create(dto, actor);
+        results.push({ row: rowNumber, status: 'SUCCESS', id: department.id });
+        successCount++;
+      } catch (err) {
+        results.push({
+          row: rowNumber,
+          status: 'FAILURE',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        });
+        failureCount++;
+      }
+    }
+
+    return this.importJobsService.create({
+      resourceType: 'departments',
+      totalRows: records.length,
+      successCount,
+      failureCount,
+      results,
+      createdByUserId: actor.id,
+    });
   }
 }

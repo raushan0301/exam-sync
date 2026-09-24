@@ -67,12 +67,17 @@ datasource db {
 /// domain identity (Student, Faculty rows land in Phases 3/4) — Phase 1 only
 /// needs to know who can log in and what roles they hold.
 model User {
-  id           String   @id @default(uuid()) @db.Uuid
-  email        String   @unique
-  passwordHash String   @map("password_hash")
-  isActive     Boolean  @default(true) @map("is_active")
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  id                 String   @id @default(uuid()) @db.Uuid
+  email              String   @unique
+  passwordHash       String   @map("password_hash")
+  isActive           Boolean  @default(true) @map("is_active")
+  // Set true when an account is provisioned with a deterministic default
+  // password (roll_number/employee_code + name) rather than one the user
+  // chose themselves — forces a password change on first login. Cleared by
+  // AuthService.changePassword.
+  mustChangePassword Boolean  @default(false) @map("must_change_password")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
 
   roles               UserRole[]
   refreshTokens       RefreshToken[]
@@ -80,8 +85,8 @@ model User {
   faculty             Faculty?
   quizApprovalActions QuizApprovalHistory[]
   createdExamSessions ExamSession[]
-  resolvedIncidents   Incident[]        @relation("IncidentResolvedBy")
-  disclosedIncidents  Incident[]        @relation("IncidentDisclosedBy")
+  resolvedIncidents   Incident[]            @relation("IncidentResolvedBy")
+  disclosedIncidents  Incident[]            @relation("IncidentDisclosedBy")
   incidentActions     IncidentHistory[]
   requestedReportJobs ReportJob[]
   auditLogEntries     AuditLog[]
@@ -241,13 +246,22 @@ model Program {
 }
 
 model Batch {
-  id        String         @id @default(uuid()) @db.Uuid
-  programId String         @map("program_id") @db.Uuid
-  year      Int
-  section   String
-  status    AcademicStatus @default(ACTIVE)
-  createdAt DateTime       @default(now()) @map("created_at")
-  updatedAt DateTime       @updatedAt @map("updated_at")
+  id         String         @id @default(uuid()) @db.Uuid
+  programId  String         @map("program_id") @db.Uuid
+  // Admission-year cohort label. A free-form string rather than an int so it
+  // can hold either a single year ("2026") or a span ("2023-2027") for
+  // multi-year programs — not used as a real date, only as a display/grouping
+  // label, so no date/range type is warranted.
+  year       String
+  // Coarse section, e.g. "4C2" — groups multiple subsections.
+  section    String
+  // Fine-grained sub-group students actually belong to, e.g. "4C24". Unique
+  // together with (programId, year, section) — NOT unique on its own, since
+  // the same subsection label can recur under a different section/program.
+  subsection String
+  status     AcademicStatus @default(ACTIVE)
+  createdAt  DateTime       @default(now()) @map("created_at")
+  updatedAt  DateTime       @updatedAt @map("updated_at")
 
   program     Program                         @relation(fields: [programId], references: [id])
   students    Student[]
@@ -255,7 +269,7 @@ model Batch {
   enrollments StudentSubjectEnrollment[]
   quizBatches QuizBatch[]
 
-  @@unique([programId, year, section])
+  @@unique([programId, year, section, subsection])
   @@index([programId])
   @@map("batches")
 }
@@ -274,7 +288,8 @@ model Subject {
   programId    String?  @map("program_id") @db.Uuid
   code         String   @unique
   name         String
-  credits      Int?
+  // Float, not Int — some programs award half-credit subjects (e.g. 4.5, 3.5).
+  credits      Float?
   isActive     Boolean  @default(true) @map("is_active")
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
@@ -381,11 +396,11 @@ model Faculty {
   createdAt    DateTime       @default(now()) @map("created_at")
   updatedAt    DateTime       @updatedAt @map("updated_at")
 
-  user        User                            @relation(fields: [userId], references: [id])
-  department  Department                      @relation(fields: [departmentId], references: [id])
-  assignments FacultySubjectBatchAssignment[]
-  quizzes     Quiz[]
-  invigilations ExamInvigilator[]
+  user              User                            @relation(fields: [userId], references: [id])
+  department        Department                      @relation(fields: [departmentId], references: [id])
+  assignments       FacultySubjectBatchAssignment[]
+  quizzes           Quiz[]
+  invigilations     ExamInvigilator[]
   attendanceMarked  Attendance[]
   attendanceChanges AttendanceHistory[]
   reportedIncidents Incident[]
@@ -525,10 +540,10 @@ enum QuizStatus {
 /// enum, since closing it would mean inventing the exact allowed value set
 /// nowhere specified in the documentation.
 model Quiz {
-  id                 String     @id @default(uuid()) @db.Uuid
-  title              String
-  subjectId          String     @map("subject_id") @db.Uuid
-  createdByFacultyId String     @map("created_by_faculty_id") @db.Uuid
+  id                     String     @id @default(uuid()) @db.Uuid
+  title                  String
+  subjectId              String     @map("subject_id") @db.Uuid
+  createdByFacultyId     String     @map("created_by_faculty_id") @db.Uuid
   /// Required at creation (identifying + BR-010 authorization-scoping
   /// fields — see this phase's design note below). Everything from here
   /// down is nullable: PRD.md FR-016/017 and this phase's own documented
@@ -539,28 +554,49 @@ model Quiz {
   /// enforces full completeness. Requiring every field at creation (the
   /// alternative) would make submit's completeness check permanently
   /// unreachable dead code, contradicting the documented test.
-  durationMinutes    Int?       @map("duration_minutes")
-  totalMarks         Decimal?   @map("total_marks")
-  questionCount      Int?       @map("question_count")
+  durationMinutes        Int?       @map("duration_minutes")
+  /// Replaces the old `totalMarks`/`questionCount` fields — this is what
+  /// actually drives room/class suggestion (RoomSuggestionService): the
+  /// expected headcount for this quiz's cohort, entered by the faculty at
+  /// quiz-creation time rather than derived from enrollment (a faculty
+  /// may not have finalized enrollment yet when drafting the quiz).
+  studentCount           Int?       @map("student_count")
   /// Instructions stays optional even at submit time — free-text guidance
   /// is not part of what "completeness" means here; nothing in PRD.md or
   /// API_CONTRACT.md lists it as submit-blocking.
-  instructions       String?
-  quizType           String?    @map("quiz_type")
-  preferredDate      DateTime?  @map("preferred_date") @db.Date
-  preferredTime      DateTime?  @map("preferred_time") @db.Time
-  academicYear       String     @map("academic_year")
-  semester           Int
-  status             QuizStatus @default(DRAFT)
+  instructions           String?
+  quizType               String?    @map("quiz_type")
+  preferredDate          DateTime?  @map("preferred_date") @db.Date
+  preferredTime          DateTime?  @map("preferred_time") @db.Time
+  academicYear           String     @map("academic_year")
+  semester               Int
+  status                 QuizStatus @default(DRAFT)
+  /// Faculty's preliminary room request, built from RoomSuggestionService
+  /// against `studentCount` (the real headcount isn't known until
+  /// students are actually assigned to an exam session later) — shown to
+  /// the admin as a conflict/availability preview during quiz approval.
+  /// Purely a recommendation carried forward; the exam session's own
+  /// `requestedRoomIds` (re-suggested against real ASSIGNED students) is
+  /// what actually gets allocated.
+  requestedRoomIds       String[]   @default([]) @map("requested_room_ids") @db.Uuid
+  backupRoomId           String?    @map("backup_room_id") @db.Uuid
+  roomAllocationStrategy String?    @map("room_allocation_strategy")
+  /// Set whenever an ADMIN adjusts this room request (swaps a room,
+  /// drops the backup room) while reviewing — a short note explaining why,
+  /// shown back to the faculty on their own quiz page. Cleared whenever
+  /// the FACULTY submits a fresh request of their own, since a new
+  /// request supersedes whatever the admin last said about the old one.
+  roomAdjustmentNote     String?    @map("room_adjustment_note")
   /// Optimistic lock (BR-051) — every PATCH must supply the version it
   /// last read via `If-Match`; a mismatch is a 409, never a silent
   /// overwrite.
-  version            Int        @default(1)
-  createdAt          DateTime   @default(now()) @map("created_at")
-  updatedAt          DateTime   @updatedAt @map("updated_at")
+  version                Int        @default(1)
+  createdAt              DateTime   @default(now()) @map("created_at")
+  updatedAt              DateTime   @updatedAt @map("updated_at")
 
   subject                Subject                 @relation(fields: [subjectId], references: [id])
   createdByFaculty       Faculty                 @relation(fields: [createdByFacultyId], references: [id])
+  backupRoom             Room?                   @relation("QuizBackupRoom", fields: [backupRoomId], references: [id])
   batches                QuizBatch[]
   approvalHistory        QuizApprovalHistory[]
   sessionAttachments     ExamSessionQuiz[]
@@ -673,21 +709,45 @@ enum ExamSessionStatus {
 /// session_date, start_time, end_time, status, created_by_admin_id,
 /// version, created_at, updated_at)` exactly. `createdByAdminId` is a FK
 /// to `User` (not a hypothetical `Admin` table — ADMIN is a role on User,
-/// same pattern as QuizApprovalHistory.actorId).
+/// same pattern as QuizApprovalHistory.actorId). NOTE: despite its name,
+/// this column is NOT restricted to admin-authored sessions — since the
+/// faculty-driven-lifecycle change, a faculty member's `users.id` is
+/// stored here too when THEY create the session. It is simply "the user
+/// who created this session, admin or faculty"; no column rename/migration
+/// was made for this (it was already a plain FK to `User`), only this
+/// comment is corrected to stop being misleading.
 model ExamSession {
-  id               String            @id @default(uuid()) @db.Uuid
-  name             String
-  sessionDate      DateTime          @map("session_date") @db.Date
-  startTime        DateTime          @map("start_time") @db.Time
-  endTime          DateTime          @map("end_time") @db.Time
-  status           ExamSessionStatus @default(DRAFT)
-  createdByAdminId String            @map("created_by_admin_id") @db.Uuid
+  id                     String            @id @default(uuid()) @db.Uuid
+  name                   String
+  sessionDate            DateTime          @map("session_date") @db.Date
+  startTime              DateTime          @map("start_time") @db.Time
+  endTime                DateTime          @map("end_time") @db.Time
+  status                 ExamSessionStatus @default(DRAFT)
+  createdByAdminId       String            @map("created_by_admin_id") @db.Uuid
+  /// Faculty's requested candidate rooms while status is ROOM_ALLOCATION
+  /// (set by `RoomAllocationService.request`, read by the admin approval
+  /// review — `getAvailabilityPreview`/`allocate`). Cleared once allocated
+  /// or rejected; not a source of truth once `allocatedRooms` exists.
+  requestedRoomIds       String[]          @default([]) @map("requested_room_ids") @db.Uuid
+  /// Single optional backup room the faculty nominated alongside the
+  /// request — admin can keep, drop, or swap it in for a primary room
+  /// that turns out to be unavailable at approval time.
+  backupRoomId           String?           @map("backup_room_id") @db.Uuid
+  /// Which RoomSuggestionService strategy the faculty picked when
+  /// building `requestedRoomIds` — display-only, shown to the admin
+  /// during review.
+  roomAllocationStrategy String?           @map("room_allocation_strategy")
+  /// Set by `RoomAllocationService.reject`; cleared on the next
+  /// successful `request`/`allocate`. Shown to faculty so they know why
+  /// their room request was sent back.
+  roomRejectionReason    String?           @map("room_rejection_reason")
   /// Optimistic lock (BR-051 pattern, same as Quiz.version).
-  version          Int               @default(1)
-  createdAt        DateTime          @default(now()) @map("created_at")
-  updatedAt        DateTime          @updatedAt @map("updated_at")
+  version                Int               @default(1)
+  createdAt              DateTime          @default(now()) @map("created_at")
+  updatedAt              DateTime          @updatedAt @map("updated_at")
 
   createdByAdmin     User                    @relation(fields: [createdByAdminId], references: [id])
+  backupRoom         Room?                   @relation("ExamSessionBackupRoom", fields: [backupRoomId], references: [id])
   quizzes            ExamSessionQuiz[]
   studentAssignments QuizStudentAssignment[]
   allocatedRooms     ExamSessionRoom[]
@@ -823,6 +883,8 @@ model Room {
   seats              RoomSeat[]
   availabilityBlocks RoomAvailability[]
   sessionAllocations ExamSessionRoom[]
+  backupForSessions  ExamSession[]      @relation("ExamSessionBackupRoom")
+  backupForQuizzes   Quiz[]             @relation("QuizBackupRoom")
   seatingPlans       SeatingPlan[]
   invigilators       ExamInvigilator[]
   incidents          Incident[]
@@ -1065,6 +1127,12 @@ enum NotificationRecipientType {
 enum NotificationEventType {
   QUIZ_APPROVED
   QUIZ_REJECTED
+  /// Additive — admin never had a notification-feed signal that a quiz
+  /// needs review (only a live "Pending Quiz Approvals" dashboard
+  /// counter existed); fans out to every ADMIN user on
+  /// `QuizzesService.submit`, same "notify every ADMIN" pattern
+  /// `IncidentsService.notifyAdmins` already established for BR-038.
+  QUIZ_SUBMITTED
   SEAT_ASSIGNED
   EXAM_SESSION_RESCHEDULED
   EXAM_SESSION_CANCELLED
@@ -1352,14 +1420,14 @@ enum IncidentAction {
 /// specifically — BR-037 requires the reporter to be an assigned
 /// Faculty/Invigilator, who by definition always has a `faculty` row.
 model Incident {
-  id                  String            @id @default(uuid()) @db.Uuid
-  examSessionId       String            @map("exam_session_id") @db.Uuid
-  quizId              String?           @map("quiz_id") @db.Uuid
-  studentId           String?           @map("student_id") @db.Uuid
-  roomId              String?           @map("room_id") @db.Uuid
-  seatId              String?           @map("seat_id") @db.Uuid
-  reportedByFacultyId String            @map("reported_by_faculty_id") @db.Uuid
-  incidentType        IncidentType      @map("incident_type")
+  id                  String           @id @default(uuid()) @db.Uuid
+  examSessionId       String           @map("exam_session_id") @db.Uuid
+  quizId              String?          @map("quiz_id") @db.Uuid
+  studentId           String?          @map("student_id") @db.Uuid
+  roomId              String?          @map("room_id") @db.Uuid
+  seatId              String?          @map("seat_id") @db.Uuid
+  reportedByFacultyId String           @map("reported_by_faculty_id") @db.Uuid
+  incidentType        IncidentType     @map("incident_type")
   severity            IncidentSeverity
   description         String
   /// Pointers to object storage, not raw files (ARCHITECTURE.md §Z's own
@@ -1368,16 +1436,16 @@ model Incident {
   /// unvalidated beyond "is it a JSON value", matching Phase 13's
   /// `SeatingPlan.violationReport`'s own precedent for an intentionally
   /// undocumented-shape JSONB column.
-  evidenceMetadata    Json?             @map("evidence_metadata")
-  status              IncidentStatus    @default(OPEN)
+  evidenceMetadata    Json?            @map("evidence_metadata")
+  status              IncidentStatus   @default(OPEN)
   /// NOT NULL enforced by the application at RESOLVE/DISMISS time (BR-039
   /// prose: "resolution required"), not a DB CHECK — same "DB is the
   /// narrow backstop, app is the real conditional-requirement enforcer"
   /// split already used for BR-012 (quiz reject) and BR-035 (attendance
   /// post-lock change).
   resolution          String?
-  resolvedByAdminId   String?           @map("resolved_by_admin_id") @db.Uuid
-  resolvedAt          DateTime?         @map("resolved_at")
+  resolvedByAdminId   String?          @map("resolved_by_admin_id") @db.Uuid
+  resolvedAt          DateTime?        @map("resolved_at")
   /// ADR-007 (DEC-009 — incident disclosure): NOT part of ARCHITECTURE.md
   /// §Z's original DDL sketch — added per that ADR's explicit
   /// "Implementation Notes": "`incidents.disclosed_at TIMESTAMPTZ NULL`,
@@ -1388,20 +1456,20 @@ model Incident {
   /// workflow, no notification side effect, no student-facing read
   /// endpoint exists anywhere in this phase to even consult these fields
   /// yet (disclosed for a future phase, per that ADR's own framing).
-  disclosedAt         DateTime?         @map("disclosed_at")
-  disclosedByAdminId  String?           @map("disclosed_by_admin_id") @db.Uuid
-  createdAt           DateTime          @default(now()) @map("created_at")
-  updatedAt           DateTime          @updatedAt @map("updated_at")
+  disclosedAt         DateTime?        @map("disclosed_at")
+  disclosedByAdminId  String?          @map("disclosed_by_admin_id") @db.Uuid
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
 
-  examSession        ExamSession       @relation(fields: [examSessionId], references: [id])
-  quiz               Quiz?             @relation(fields: [quizId], references: [id])
-  student            Student?          @relation(fields: [studentId], references: [id])
-  room               Room?             @relation(fields: [roomId], references: [id])
-  seat               RoomSeat?         @relation(fields: [seatId], references: [id])
-  reportedByFaculty  Faculty           @relation(fields: [reportedByFacultyId], references: [id])
-  resolvedByAdmin    User?             @relation("IncidentResolvedBy", fields: [resolvedByAdminId], references: [id])
-  disclosedByAdmin   User?             @relation("IncidentDisclosedBy", fields: [disclosedByAdminId], references: [id])
-  history            IncidentHistory[]
+  examSession       ExamSession       @relation(fields: [examSessionId], references: [id])
+  quiz              Quiz?             @relation(fields: [quizId], references: [id])
+  student           Student?          @relation(fields: [studentId], references: [id])
+  room              Room?             @relation(fields: [roomId], references: [id])
+  seat              RoomSeat?         @relation(fields: [seatId], references: [id])
+  reportedByFaculty Faculty           @relation(fields: [reportedByFacultyId], references: [id])
+  resolvedByAdmin   User?             @relation("IncidentResolvedBy", fields: [resolvedByAdminId], references: [id])
+  disclosedByAdmin  User?             @relation("IncidentDisclosedBy", fields: [disclosedByAdminId], references: [id])
+  history           IncidentHistory[]
 
   @@index([examSessionId])
   @@index([status])
@@ -1558,17 +1626,17 @@ model ReportJob {
 /// already exists and is backfilled — no separate backfill migration
 /// needed later.
 model AuditLog {
-  id         String     @id @default(uuid()) @db.Uuid
-  actorId    String     @map("actor_id") @db.Uuid
-  action     AuditAction
-  entityType String     @map("entity_type")
-  entityId   String     @map("entity_id")
-  oldValue   Json?      @map("old_value")
-  newValue   Json?      @map("new_value")
-  reason     String?
-  requestId  String?    @map("request_id")
-  academicYear Int?     @map("academic_year")
-  createdAt  DateTime   @default(now()) @map("created_at")
+  id           String      @id @default(uuid()) @db.Uuid
+  actorId      String      @map("actor_id") @db.Uuid
+  action       AuditAction
+  entityType   String      @map("entity_type")
+  entityId     String      @map("entity_id")
+  oldValue     Json?       @map("old_value")
+  newValue     Json?       @map("new_value")
+  reason       String?
+  requestId    String?     @map("request_id")
+  academicYear Int?        @map("academic_year")
+  createdAt    DateTime    @default(now()) @map("created_at")
 
   actor User @relation(fields: [actorId], references: [id])
 

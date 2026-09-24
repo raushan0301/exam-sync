@@ -27,6 +27,17 @@ export interface ListAttendanceParams {
   limit?: number;
 }
 
+/**
+ * `Attendance` plus the human-readable bits the overview table needs —
+ * the raw row carries only `quizStudentAssignmentId`/`seatId`, which is
+ * meaningless in a UI without a separate lookup this endpoint's callers
+ * don't otherwise have a reason to make.
+ */
+export interface AttendanceOverviewRow extends Attendance {
+  quizStudentAssignment: { student: { name: string; rollNumber: string }; quiz: { title: string } };
+  seat: { seatLabel: string };
+}
+
 /** No dedicated Nest exception class exists for `423 Locked` (this Nest version's `HttpStatus` enum has no `LOCKED` member) — API_CONTRACT.md's literal `423 Locked` (BR-035) needs the exact code, not the closest built-in (`ConflictException` is 409), so a plain `HttpException` carries it. */
 function lockedException(message: string): HttpException {
   return new HttpException(message, 423);
@@ -240,7 +251,7 @@ export class AttendanceService {
     examSessionId: string,
     actor: AuthenticatedUser,
     params: ListAttendanceParams,
-  ): Promise<PaginatedResult<Attendance>> {
+  ): Promise<PaginatedResult<AttendanceOverviewRow>> {
     await this.examSessionsService.findById(examSessionId);
     const limit = resolveLimit(params.limit);
 
@@ -262,9 +273,15 @@ export class AttendanceService {
     const rows = await this.prisma.attendance.findMany({
       where: { quizStudentAssignment: { examSessionId }, ...roomFilter },
       orderBy: { markedAt: 'desc' },
+      include: {
+        quizStudentAssignment: {
+          select: { student: { select: { name: true, rollNumber: true } }, quiz: { select: { title: true } } },
+        },
+        seat: { select: { seatLabel: true } },
+      },
       ...cursorFindManyArgs(params.cursor, limit),
     });
-    return toPaginatedResult(rows, limit);
+    return toPaginatedResult(rows as AttendanceOverviewRow[], limit);
   }
 
   /** `GET /students/{id}/attendance-history` — self/ADMIN, 404-not-403 (same IDOR posture as every other resource-level check). */

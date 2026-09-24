@@ -10,7 +10,9 @@ export type AuthAuditEventType =
   | 'TOKEN_REFRESH_SUCCESS'
   | 'TOKEN_REFRESH_FAILURE'
   | 'TOKEN_REFRESH_REUSE_DETECTED'
-  | 'LOGOUT';
+  | 'LOGOUT'
+  | 'PASSWORD_CHANGE_SUCCESS'
+  | 'PASSWORD_CHANGE_FAILURE';
 
 export interface AuthAuditContext {
   userId?: string;

@@ -5,7 +5,7 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Card } from '@/components/ui';
 import { useCreateQuiz } from '@/lib/mutations/useQuizMutations';
-import { mapError } from '@/lib/error-mapping';
+import { mapError, specificForbiddenMessage } from '@/lib/error-mapping';
 import { QuizForm, quizFormSchema, defaultQuizFormValues, toQuizApiPayload, type QuizFormValues } from '@/components/quiz/QuizForm';
 
 export default function NewQuizPage() {
@@ -22,7 +22,7 @@ export default function NewQuizPage() {
       const quiz = await createMutation.mutateAsync({ ...toQuizApiPayload(values), batch_ids: values.batch_ids });
       router.push(`/faculty/quizzes/${quiz.id}`);
     } catch (err) {
-      form.setError('root', { message: mapError(err).description });
+      form.setError('root', { message: specificForbiddenMessage(err) ?? mapError(err).description });
     }
   }
 
@@ -39,6 +39,7 @@ export default function NewQuizPage() {
           submitting={createMutation.isPending}
           rootError={form.formState.errors.root?.message}
           onSubmit={onSubmit}
+          autoFillStudentCount
         />
       </Card>
     </div>

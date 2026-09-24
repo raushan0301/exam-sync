@@ -13,7 +13,7 @@ function buildPrismaMock() {
   } as any;
 }
 
-const student: AuthenticatedUser = { id: 'user-1', email: 's@example.com', roles: ['STUDENT'] };
+const student: AuthenticatedUser = { id: 'user-1', email: 's@example.com', roles: ['STUDENT'], mustChangePassword: false };
 
 describe('NotificationsService', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;

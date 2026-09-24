@@ -51,6 +51,32 @@ export class QuizzesController {
     );
   }
 
+  /**
+   * `GET /quizzes/eligible-student-count` — this feature's own addition,
+   * so the quiz-creation form can auto-fill `student_count` from real
+   * enrollment as soon as subject/batches/academic_year/semester are
+   * picked (before the quiz exists) — registered BEFORE `:id` below so
+   * Nest doesn't treat "eligible-student-count" as a quiz id.
+   */
+  @Roles(ROLE.FACULTY)
+  @Get('eligible-student-count')
+  eligibleStudentCount(
+    @Query('subject_id') subjectId?: string,
+    @Query('batch_ids') batchIds?: string,
+    @Query('academic_year') academicYear?: string,
+    @Query('semester') semester?: string,
+  ) {
+    if (!subjectId || !batchIds || !academicYear || !semester) {
+      throw new BadRequestException('subject_id, batch_ids, academic_year, and semester are all required.');
+    }
+    return this.quizzesService.getEligibleStudentCount(
+      subjectId,
+      batchIds.split(',').filter(Boolean),
+      academicYear,
+      parseInt(semester, 10),
+    );
+  }
+
   @Roles(ROLE.ADMIN, ROLE.FACULTY)
   @Get(':id')
   findOne(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {

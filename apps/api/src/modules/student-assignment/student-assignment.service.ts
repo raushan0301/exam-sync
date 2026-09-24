@@ -14,7 +14,7 @@ import { ImportJobsService } from '../../common/import-jobs/import-jobs.service'
 import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
 import { PaginatedResult, PaginationParams, cursorFindManyArgs, resolveLimit, toPaginatedResult } from '../../common/pagination/paginate';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService } from '../conflict-engine';
 import { QuizzesService } from '../quiz';
 import { StudentsService } from '../students';
@@ -62,6 +62,7 @@ export class StudentAssignmentService {
     private readonly quizzesService: QuizzesService,
     private readonly studentsService: StudentsService,
     private readonly enrollmentsService: EnrollmentsService,
+    private readonly examSessionOwnershipService: ExamSessionOwnershipService,
   ) {}
 
   /**
@@ -86,6 +87,9 @@ export class StudentAssignmentService {
     actor: AuthenticatedUser,
   ): Promise<{ importJob: ImportJob; examSession: ExamSession }> {
     const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (session.status !== ExamSessionStatus.DRAFT) {
       throw new ConflictException(
         `Exam session is in status "${session.status}" and students can only be assigned while DRAFT.`,
@@ -132,18 +136,24 @@ export class StudentAssignmentService {
           },
           tx,
         );
-        const conflictedStudentIds = new Set(
-          conflictResult.hard.filter((d) => d.type === 'STUDENT_OVERLAP').map((d) => d.studentId),
+        // Conflict Engine messages already carry the student's name/roll
+        // number and the conflicting session's name (see
+        // ConflictEngineService.checkSessionAssembly) — reuse that
+        // human-readable text per student instead of building a fresh
+        // message from the raw id here.
+        const conflictMessageByStudentId = new Map(
+          conflictResult.hard.filter((d) => d.type === 'STUDENT_OVERLAP' && d.studentId).map((d) => [d.studentId!, d.message]),
         );
 
         const rows: ImportRowResult[] = [];
         for (const chunk of this.chunk(eligibleStudentIds, ASSIGNMENT_CHUNK_SIZE)) {
           for (const studentId of chunk) {
-            if (conflictedStudentIds.has(studentId)) {
+            const conflictMessage = conflictMessageByStudentId.get(studentId);
+            if (conflictMessage) {
               rows.push({
                 row: 0, // renumbered below, once merged across all quizzes
                 status: 'FAILURE',
-                error: `Student "${studentId}" already has an overlapping active assignment elsewhere (BR-019).`,
+                error: conflictMessage,
               });
               continue;
             }
@@ -218,17 +228,32 @@ export class StudentAssignmentService {
     examSessionId: string,
     actor: AuthenticatedUser,
     params: PaginationParams & { status?: QuizStudentAssignmentStatus },
-  ): Promise<PaginatedResult<QuizStudentAssignment>> {
+  ): Promise<PaginatedResult<QuizStudentAssignment & { quizTitle: string; studentName: string; studentRollNumber: string }>> {
     await this.examSessionsService.findByIdScoped(examSessionId, actor);
 
     const limit = resolveLimit(params.limit);
     const rows = await this.prisma.quizStudentAssignment.findMany({
       where: { examSessionId, ...(params.status ? { status: params.status } : {}) },
       orderBy: { id: 'asc' },
+      // Joined for display labels below. Session cancellation detaches
+      // every quiz (`isActiveAttachment: false`), so a roster row's quiz
+      // can no longer be found in the exam session's own `quizzes` list —
+      // the frontend previously cross-referenced that list and fell back
+      // to the raw quizId once it came up empty. Reading the title
+      // straight off this row's own quiz relation instead means it stays
+      // correct regardless of the quiz's current attachment state.
+      include: {
+        quiz: { select: { title: true } },
+        student: { select: { name: true, rollNumber: true } },
+      },
       ...cursorFindManyArgs(params.cursor, limit),
     });
+    const withLabels = rows.map((row) => {
+      const { quiz, student, ...assignment } = row;
+      return { ...assignment, quizTitle: quiz.title, studentName: student.name, studentRollNumber: student.rollNumber };
+    });
 
-    return toPaginatedResult(rows, limit);
+    return toPaginatedResult(withLabels, limit);
   }
 
   /**
@@ -249,6 +274,9 @@ export class StudentAssignmentService {
     actor: AuthenticatedUser,
   ): Promise<QuizStudentAssignment> {
     const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (session.status === ExamSessionStatus.CANCELLED) {
       throw new ConflictException('Exam session is CANCELLED and its roster cannot be modified.');
     }
@@ -271,7 +299,7 @@ export class StudentAssignmentService {
     );
     if (!eligibleStudentIds.includes(student.id)) {
       throw new ConflictException(
-        `Student "${student.id}" is not eligible for quiz "${dto.quiz_id}" (not ENROLLED in its subject/batch for this academic_year/semester — BR-005).`,
+        `${student.name} (${student.rollNumber}) is not eligible for quiz "${quiz.title}" (not ENROLLED in its subject/batch for this academic_year/semester — BR-005).`,
       );
     }
 
@@ -337,6 +365,9 @@ export class StudentAssignmentService {
     actor: AuthenticatedUser,
   ): Promise<QuizStudentAssignment> {
     await this.examSessionsService.findById(examSessionId); // 404 if the session itself doesn't exist
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
 
     const existing = await this.prisma.quizStudentAssignment.findUnique({
       where: { quizId_studentId: { quizId: dto.quiz_id, studentId } },
@@ -391,7 +422,16 @@ export class StudentAssignmentService {
       return await client.quizStudentAssignment.upsert({
         where: { quizId_studentId: { quizId, studentId } },
         create: { quizId, examSessionId, studentId, status: QuizStudentAssignmentStatus.ASSIGNED },
+        // `(quizId, studentId)` is globally unique (schema.prisma), not
+        // scoped per exam session — a quiz that was attached, cancelled,
+        // and re-attached to a NEW exam session already has a row here
+        // from the OLD one. Without repointing `examSessionId` on the
+        // update path too, this would silently reactivate the assignment
+        // under the STALE (cancelled) session while the new session's
+        // roster stayed empty — exactly the "student allocation broken
+        // after re-creating a cancelled session" failure mode.
         update: {
+          examSessionId,
           status: QuizStudentAssignmentStatus.ASSIGNED,
           assignedAt: new Date(),
           cancelledAt: null,
@@ -399,8 +439,15 @@ export class StudentAssignmentService {
       });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        // Rare race-backstop path (concurrent duplicate upsert) — only
+        // IDs are in scope here, so resolve names just for this message
+        // rather than threading them through every caller.
+        const [student, quiz] = await Promise.all([
+          this.studentsService.findById(studentId).catch(() => null),
+          this.quizzesService.findById(quizId).catch(() => null),
+        ]);
         throw new ConflictException(
-          `Student "${studentId}" is already assigned to quiz "${quizId}".`,
+          `${student ? `${student.name} (${student.rollNumber})` : `Student "${studentId}"`} is already assigned to quiz "${quiz?.title ?? quizId}".`,
         );
       }
       throw err;

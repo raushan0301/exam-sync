@@ -1,15 +1,19 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import * as crypto from 'crypto';
-import { Prisma, Faculty, AcademicStatus } from '@exam-sync/db';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma, Faculty, AcademicStatus, ImportJob } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { generateDefaultPassword } from '../../common/auth/generate-default-password';
 import {
   cursorFindManyArgs,
   PaginatedResult,
   resolveLimit,
   toPaginatedResult,
 } from '../../common/pagination/paginate';
+import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
+import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
+import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
+import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
 import { DepartmentsService } from '../academic-structure';
 import { PasswordService } from '../auth';
 import { FacultyAccessRepository } from './faculty-access.repository';
@@ -40,6 +44,7 @@ export class FacultyService {
     private readonly departmentsService: DepartmentsService,
     private readonly passwordService: PasswordService,
     private readonly accessRepository: FacultyAccessRepository,
+    private readonly importJobsService: ImportJobsService,
   ) {}
 
   async create(dto: CreateFacultyDto, actor: AuthenticatedUser): Promise<Faculty> {
@@ -57,7 +62,10 @@ export class FacultyService {
       throw new ConflictException(`A user with email "${dto.email}" already exists.`);
     }
 
-    const temporaryPassword = crypto.randomBytes(24).toString('base64url');
+    // Deterministic default password (employee_code + name, lowercase, no
+    // spaces) — see generateDefaultPassword. mustChangePassword forces a
+    // real password to be set on first login.
+    const temporaryPassword = generateDefaultPassword(dto.employee_code, dto.name);
     const passwordHash = await this.passwordService.hash(temporaryPassword);
 
     const faculty = await this.prisma
@@ -70,7 +78,7 @@ export class FacultyService {
         }
 
         const user = await tx.user.create({
-          data: { email: dto.email, passwordHash, isActive: true },
+          data: { email: dto.email, passwordHash, isActive: true, mustChangePassword: true },
         });
         await tx.userRole.create({ data: { userId: user.id, roleId: facultyRole.id } });
 
@@ -211,5 +219,71 @@ export class FacultyService {
       throw new ConflictException(`Employee code "${employeeCode}" already exists.`);
     }
     throw err;
+  }
+
+  /** `GET /faculty/bulk-import/template` (ADMIN). */
+  /** Example row is a real existing faculty member (+ their department's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
+  async generateBulkImportTemplate(): Promise<Buffer> {
+    const sample = await this.prisma.faculty.findFirst({
+      where: { status: 'ACTIVE', department: { status: 'ACTIVE' } },
+      orderBy: { createdAt: 'desc' },
+      include: { department: true, user: true },
+    });
+    return generateExcelTemplate({
+      entityName: 'Faculty',
+      uniqueFieldsNote: 'Unique key: employee_code (email must also be unique)',
+      columns: [
+        { header: 'department_code', example: sample?.department.code ?? 'CSE', note: 'Must match an existing Department\'s code.' },
+        { header: 'employee_code', example: sample?.employeeCode ?? 'EMP1001', note: 'Unique — cannot repeat an existing employee code.' },
+        { header: 'name', example: sample?.name ?? 'Dr. Jane Doe', note: 'Full name.' },
+        { header: 'email', example: sample?.user.email ?? 'jane.doe@example.com', note: 'Unique — used to provision the faculty login.' },
+      ],
+    });
+  }
+
+  /** `POST /faculty/bulk-import` (ADMIN). Resolves `department_code` -> `department_id` per row. */
+  async bulkImport(buffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
+    const records = await parseExcelBuffer(buffer, ['department_code', 'employee_code', 'name', 'email']);
+
+    const results: ImportRowResult[] = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (let i = 0; i < records.length; i++) {
+      const rowNumber = i + 2;
+      const record = records[i];
+      try {
+        const department = await this.departmentsService.findByCode(record.department_code);
+        if (!department) {
+          throw new BadRequestException(`Department code '${record.department_code}' not found`);
+        }
+
+        const dto: CreateFacultyDto = {
+          name: record.name,
+          email: record.email,
+          department_id: department.id,
+          employee_code: record.employee_code,
+        };
+        const faculty = await this.create(dto, actor);
+        results.push({ row: rowNumber, status: 'SUCCESS', id: faculty.id });
+        successCount++;
+      } catch (err) {
+        results.push({
+          row: rowNumber,
+          status: 'FAILURE',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        });
+        failureCount++;
+      }
+    }
+
+    return this.importJobsService.create({
+      resourceType: 'faculty',
+      totalRows: records.length,
+      successCount,
+      failureCount,
+      results,
+      createdByUserId: actor.id,
+    });
   }
 }

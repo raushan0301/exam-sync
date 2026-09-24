@@ -256,7 +256,7 @@ describe('Academic Structure (e2e) — Phase 2', () => {
       await request(app.getHttpServer())
         .post('/batches')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ program_id: '00000000-0000-0000-0000-000000000000', year: 2026, section: 'A' })
+        .send({ program_id: '00000000-0000-0000-0000-000000000000', year: '2026', section: 'A', subsection: 'A' })
         .expect(404);
     });
 
@@ -264,7 +264,7 @@ describe('Academic Structure (e2e) — Phase 2', () => {
       const res = await request(app.getHttpServer())
         .post('/batches')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ program_id: programId, year: 2026, section: 'A' })
+        .send({ program_id: programId, year: '2026', section: 'A', subsection: 'A' })
         .expect(201);
       batchId = res.body.id;
     });
@@ -273,7 +273,7 @@ describe('Academic Structure (e2e) — Phase 2', () => {
       await request(app.getHttpServer())
         .post('/batches')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ program_id: programId, year: 2026, section: 'A' })
+        .send({ program_id: programId, year: '2026', section: 'A', subsection: 'A' })
         .expect(409);
     });
 
@@ -281,7 +281,7 @@ describe('Academic Structure (e2e) — Phase 2', () => {
       const res = await request(app.getHttpServer())
         .post('/batches')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ program_id: programId, year: 2026, section: 'B' })
+        .send({ program_id: programId, year: '2026', section: 'B', subsection: 'B' })
         .expect(201);
 
       // cleanup this extra one immediately, it's only needed for this assertion

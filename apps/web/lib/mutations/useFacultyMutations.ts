@@ -2,6 +2,7 @@
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
+import { downloadBulkImportTemplate, uploadBulkImportFile } from './bulk-import-helpers';
 import type { AcademicStatus, Faculty } from '../queries/types';
 
 export interface CreateFacultyInput {
@@ -37,4 +38,20 @@ export function useUpdateFaculty(id: string) {
       queryClient.invalidateQueries({ queryKey: ['faculty', 'list'] });
     },
   });
+}
+
+/** POST /faculty/bulk-import — multipart/form-data, field name `file`. */
+export function useBulkImportFaculty() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (file: File) => uploadBulkImportFile('faculty', file),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['faculty', 'list'] });
+    },
+  });
+}
+
+/** GET /faculty/bulk-import/template — downloads the .xlsx template via the browser. */
+export function downloadFacultyTemplate() {
+  return downloadBulkImportTemplate('faculty', 'faculty-bulk-import-template.xlsx');
 }

@@ -1,9 +1,10 @@
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { ExamSessionStatus, Prisma } from '@exam-sync/db';
 import { RoomAllocationService } from './room-allocation.service';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService } from '../conflict-engine';
 import { RoomsService } from '../rooms';
+import { QuizzesService, QuizOwnershipService } from '../quiz';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 
@@ -17,6 +18,9 @@ function buildPrismaMock() {
   };
   return {
     quizStudentAssignment: { groupBy: jest.fn() },
+    room: { findMany: jest.fn() },
+    quiz: { update: jest.fn().mockImplementation((args: any) => Promise.resolve({ id: args.where.id, ...args.data })) },
+    examSessionQuiz: { findMany: jest.fn(), findFirst: jest.fn() },
     $transaction: jest.fn((cb: any) => cb(tx)),
     __tx: tx,
   } as any;
@@ -29,30 +33,41 @@ function exclusionViolation(): Prisma.PrismaClientUnknownRequestError {
   );
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 const draftLikeSession = {
   id: 's1',
-  status: ExamSessionStatus.ASSIGNING_STUDENTS,
+  status: ExamSessionStatus.ROOM_ALLOCATION,
   sessionDate: new Date('2026-05-01T00:00:00Z'),
   startTime: new Date('1970-01-01T10:00:00Z'),
   endTime: new Date('1970-01-01T11:00:00Z'),
+  requestedRoomIds: [] as string[],
+  backupRoomId: null as string | null,
 };
 
 describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/022, SELECT FOR UPDATE)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
   let examSessionsService: { findById: jest.Mock };
-  let conflictEngine: { checkRoomAllocation: jest.Mock };
+  let conflictEngine: { checkRoomAllocation: jest.Mock; checkSessionAssembly: jest.Mock };
   let roomsService: { findAvailable: jest.Mock };
+  let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
+  let quizzesService: { findById: jest.Mock };
+  let quizOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let service: RoomAllocationService;
 
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
     examSessionsService = { findById: jest.fn() };
-    conflictEngine = { checkRoomAllocation: jest.fn().mockResolvedValue({ hard: [], warnings: [] }) };
+    conflictEngine = {
+      checkRoomAllocation: jest.fn().mockResolvedValue({ hard: [], warnings: [] }),
+      checkSessionAssembly: jest.fn().mockResolvedValue({ hard: [], warnings: [] }),
+    };
     roomsService = { findAvailable: jest.fn() };
+    examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
+    quizzesService = { findById: jest.fn() };
+    quizOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
 
     service = new RoomAllocationService(
       prisma,
@@ -60,6 +75,9 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
       examSessionsService as unknown as ExamSessionsService,
       conflictEngine as unknown as ConflictEngineService,
       roomsService as unknown as RoomsService,
+      examSessionOwnershipService as unknown as ExamSessionOwnershipService,
+      quizzesService as unknown as QuizzesService,
+      quizOwnershipService as unknown as QuizOwnershipService,
     );
   });
 
@@ -78,8 +96,8 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
   }
 
   describe('preconditions', () => {
-    it('rejects a session not in ASSIGNING_STUDENTS with 409', async () => {
-      examSessionsService.findById.mockResolvedValue({ ...draftLikeSession, status: ExamSessionStatus.DRAFT });
+    it('rejects a session not in ROOM_ALLOCATION with 409 (ADMIN approval requires a pending faculty room request)', async () => {
+      examSessionsService.findById.mockResolvedValue({ ...draftLikeSession, status: ExamSessionStatus.ASSIGNING_STUDENTS });
 
       await expect(
         service.allocate('s1', { room_ids: ['room-1'] }, admin),
@@ -334,7 +352,13 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
       expect(result.status).toBe(ExamSessionStatus.SEATING_GENERATION);
       expect(prisma.__tx.examSession.update).toHaveBeenCalledWith({
         where: { id: 's1' },
-        data: { status: ExamSessionStatus.SEATING_GENERATION, version: { increment: 1 } },
+        data: {
+          status: ExamSessionStatus.SEATING_GENERATION,
+          requestedRoomIds: [],
+          backupRoomId: null,
+          roomRejectionReason: null,
+          version: { increment: 1 },
+        },
       });
       expect(auditHook.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'UPDATE', entityType: 'ExamSession', entityId: 's1' }),
@@ -371,6 +395,337 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
       await expect(
         service.allocate('s1', { room_ids: ['room-1'] }, admin),
       ).rejects.toThrow('boom');
+    });
+  });
+
+  describe('allocatePreApproved — FACULTY self-service using ONLY the quiz-approval-time approved room(s)', () => {
+    const faculty: AuthenticatedUser = { id: 'faculty-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
+    const assigningSession = { ...draftLikeSession, status: ExamSessionStatus.ASSIGNING_STUDENTS };
+
+    it('404s a non-owner FACULTY', async () => {
+      examSessionsService.findById.mockResolvedValue(assigningSession);
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(service.allocatePreApproved('s1', faculty)).rejects.toThrow(NotFoundException);
+    });
+
+    it('409s when the session is not ASSIGNING_STUDENTS', async () => {
+      examSessionsService.findById.mockResolvedValue({ ...assigningSession, status: ExamSessionStatus.ROOM_ALLOCATION });
+
+      await expect(service.allocatePreApproved('s1', faculty)).rejects.toThrow(ConflictException);
+    });
+
+    it('409s when the attached quiz has no admin-approved room request', async () => {
+      examSessionsService.findById.mockResolvedValue(assigningSession);
+      prisma.examSessionQuiz.findMany.mockResolvedValue([
+        { quiz: { id: 'quiz-1', requestedRoomIds: [] } },
+      ]);
+
+      await expect(service.allocatePreApproved('s1', faculty)).rejects.toThrow(ConflictException);
+    });
+
+    it('allocates straight from ASSIGNING_STUDENTS using the union of every attached quiz\'s approved rooms — no admin step', async () => {
+      examSessionsService.findById.mockResolvedValue(assigningSession);
+      prisma.examSessionQuiz.findMany.mockResolvedValue([
+        { quiz: { id: 'quiz-1', requestedRoomIds: ['room-1'] } },
+      ]);
+      mockGroups([{ quizId: 'quiz-1', count: 10 }]);
+      mockLockedRooms(['room-1']);
+      mockSeatCounts({ 'room-1': 20 });
+      prisma.__tx.examSession.update.mockResolvedValue({ ...assigningSession, status: ExamSessionStatus.SEATING_GENERATION, version: 2 });
+
+      const result = await service.allocatePreApproved('s1', faculty);
+
+      expect(result.status).toBe(ExamSessionStatus.SEATING_GENERATION);
+      expect(prisma.__tx.examSessionRoom.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ roomId: 'room-1' }) }),
+      );
+    });
+  });
+
+  describe('request — FACULTY submits a room request (ASSIGNING_STUDENTS -> ROOM_ALLOCATION)', () => {
+    const faculty: AuthenticatedUser = { id: 'faculty-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
+    const assigningSession = { ...draftLikeSession, status: ExamSessionStatus.ASSIGNING_STUDENTS };
+
+    it('404s a non-owner (IDOR-safe)', async () => {
+      examSessionsService.findById.mockResolvedValue(assigningSession);
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(
+        service.request('s1', { room_ids: ['room-1'] }, faculty),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('409s when the session is not ASSIGNING_STUDENTS', async () => {
+      examSessionsService.findById.mockResolvedValue({ ...assigningSession, status: ExamSessionStatus.ROOM_ALLOCATION });
+
+      await expect(
+        service.request('s1', { room_ids: ['room-1'] }, faculty),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('400s when backup_room_id also appears in room_ids', async () => {
+      examSessionsService.findById.mockResolvedValue(assigningSession);
+
+      await expect(
+        service.request('s1', { room_ids: ['room-1'], backup_room_id: 'room-1' }, faculty),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('404s when a requested room does not exist', async () => {
+      examSessionsService.findById.mockResolvedValue(assigningSession);
+      prisma.room.findMany.mockResolvedValue([{ id: 'room-1' }]);
+
+      await expect(
+        service.request('s1', { room_ids: ['room-1', 'ghost-room'] }, faculty),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('moves the session to ROOM_ALLOCATION and stores the request + backup room + strategy', async () => {
+      examSessionsService.findById.mockResolvedValue(assigningSession);
+      prisma.room.findMany.mockResolvedValue([{ id: 'room-1' }, { id: 'room-2' }, { id: 'room-backup' }]);
+      prisma.__tx.examSession.update.mockResolvedValue({
+        ...assigningSession,
+        status: ExamSessionStatus.ROOM_ALLOCATION,
+        requestedRoomIds: ['room-1', 'room-2'],
+        backupRoomId: 'room-backup',
+        version: 2,
+      });
+
+      const result = await service.request(
+        's1',
+        { room_ids: ['room-1', 'room-2'], backup_room_id: 'room-backup', strategy: 'FEWEST_ROOMS' },
+        faculty,
+      );
+
+      expect(result.status).toBe(ExamSessionStatus.ROOM_ALLOCATION);
+      expect(prisma.__tx.examSession.update).toHaveBeenCalledWith({
+        where: { id: 's1' },
+        data: {
+          status: ExamSessionStatus.ROOM_ALLOCATION,
+          requestedRoomIds: ['room-1', 'room-2'],
+          backupRoomId: 'room-backup',
+          roomAllocationStrategy: 'FEWEST_ROOMS',
+          roomRejectionReason: null,
+          version: { increment: 1 },
+        },
+      });
+      expect(auditHook.record).toHaveBeenCalled();
+    });
+  });
+
+  describe('reject — ADMIN sends a pending room request back to the faculty', () => {
+    it('409s when there is no pending request (not ROOM_ALLOCATION)', async () => {
+      examSessionsService.findById.mockResolvedValue({ ...draftLikeSession, status: ExamSessionStatus.ASSIGNING_STUDENTS });
+
+      await expect(service.reject('s1', { reason: 'No rooms free' }, admin)).rejects.toThrow(ConflictException);
+    });
+
+    it('moves ROOM_ALLOCATION back to ASSIGNING_STUDENTS, clears the request, and stores the reason', async () => {
+      examSessionsService.findById.mockResolvedValue(draftLikeSession);
+      prisma.__tx.examSession.update.mockResolvedValue({
+        ...draftLikeSession,
+        status: ExamSessionStatus.ASSIGNING_STUDENTS,
+        requestedRoomIds: [],
+        backupRoomId: null,
+        roomRejectionReason: 'No rooms free at that time',
+        version: 2,
+      });
+
+      const result = await service.reject('s1', { reason: 'No rooms free at that time' }, admin);
+
+      expect(result.status).toBe(ExamSessionStatus.ASSIGNING_STUDENTS);
+      expect(prisma.__tx.examSession.update).toHaveBeenCalledWith({
+        where: { id: 's1' },
+        data: {
+          status: ExamSessionStatus.ASSIGNING_STUDENTS,
+          requestedRoomIds: [],
+          backupRoomId: null,
+          roomRejectionReason: 'No rooms free at that time',
+          version: { increment: 1 },
+        },
+      });
+      expect(auditHook.record).toHaveBeenCalled();
+    });
+  });
+
+  describe('getAvailabilityPreview — live availability + alternatives for the admin review screen', () => {
+    it('409s when the session is not ROOM_ALLOCATION', async () => {
+      examSessionsService.findById.mockResolvedValue({ ...draftLikeSession, status: ExamSessionStatus.ASSIGNING_STUDENTS });
+
+      await expect(service.getAvailabilityPreview('s1', admin)).rejects.toThrow(ConflictException);
+    });
+
+    it('marks a requested room unavailable and suggests alternatives when it conflicts', async () => {
+      const session = { ...draftLikeSession, requestedRoomIds: ['room-1'], backupRoomId: null };
+      examSessionsService.findById.mockResolvedValue(session);
+      prisma.room.findMany.mockResolvedValue([
+        { id: 'room-1', building: 'A', floor: 1, roomNumber: '101', capacity: 30 },
+      ]);
+      conflictEngine.checkRoomAllocation
+        .mockResolvedValueOnce({ hard: [{ type: 'ROOM_OVERLAP', roomId: 'room-1', message: 'already booked' }], warnings: [] })
+        .mockResolvedValueOnce({ hard: [], warnings: [] });
+      roomsService.findAvailable.mockResolvedValue([{ id: 'room-2', building: 'A', floor: 1, roomNumber: '102', capacity: 40 }]);
+
+      const preview = await service.getAvailabilityPreview('s1', admin);
+
+      expect(preview.requestedRooms[0].available).toBe(false);
+      expect(preview.requestedRooms[0].reason).toContain('already booked');
+      expect(preview.requestedRooms[0].alternatives?.[0].roomId).toBe('room-2');
+    });
+  });
+
+  describe('requestForQuiz — FACULTY builds it (DRAFT/REJECTED), ADMIN may swap while reviewing (SUBMITTED)', () => {
+    const faculty: AuthenticatedUser = { id: 'faculty-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
+    const draftQuiz = { id: 'q1', status: 'DRAFT', createdByFacultyId: 'faculty-1' };
+    const submittedQuiz = { ...draftQuiz, status: 'SUBMITTED' };
+
+    it('404s a non-owner FACULTY', async () => {
+      quizzesService.findById.mockResolvedValue(draftQuiz);
+      quizOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(service.requestForQuiz('q1', { room_ids: ['room-1'] }, faculty)).rejects.toThrow(NotFoundException);
+    });
+
+    it('blocks FACULTY from changing it once SUBMITTED', async () => {
+      quizzesService.findById.mockResolvedValue(submittedQuiz);
+      quizOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(true);
+
+      await expect(service.requestForQuiz('q1', { room_ids: ['room-1'] }, faculty)).rejects.toThrow(ConflictException);
+    });
+
+    it('lets ADMIN swap the room set while the quiz is SUBMITTED, bypassing ownership entirely', async () => {
+      quizzesService.findById.mockResolvedValue(submittedQuiz);
+      prisma.room.findMany.mockResolvedValue([{ id: 'room-2' }]);
+
+      await service.requestForQuiz('q1', { room_ids: ['room-2'] }, admin);
+
+      expect(quizOwnershipService.isOwnerOrCoInstructor).not.toHaveBeenCalled();
+      expect(prisma.quiz.update).toHaveBeenCalledWith({
+        where: { id: 'q1' },
+        data: { requestedRoomIds: ['room-2'], backupRoomId: null, roomAllocationStrategy: null, roomAdjustmentNote: null },
+      });
+    });
+
+    it("stores the ADMIN's note (e.g. explaining a backup-room removal) on the quiz, visible to the faculty", async () => {
+      quizzesService.findById.mockResolvedValue(submittedQuiz);
+      prisma.room.findMany.mockResolvedValue([{ id: 'room-2' }]);
+
+      await service.requestForQuiz('q1', { room_ids: ['room-2'], admin_note: 'Backup room removed — it was double-booked.' }, admin);
+
+      expect(prisma.quiz.update).toHaveBeenCalledWith({
+        where: { id: 'q1' },
+        data: {
+          requestedRoomIds: ['room-2'],
+          backupRoomId: null,
+          roomAllocationStrategy: null,
+          roomAdjustmentNote: 'Backup room removed — it was double-booked.',
+        },
+      });
+    });
+
+    it("ignores a FACULTY-supplied admin_note (only an ADMIN's own edit can set one)", async () => {
+      quizzesService.findById.mockResolvedValue(draftQuiz);
+      quizOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(true);
+      prisma.room.findMany.mockResolvedValue([{ id: 'room-1' }]);
+
+      await service.requestForQuiz('q1', { room_ids: ['room-1'], admin_note: 'ignored' } as any, faculty);
+
+      expect(prisma.quiz.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ roomAdjustmentNote: null }) }),
+      );
+    });
+
+    it('still blocks ADMIN once the quiz is fully APPROVED (nothing left to swap)', async () => {
+      quizzesService.findById.mockResolvedValue({ ...draftQuiz, status: 'APPROVED' });
+
+      await expect(service.requestForQuiz('q1', { room_ids: ['room-1'] }, admin)).rejects.toThrow(ConflictException);
+    });
+  });
+
+  describe('getQuizRoomConflicts', () => {
+    it('404s a non-owner FACULTY', async () => {
+      quizzesService.findById.mockResolvedValue({ id: 'q1', requestedRoomIds: ['room-1'], backupRoomId: null, preferredDate: new Date(), preferredTime: new Date() });
+      quizOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(service.getQuizRoomConflicts('q1', { id: 'faculty-1', email: 'f@x.com', roles: ['FACULTY'], mustChangePassword: false })).rejects.toThrow(NotFoundException);
+    });
+
+    it('ADMIN sees it unscoped', async () => {
+      quizzesService.findById.mockResolvedValue({
+        id: 'q1',
+        requestedRoomIds: ['room-1'],
+        backupRoomId: null,
+        roomAllocationStrategy: 'FEWEST_ROOMS',
+        preferredDate: new Date('2026-05-01T00:00:00Z'),
+        preferredTime: new Date('1970-01-01T10:00:00Z'),
+        durationMinutes: 60,
+      });
+      prisma.room.findMany.mockResolvedValue([{ id: 'room-1', building: 'A', floor: 1, roomNumber: '101', capacity: 30 }]);
+      roomsService.findAvailable.mockResolvedValue([]);
+
+      const result = await service.getQuizRoomConflicts('q1', admin);
+
+      expect(result.requestedRooms[0].roomId).toBe('room-1');
+      expect(result.studentConflicts).toEqual([]);
+      expect(quizOwnershipService.isOwnerOrCoInstructor).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a BR-019 student-schedule conflict against the quiz's OWN preferred slot — visible before the quiz is even approved", async () => {
+      quizzesService.findById.mockResolvedValue({
+        id: 'q1',
+        requestedRoomIds: [],
+        backupRoomId: null,
+        roomAllocationStrategy: null,
+        preferredDate: new Date('2026-05-01T00:00:00Z'),
+        preferredTime: new Date('1970-01-01T10:00:00Z'),
+        durationMinutes: 60,
+      });
+      conflictEngine.checkSessionAssembly.mockResolvedValue({
+        hard: [
+          {
+            type: 'STUDENT_OVERLAP',
+            studentId: 'student-1',
+            conflictingExamSessionId: 'other-session',
+            message: 'Student "student-1" already has an active assignment in exam session "other-session".',
+          },
+        ],
+        warnings: [],
+      });
+
+      const result = await service.getQuizRoomConflicts('q1', admin);
+
+      expect(conflictEngine.checkSessionAssembly).toHaveBeenCalledWith(
+        expect.objectContaining({ quizIds: ['q1'] }),
+      );
+      expect(result.studentConflicts).toEqual([
+        { studentId: 'student-1', conflictingExamSessionId: 'other-session', message: expect.stringContaining('student-1') },
+      ]);
+      expect(result.requestedRooms).toEqual([]);
+    });
+
+    it("excludes the quiz's OWN actively-attached exam session, not just the NIL sentinel — a quiz must not conflict with its own booking after approval", async () => {
+      quizzesService.findById.mockResolvedValue({
+        id: 'q1',
+        requestedRoomIds: [],
+        backupRoomId: null,
+        roomAllocationStrategy: null,
+        preferredDate: new Date('2026-05-01T00:00:00Z'),
+        preferredTime: new Date('1970-01-01T10:00:00Z'),
+        durationMinutes: 60,
+      });
+      prisma.examSessionQuiz.findFirst.mockResolvedValue({ examSessionId: 'real-session-1' });
+      conflictEngine.checkSessionAssembly.mockResolvedValue({ hard: [], warnings: [] });
+
+      await service.getQuizRoomConflicts('q1', admin);
+
+      expect(prisma.examSessionQuiz.findFirst).toHaveBeenCalledWith({
+        where: { quizId: 'q1', isActiveAttachment: true },
+        select: { examSessionId: true },
+      });
+      expect(conflictEngine.checkSessionAssembly).toHaveBeenCalledWith(
+        expect.objectContaining({ examSessionId: 'real-session-1' }),
+      );
     });
   });
 });

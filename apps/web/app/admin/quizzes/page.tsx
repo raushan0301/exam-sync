@@ -1,8 +1,9 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { useState } from 'react';
-import { StatusBadge, Select, FilterBar, Pagination, Button } from '@/components/ui';
+import { StatusBadge, Select, FilterBar, Pagination, Button, Card } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
 import { useQuizzes } from '@/lib/queries/useQuizzes';
@@ -39,9 +40,29 @@ export default function AdminQuizzesPage() {
     { key: 'title', header: 'Title', render: (q) => q.title },
     { key: 'subject', header: 'Subject', render: (q) => subjectById.get(q.subjectId)?.name ?? q.subjectId },
     { key: 'status', header: 'Status', render: (q) => <StatusBadge status={q.status} /> },
+    {
+      key: 'session',
+      header: 'Exam Session',
+      render: (q) =>
+        q.examSession ? (
+          <Link href={`/admin/exam-sessions/${q.examSession.id}`} className="flex items-center gap-2 text-primary-600 hover:underline">
+            <StatusBadge status={q.examSession.status} />
+          </Link>
+        ) : (
+          <span className="text-text-muted">Not scheduled</span>
+        ),
+    },
     { key: 'term', header: 'Year / Semester', render: (q) => `${q.academicYear} / Sem ${q.semester}` },
     { key: 'updatedAt', header: 'Updated', render: (q) => new Date(q.updatedAt).toLocaleDateString() },
   ];
+
+  const items = data?.items ?? [];
+  // Same split as the faculty "My Quizzes" list — once the quiz's own
+  // exam session is COMPLETED or CANCELLED, there's nothing left to act
+  // on for it.
+  const isHistorical = (q: Quiz) => q.examSession?.status === 'COMPLETED' || q.examSession?.status === 'CANCELLED';
+  const activeQuizzes = items.filter((q) => !isHistorical(q));
+  const historyQuizzes = items.filter(isHistorical);
 
   return (
     <div className="flex flex-col gap-4">
@@ -64,7 +85,7 @@ export default function AdminQuizzesPage() {
 
       <DataTable
         columns={columns}
-        data={data?.items ?? []}
+        data={activeQuizzes}
         getRowKey={(q) => q.id}
         isLoading={isLoading}
         isError={isError}
@@ -80,7 +101,25 @@ export default function AdminQuizzesPage() {
         )}
       />
 
-      {(data?.items?.length ?? 0) > 0 && (
+      {historyQuizzes.length > 0 && (
+        <Card header={<h2 className="text-sm font-semibold text-text">History</h2>} padding="dense">
+          <DataTable
+            columns={columns}
+            data={historyQuizzes}
+            getRowKey={(q) => q.id}
+            isLoading={false}
+            isError={false}
+            emptyTitle="No past quizzes yet"
+            renderActions={(q) => (
+              <Button size="sm" variant="secondary" onClick={() => router.push(`/admin/quizzes/${q.id}`)}>
+                View
+              </Button>
+            )}
+          />
+        </Card>
+      )}
+
+      {items.length > 0 && (
         <Pagination hasNext={!!data?.next_cursor} hasPrev={pager.hasPrev} onNext={() => pager.goNext(data?.next_cursor)} onPrev={pager.goPrev} />
       )}
     </div>

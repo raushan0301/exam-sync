@@ -1,6 +1,7 @@
 import {
   CanActivate,
   ExecutionContext,
+  ForbiddenException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -9,6 +10,7 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { IS_PUBLIC_KEY } from './public.decorator';
+import { ALLOW_PASSWORD_CHANGE_REQUIRED_KEY } from './allow-password-change-required.decorator';
 import { AuthenticatedUser, JwtAccessPayload } from './auth.types';
 
 /**
@@ -69,10 +71,29 @@ export class JwtAuthGuard implements CanActivate {
       throw new UnauthorizedException('Invalid or expired token.');
     }
 
+    if (user.mustChangePassword) {
+      const allowed = this.reflector.getAllAndOverride<boolean>(
+        ALLOW_PASSWORD_CHANGE_REQUIRED_KEY,
+        [context.getHandler(), context.getClass()],
+      );
+      if (!allowed) {
+        // A standing default password (roll_number/employee_code + name)
+        // must never be usable for anything beyond setting a real one —
+        // enforced server-side, not just as a frontend redirect, since a
+        // client could otherwise just skip the prompt and keep using the
+        // access token it already has.
+        throw new ForbiddenException({
+          code: 'PASSWORD_CHANGE_REQUIRED',
+          message: 'You must change your password before continuing.',
+        });
+      }
+    }
+
     const authenticatedUser: AuthenticatedUser = {
       id: user.id,
       email: user.email,
       roles: user.roles.map((ur) => ur.role.name),
+      mustChangePassword: user.mustChangePassword,
     };
 
     request.user = authenticatedUser;

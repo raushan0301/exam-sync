@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Plus } from 'lucide-react';
+import { Plus, Upload } from 'lucide-react';
 import {
   Button,
   Input,
@@ -19,16 +19,24 @@ import {
 } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { useBatches } from '@/lib/queries/useBatches';
 import { usePrograms } from '@/lib/queries/usePrograms';
-import { useCreateBatch, useUpdateBatch } from '@/lib/mutations/useBatchMutations';
+import {
+  useCreateBatch,
+  useUpdateBatch,
+  useBulkImportBatches,
+  downloadBatchTemplate,
+} from '@/lib/mutations/useBatchMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { Batch } from '@/lib/queries/types';
 
 const batchSchema = z.object({
   program_id: z.string().uuid('Select a program.'),
-  year: z.coerce.number().int().min(1900, 'Year must be 1900 or later.'),
+  year: z.string().min(1, 'Year is required.'),
   section: z.string().min(1, 'Section is required.'),
+  subsection: z.string().min(1, 'Subsection is required.'),
 });
 type BatchFormValues = z.infer<typeof batchSchema>;
 
@@ -40,6 +48,7 @@ export default function BatchesPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Batch | null>(null);
   const [deactivating, setDeactivating] = useState<Batch | null>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = useBatches({
     status: statusFilter || undefined,
@@ -53,18 +62,24 @@ export default function BatchesPage() {
   const createMutation = useCreateBatch();
   const updateMutation = useUpdateBatch(editing?.id ?? '');
   const deactivateMutation = useUpdateBatch(deactivating?.id ?? '');
+  const bulkImportMutation = useBulkImportBatches();
 
   const form = useForm<BatchFormValues>({
     resolver: zodResolver(batchSchema),
-    defaultValues: { program_id: '', year: new Date().getFullYear(), section: '' },
+    defaultValues: { program_id: '', year: '', section: '', subsection: '' },
   });
 
   useEffect(() => {
     if (modalOpen) {
       form.reset(
         editing
-          ? { program_id: editing.programId, year: editing.year, section: editing.section }
-          : { program_id: '', year: new Date().getFullYear(), section: '' },
+          ? {
+              program_id: editing.programId,
+              year: editing.year,
+              section: editing.section,
+              subsection: editing.subsection,
+            }
+          : { program_id: '', year: '', section: '', subsection: '' },
       );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -101,8 +116,9 @@ export default function BatchesPage() {
 
   const columns: DataTableColumn<Batch>[] = [
     { key: 'program', header: 'Program', render: (b) => programById.get(b.programId)?.name ?? b.programId },
-    { key: 'year', header: 'Year', render: (b) => String(b.year) },
+    { key: 'year', header: 'Year', render: (b) => b.year },
     { key: 'section', header: 'Section', render: (b) => b.section },
+    { key: 'subsection', header: 'Subsection', render: (b) => b.subsection },
     { key: 'status', header: 'Status', render: (b) => <StatusBadge status={b.status} /> },
   ];
 
@@ -115,9 +131,18 @@ export default function BatchesPage() {
           <h1 className="text-xl font-semibold text-text">Batches</h1>
           <p className="text-sm text-text-muted">Manage student batches (year/section) within programs.</p>
         </div>
-        <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
-          New Batch
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            leadingIcon={<Upload size={16} aria-hidden="true" />}
+            onClick={() => setBulkImportOpen(true)}
+          >
+            Bulk Import
+          </Button>
+          <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
+            New Batch
+          </Button>
+        </div>
       </div>
 
       <FilterBar>
@@ -186,15 +211,18 @@ export default function BatchesPage() {
             <FormField<BatchFormValues> name="year" label="Year" required>
               {(field) => (
                 <Input
-                  type="number"
                   {...field}
-                  value={(field.value as number) ?? ''}
-                  onChange={(e) => field.onChange(e.target.value === '' ? '' : Number(e.target.value))}
+                  placeholder="e.g. 4 or 2023-2027"
+                  value={(field.value as string) ?? ''}
+                  onChange={(e) => field.onChange(e.target.value)}
                 />
               )}
             </FormField>
             <FormField<BatchFormValues> name="section" label="Section" required>
-              {(field) => <Input {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
+              {(field) => <Input {...field} placeholder="e.g. 4C2" value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
+            </FormField>
+            <FormField<BatchFormValues> name="subsection" label="Subsection" required>
+              {(field) => <Input {...field} placeholder="e.g. 4C24" value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
             </FormField>
           </form>
         </FormProvider>
@@ -206,13 +234,22 @@ export default function BatchesPage() {
         title={deactivating?.status === 'ACTIVE' ? 'Deactivate batch?' : 'Reactivate batch?'}
         description={
           deactivating?.status === 'ACTIVE'
-            ? `Batch "${deactivating?.section} (${deactivating?.year})" will be marked inactive.`
-            : `Batch "${deactivating?.section} (${deactivating?.year})" will be marked active again.`
+            ? `Batch "${deactivating?.section}/${deactivating?.subsection} (${deactivating?.year})" will be marked inactive.`
+            : `Batch "${deactivating?.section}/${deactivating?.subsection} (${deactivating?.year})" will be marked active again.`
         }
         confirmLabel={deactivating?.status === 'ACTIVE' ? 'Deactivate' : 'Reactivate'}
         destructive={deactivating?.status === 'ACTIVE'}
         loading={deactivateMutation.isPending}
         onConfirm={confirmDeactivate}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Batch"
+        onDownloadTemplate={downloadBatchTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

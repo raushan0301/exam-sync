@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Plus } from 'lucide-react';
+import { Plus, Upload } from 'lucide-react';
 import {
   Button,
   Input,
@@ -20,9 +20,16 @@ import {
 } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { usePrograms } from '@/lib/queries/usePrograms';
 import { useDepartments } from '@/lib/queries/useDepartments';
-import { useCreateProgram, useUpdateProgram } from '@/lib/mutations/useProgramMutations';
+import {
+  useCreateProgram,
+  useUpdateProgram,
+  useBulkImportPrograms,
+  downloadProgramTemplate,
+} from '@/lib/mutations/useProgramMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { Program } from '@/lib/queries/types';
 
@@ -40,6 +47,7 @@ export default function ProgramsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Program | null>(null);
   const [deactivating, setDeactivating] = useState<Program | null>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = usePrograms({
     search,
@@ -54,6 +62,7 @@ export default function ProgramsPage() {
   const createMutation = useCreateProgram();
   const updateMutation = useUpdateProgram(editing?.id ?? '');
   const deactivateMutation = useUpdateProgram(deactivating?.id ?? '');
+  const bulkImportMutation = useBulkImportPrograms();
 
   const form = useForm<ProgramFormValues>({
     resolver: zodResolver(programSchema),
@@ -116,9 +125,18 @@ export default function ProgramsPage() {
           <h1 className="text-xl font-semibold text-text">Programs</h1>
           <p className="text-sm text-text-muted">Manage academic programs within departments.</p>
         </div>
-        <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
-          New Program
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            leadingIcon={<Upload size={16} aria-hidden="true" />}
+            onClick={() => setBulkImportOpen(true)}
+          >
+            Bulk Import
+          </Button>
+          <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
+            New Program
+          </Button>
+        </div>
       </div>
 
       <FilterBar>
@@ -208,6 +226,15 @@ export default function ProgramsPage() {
         destructive={deactivating?.status === 'ACTIVE'}
         loading={deactivateMutation.isPending}
         onConfirm={confirmDeactivate}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Program"
+        onDownloadTemplate={downloadProgramTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

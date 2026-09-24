@@ -13,8 +13,12 @@ import {
   useRejectQuiz,
 } from '@/lib/mutations/useQuizMutations';
 import { ApiError } from '@/lib/api-client';
-import { mapError } from '@/lib/error-mapping';
+import { formatTime } from '@/lib/format-time';
+import { mapError, specificForbiddenMessage } from '@/lib/error-mapping';
 import { QuizForm, editQuizFormSchema, defaultQuizFormValues, toQuizApiPayload, type EditQuizFormValues } from './QuizForm';
+import { QuizRoomRequestPanel } from './QuizRoomRequestPanel';
+import { QuizRoomConflictPanel } from './QuizRoomConflictPanel';
+import { QuizAllocatedRoomsPanel } from './QuizAllocatedRoomsPanel';
 
 export interface QuizDetailViewProps {
   quizId: string;
@@ -80,7 +84,7 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
         setConflictMessage('This quiz was changed by someone else since you loaded it. Refresh to see the latest version before editing again.');
         quizQuery.refetch();
       } else {
-        editForm.setError('root', { message: mapError(err).description });
+        editForm.setError('root', { message: specificForbiddenMessage(err) ?? mapError(err).description });
       }
     }
   }
@@ -194,12 +198,8 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
               <dd className="text-text">{quiz.durationMinutes ?? '—'} min</dd>
             </div>
             <div>
-              <dt className="text-text-muted">Total Marks</dt>
-              <dd className="text-text">{quiz.totalMarks ?? '—'}</dd>
-            </div>
-            <div>
-              <dt className="text-text-muted">Number of Questions</dt>
-              <dd className="text-text">{quiz.questionCount ?? '—'}</dd>
+              <dt className="text-text-muted">Number of Students</dt>
+              <dd className="text-text">{quiz.studentCount ?? '—'}</dd>
             </div>
             <div>
               <dt className="text-text-muted">Quiz Type</dt>
@@ -211,7 +211,7 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
             </div>
             <div>
               <dt className="text-text-muted">Preferred Time</dt>
-              <dd className="text-text">{quiz.preferredTime ? quiz.preferredTime.slice(0, 5) : '—'}</dd>
+              <dd className="text-text">{formatTime(quiz.preferredTime)}</dd>
             </div>
             <div className="col-span-2">
               <dt className="text-text-muted">Instructions</dt>
@@ -226,6 +226,37 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
           </Alert>
         )}
       </Card>
+
+      {quiz.roomAdjustmentNote && (
+        <Alert color="info" title="Admin note on this room request">
+          {quiz.roomAdjustmentNote}
+        </Alert>
+      )}
+
+      {canFacultyEdit && !editing && (
+        <Card header={<h2 className="text-sm font-semibold text-text">Room Suggestion</h2>} padding="dense">
+          <QuizRoomRequestPanel quiz={quiz} />
+        </Card>
+      )}
+
+      {(quiz.status === 'SUBMITTED' || quiz.status === 'APPROVED') && (
+        <Card
+          header={
+            <h2 className="text-sm font-semibold text-text">
+              {quiz.status === 'APPROVED' ? 'Requested Rooms (at approval time)' : role === 'ADMIN' ? 'Room Availability' : 'Requested Rooms'}
+            </h2>
+          }
+          padding="dense"
+        >
+          <QuizRoomConflictPanel quiz={quiz} canSwap={role === 'ADMIN' && quiz.status === 'SUBMITTED'} />
+        </Card>
+      )}
+
+      {(quiz.examSession?.rooms.length ?? 0) > 0 && (
+        <Card header={<h2 className="text-sm font-semibold text-text">Final Allocated Rooms</h2>} padding="dense">
+          <QuizAllocatedRoomsPanel quiz={quiz} />
+        </Card>
+      )}
 
       <Card header={<h2 className="text-sm font-semibold text-text">Approval History</h2>} padding="dense">
         {historyQuery.isLoading ? (

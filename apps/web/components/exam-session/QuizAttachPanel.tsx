@@ -9,6 +9,8 @@ import { useUpdateSessionQuizzes } from '@/lib/mutations/useExamSessionMutations
 
 export interface QuizAttachPanelProps {
   session: ExamSessionDetail;
+  /** Faculty-lifecycle-ownership change: ADMIN is now read-only for scheduling data — pass `true` to hide Attach/Detach controls entirely. */
+  readOnly?: boolean;
 }
 
 /**
@@ -18,8 +20,8 @@ export interface QuizAttachPanelProps {
  * (exam-sessions.service.ts's `attachAndDetachQuizzes` guard) — the panel
  * still shows the current list read-only past that point.
  */
-export function QuizAttachPanel({ session }: QuizAttachPanelProps) {
-  const editable = session.status === 'DRAFT';
+export function QuizAttachPanel({ session, readOnly = false }: QuizAttachPanelProps) {
+  const editable = session.status === 'DRAFT' && !readOnly;
   const approvedQuizzesQuery = useQuizzes({ status: 'APPROVED', limit: 200 });
   const updateQuizzesMutation = useUpdateSessionQuizzes(session.id);
   const [selectedQuizId, setSelectedQuizId] = useState('');

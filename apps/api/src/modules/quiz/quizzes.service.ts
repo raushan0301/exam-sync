@@ -27,6 +27,7 @@ import {
 import { SubjectsService, BatchesService } from '../academic-structure';
 import { FacultyService } from '../faculty';
 import { FacultyAssignmentsService } from '../faculty-assignment';
+import { EnrollmentsService } from '../enrollment';
 import { QuizOwnershipService } from './quiz-ownership.service';
 import { QuizAccessRepository } from './quiz-access.repository';
 import { QuizApprovalHistoryService } from './quiz-approval-history.service';
@@ -40,6 +41,42 @@ export interface ListQuizzesParams {
   status?: QuizStatus;
   subjectId?: string;
   facultyId?: string;
+}
+
+/**
+ * `GET /quizzes` response shape — `examSession` denormalizes whether this
+ * quiz is CURRENTLY actively attached to an exam session (`null` if not),
+ * so callers (the "New Exam Session" picker, "My Quizzes") can show an
+ * approved-but-already-scheduled quiz as scheduled/in-progress/completed
+ * instead of letting a faculty start a second session for the same quiz.
+ * Detaching a quiz (isActiveAttachment: false) clears this back to null,
+ * matching FR-021/the attach-establishes-ownership design already in
+ * exam-sessions.service.ts.
+ */
+export interface QuizWithSchedule extends Quiz {
+  examSession: { id: string; status: string } | null;
+}
+
+export interface QuizAllocatedRoom {
+  id: string;
+  building: string;
+  floor: number;
+  roomNumber: string;
+  capacity: number;
+  allocatedCapacity: number;
+}
+
+/**
+ * `GET /quizzes/{id}` response shape — same `examSession` attachment
+ * `list()` already enriches with, PLUS (once one exists) its FINAL
+ * allocated rooms (`exam_session_rooms`, via `RoomAllocationService`) —
+ * distinct from this quiz's own `requestedRoomIds` (a preliminary,
+ * faculty-picked recommendation): once an exam session is built from
+ * this quiz and an admin actually approves room allocation there, THESE
+ * are the real, booked rooms.
+ */
+export interface QuizDetail extends Quiz {
+  examSession: { id: string; status: string; rooms: QuizAllocatedRoom[] } | null;
 }
 
 /**
@@ -66,7 +103,27 @@ export class QuizzesService {
     private readonly accessRepository: QuizAccessRepository,
     private readonly approvalHistoryService: QuizApprovalHistoryService,
     private readonly notificationsOutbox: NotificationsOutboxService,
+    private readonly enrollmentsService: EnrollmentsService,
   ) {}
+
+  /**
+   * `GET /quizzes/eligible-student-count` — real enrollment count for the
+   * exact (subject, batches, academic_year, semester) combination the
+   * quiz-creation form has picked so far, so `student_count` can be
+   * auto-filled with a real number instead of a guess. Same derivation
+   * `EnrollmentsService.findEligibleStudentIds` already uses for Phase 9's
+   * bulk student assignment (BR-005) — this quiz doesn't exist yet, so
+   * there's nothing to scope this to beyond the raw enrollment data.
+   */
+  async getEligibleStudentCount(
+    subjectId: string,
+    batchIds: string[],
+    academicYear: string,
+    semester: number,
+  ): Promise<{ count: number }> {
+    const ids = await this.enrollmentsService.findEligibleStudentIds(subjectId, batchIds, academicYear, semester);
+    return { count: ids.length };
+  }
 
   async create(dto: CreateQuizDto, actor: AuthenticatedUser): Promise<Quiz> {
     const actingFaculty = await this.requireActingFaculty(actor);
@@ -96,8 +153,7 @@ export class QuizzesService {
           academicYear: dto.academic_year,
           semester: dto.semester,
           durationMinutes: dto.duration_minutes,
-          totalMarks: dto.total_marks,
-          questionCount: dto.question_count,
+          studentCount: dto.student_count,
           instructions: dto.instructions,
           quizType: dto.quiz_type,
           preferredDate: this.toDate(dto.preferred_date),
@@ -136,8 +192,38 @@ export class QuizzesService {
   }
 
   /** `GET /quizzes/{id}` — ADMIN or owner/co-instructor FACULTY (404-not-403, IDOR-safe). */
-  async findByIdScoped(id: string, actor: AuthenticatedUser): Promise<Quiz> {
-    return this.accessRepository.findScoped(id, actor);
+  async findByIdScoped(id: string, actor: AuthenticatedUser): Promise<QuizDetail> {
+    const quiz = await this.accessRepository.findScoped(id, actor);
+
+    const attachment = await this.prisma.examSessionQuiz.findFirst({
+      where: { quizId: id, isActiveAttachment: true },
+      select: {
+        examSession: {
+          select: {
+            id: true,
+            status: true,
+            allocatedRooms: { select: { allocatedCapacity: true, room: true } },
+          },
+        },
+      },
+    });
+
+    const examSession = attachment
+      ? {
+          id: attachment.examSession.id,
+          status: attachment.examSession.status,
+          rooms: attachment.examSession.allocatedRooms.map((r) => ({
+            id: r.room.id,
+            building: r.room.building,
+            floor: r.room.floor,
+            roomNumber: r.room.roomNumber,
+            capacity: r.room.capacity,
+            allocatedCapacity: r.allocatedCapacity,
+          })),
+        }
+      : null;
+
+    return { ...quiz, examSession };
   }
 
   async getBatchIds(quizId: string): Promise<string[]> {
@@ -152,7 +238,7 @@ export class QuizzesService {
    * pass is ignored rather than trusted, since honoring it would let a
    * faculty probe another faculty's quiz list by id.
    */
-  async list(params: ListQuizzesParams, actor: AuthenticatedUser): Promise<PaginatedResult<Quiz>> {
+  async list(params: ListQuizzesParams, actor: AuthenticatedUser): Promise<PaginatedResult<QuizWithSchedule>> {
     const limit = resolveLimit(params.limit);
     const isAdmin = actor.roles.includes(ROLE.ADMIN);
 
@@ -192,7 +278,17 @@ export class QuizzesService {
       orderBy: { createdAt: 'asc' },
     });
 
-    return toPaginatedResult(rows, limit);
+    const attachments = rows.length
+      ? await this.prisma.examSessionQuiz.findMany({
+          where: { quizId: { in: rows.map((q) => q.id) }, isActiveAttachment: true },
+          select: { quizId: true, examSession: { select: { id: true, status: true } } },
+        })
+      : [];
+    const examSessionByQuizId = new Map(attachments.map((a) => [a.quizId, a.examSession]));
+
+    const enriched: QuizWithSchedule[] = rows.map((q) => ({ ...q, examSession: examSessionByQuizId.get(q.id) ?? null }));
+
+    return toPaginatedResult(enriched, limit);
   }
 
   /**
@@ -264,8 +360,7 @@ export class QuizzesService {
           academicYear: dto.academic_year,
           semester: dto.semester,
           durationMinutes: dto.duration_minutes,
-          totalMarks: dto.total_marks,
-          questionCount: dto.question_count,
+          studentCount: dto.student_count,
           instructions: dto.instructions,
           quizType: dto.quiz_type,
           preferredDate: this.toDate(dto.preferred_date),
@@ -375,6 +470,12 @@ export class QuizzesService {
         },
         tx,
       );
+
+      // Admin previously had no notification-feed signal that a quiz
+      // needs review — only a live "Pending Quiz Approvals" dashboard
+      // counter, nothing in the inbox — same "notify every ADMIN" pattern
+      // IncidentsService.notifyAdmins already established for BR-038.
+      await this.notifyAdmins(tx, updated);
 
       await this.auditHook.record(
         {
@@ -589,8 +690,7 @@ export class QuizzesService {
   private findMissingRequiredFields(quiz: Quiz): string[] {
     const missing: string[] = [];
     if (quiz.durationMinutes === null) missing.push('duration_minutes');
-    if (quiz.totalMarks === null) missing.push('total_marks');
-    if (quiz.questionCount === null) missing.push('question_count');
+    if (quiz.studentCount === null) missing.push('student_count');
     if (quiz.quizType === null) missing.push('quiz_type');
     if (quiz.preferredDate === null) missing.push('preferred_date');
     if (quiz.preferredTime === null) missing.push('preferred_time');
@@ -624,13 +724,41 @@ export class QuizzesService {
       );
       if (!assigned) {
         if (throwOnFailure) {
+          // Human-readable, not raw UUIDs — this message is shown verbatim
+          // to the faculty member (frontend's specificForbiddenMessage()
+          // opts this specific 403 out of the app's generic "access
+          // denied" text), so it needs to actually help them fix their own
+          // input, not just repeat back ids they didn't type themselves.
+          const [subject, batch] = await Promise.all([
+            this.subjectsService.findById(subjectId),
+            this.batchesService.findById(batchId),
+          ]);
           throw new ForbiddenException(
-            `Faculty is not assigned to teach subject "${subjectId}" for batch "${batchId}" in ${academicYear}/semester ${semester}.`,
+            `You are not assigned to teach "${subject.code} — ${subject.name}" for batch ` +
+              `"${batch.section}/${batch.subsection} (${batch.year})" in ${academicYear}, semester ${semester}.`,
           );
         }
         return false;
       }
     }
     return true;
+  }
+
+  /** Fans out an immediate notification to every ADMIN user — same pattern as `IncidentsService.notifyAdmins` (BR-038). */
+  private async notifyAdmins(tx: Prisma.TransactionClient, quiz: Quiz): Promise<void> {
+    const admins = await tx.user.findMany({
+      where: { roles: { some: { role: { name: ROLE.ADMIN } } } },
+      select: { id: true },
+    });
+    for (const admin of admins) {
+      await this.notificationsOutbox.queue(tx, {
+        recipientType: NotificationRecipientType.ADMIN,
+        recipientId: admin.id,
+        eventType: NotificationEventType.QUIZ_SUBMITTED,
+        entityId: quiz.id,
+        entityVersion: quiz.version,
+        payload: { quiz_id: quiz.id, quiz_title: quiz.title },
+      });
+    }
   }
 }

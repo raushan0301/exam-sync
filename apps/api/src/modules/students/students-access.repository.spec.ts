@@ -23,7 +23,7 @@ describe('StudentsAccessRepository (BR-045 / EC-038)', () => {
 
   it('lets the student themself read their own record', async () => {
     prisma.student.findUnique.mockResolvedValue({ id: 's1', userId: 'user-1', batchId: 'b1' });
-    const actor: AuthenticatedUser = { id: 'user-1', email: 'a@b.com', roles: ['STUDENT'] };
+    const actor: AuthenticatedUser = { id: 'user-1', email: 'a@b.com', roles: ['STUDENT'], mustChangePassword: false };
 
     await expect(repo.findScoped('s1', actor)).resolves.toEqual(
       expect.objectContaining({ id: 's1' }),
@@ -34,7 +34,7 @@ describe('StudentsAccessRepository (BR-045 / EC-038)', () => {
 
   it('lets ADMIN read any student record', async () => {
     prisma.student.findUnique.mockResolvedValue({ id: 's1', userId: 'someone-else', batchId: 'b1' });
-    const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@b.com', roles: ['ADMIN'] };
+    const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@b.com', roles: ['ADMIN'], mustChangePassword: false };
 
     await expect(repo.findScoped('s1', actor)).resolves.toEqual(
       expect.objectContaining({ id: 's1' }),
@@ -43,7 +43,7 @@ describe('StudentsAccessRepository (BR-045 / EC-038)', () => {
 
   it('blocks a different student with 404, not 403 (IDOR — EC-038)', async () => {
     prisma.student.findUnique.mockResolvedValue({ id: 's1', userId: 'the-owner', batchId: 'b1' });
-    const actor: AuthenticatedUser = { id: 'some-other-student', email: 'x@b.com', roles: ['STUDENT'] };
+    const actor: AuthenticatedUser = { id: 'some-other-student', email: 'x@b.com', roles: ['STUDENT'], mustChangePassword: false };
 
     await expect(repo.findScoped('s1', actor)).rejects.toThrow(NotFoundException);
   });
@@ -51,7 +51,7 @@ describe('StudentsAccessRepository (BR-045 / EC-038)', () => {
   it('lets a FACULTY member who teaches the student\'s batch read the record (Phase 5)', async () => {
     prisma.student.findUnique.mockResolvedValue({ id: 's1', userId: 'the-owner', batchId: 'batch-A' });
     facultyAssignmentsService.isFacultyTeachingBatch.mockResolvedValue(true);
-    const actor: AuthenticatedUser = { id: 'faculty-user-1', email: 'f@b.com', roles: ['FACULTY'] };
+    const actor: AuthenticatedUser = { id: 'faculty-user-1', email: 'f@b.com', roles: ['FACULTY'], mustChangePassword: false };
 
     await expect(repo.findScoped('s1', actor)).resolves.toEqual(
       expect.objectContaining({ id: 's1' }),
@@ -65,14 +65,14 @@ describe('StudentsAccessRepository (BR-045 / EC-038)', () => {
   it('blocks a FACULTY member who does NOT teach the student\'s batch, with 404', async () => {
     prisma.student.findUnique.mockResolvedValue({ id: 's1', userId: 'the-owner', batchId: 'batch-A' });
     facultyAssignmentsService.isFacultyTeachingBatch.mockResolvedValue(false);
-    const actor: AuthenticatedUser = { id: 'faculty-user-2', email: 'f2@b.com', roles: ['FACULTY'] };
+    const actor: AuthenticatedUser = { id: 'faculty-user-2', email: 'f2@b.com', roles: ['FACULTY'], mustChangePassword: false };
 
     await expect(repo.findScoped('s1', actor)).rejects.toThrow(NotFoundException);
   });
 
   it('404s for a non-existent student id', async () => {
     prisma.student.findUnique.mockResolvedValue(null);
-    const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@b.com', roles: ['ADMIN'] };
+    const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@b.com', roles: ['ADMIN'], mustChangePassword: false };
 
     await expect(repo.findScoped('missing', actor)).rejects.toThrow(NotFoundException);
   });

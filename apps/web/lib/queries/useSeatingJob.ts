@@ -7,12 +7,14 @@ import { queryKeys } from './queryKeys';
 import type { SeatingGenerationSummary } from './types';
 
 /**
- * GET /seating-jobs/{id} — ADMIN. This phase's generation is synchronous
- * (the `202` response already carries the final summary), so this hook is
- * built for contract completeness / a possible future "re-check a job"
- * affordance — the main generate flow never needs to poll it (verified
- * against `SeatingEngineService.getJob`, which just re-reads the same
- * `SeatingPlan` row by id and re-summarizes it).
+ * GET /seating-jobs/{id} — ADMIN (unscoped) or the owning/co-instructing
+ * FACULTY (scoped, 404 otherwise). This phase's generation is synchronous
+ * (the `202` response already carries the final summary), but
+ * SeatingPanel.tsx DOES call this hook right after generating — the
+ * `202` body and this endpoint return the identical shape
+ * (`SeatingEngineService.getJob` just re-reads the same `SeatingPlan` row
+ * by id and re-summarizes it), so re-fetching here is a deliberate refresh
+ * rather than a genuine polling need.
  */
 export function useSeatingJob(jobId: string | undefined) {
   return useQuery({

@@ -1,4 +1,5 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
+import { buildXlsxBuffer, readTemplateExampleRow } from '../../common/bulk-import/test-utils';
 import { Prisma, AcademicStatus } from '@exam-sync/db';
 import { FacultyService } from './faculty.service';
 import { DepartmentsService } from '../academic-structure';
@@ -12,27 +13,29 @@ function buildPrismaMock() {
     role: { findUnique: jest.fn() },
     user: { create: jest.fn(), update: jest.fn(), findUnique: jest.fn() },
     userRole: { create: jest.fn() },
-    faculty: { create: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
+    faculty: { create: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
   };
   return { ...tx, $transaction: jest.fn((cb: any) => cb(tx)) } as any;
 }
 
-const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('FacultyService (mirrors StudentsService)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
-  let departmentsService: { findById: jest.Mock };
+  let departmentsService: { findById: jest.Mock; findByCode: jest.Mock };
   let passwordService: { hash: jest.Mock };
   let accessRepository: any;
+  let importJobsService: { create: jest.Mock };
   let service: FacultyService;
 
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
-    departmentsService = { findById: jest.fn() };
+    departmentsService = { findById: jest.fn(), findByCode: jest.fn() };
     passwordService = { hash: jest.fn().mockResolvedValue('hashed-temp-password') };
     accessRepository = {};
+    importJobsService = { create: jest.fn().mockResolvedValue({ id: 'job-1' }) };
 
     service = new FacultyService(
       prisma,
@@ -40,7 +43,32 @@ describe('FacultyService (mirrors StudentsService)', () => {
       departmentsService as unknown as DepartmentsService,
       passwordService as unknown as PasswordService,
       accessRepository as FacultyAccessRepository,
+      importJobsService as any,
     );
+  });
+
+  describe('generateBulkImportTemplate', () => {
+    it('uses a real existing faculty member (+ their department\'s real code) as the example row', async () => {
+      prisma.faculty.findFirst.mockResolvedValue({
+        employeeCode: 'EMP2050', name: 'Dr. Real Person',
+        department: { code: 'ECE' }, user: { email: 'real.person@example.edu' },
+      });
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.department_code).toBe('ECE');
+      expect(row.employee_code).toBe('EMP2050');
+      expect(row.name).toBe('Dr. Real Person');
+      expect(row.email).toBe('real.person@example.edu');
+    });
+
+    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
+      prisma.faculty.findFirst.mockResolvedValue(null);
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.employee_code).toBe('EMP1001');
+    });
   });
 
   describe('create', () => {
@@ -87,6 +115,10 @@ describe('FacultyService (mirrors StudentsService)', () => {
       expect(JSON.stringify(result)).not.toMatch(/password/i);
       expect(prisma.userRole.create).toHaveBeenCalledWith({
         data: { userId: 'user-1', roleId: 'role-faculty' },
+      });
+      expect(passwordService.hash).toHaveBeenCalledWith('EMP-001_dr.gracehopper');
+      expect(prisma.user.create).toHaveBeenCalledWith({
+        data: { email: dto.email, passwordHash: 'hashed-temp-password', isActive: true, mustChangePassword: true },
       });
       expect(passwordService.hash).toHaveBeenCalled();
       expect(auditHook.record).toHaveBeenCalledWith(
@@ -153,6 +185,50 @@ describe('FacultyService (mirrors StudentsService)', () => {
       departmentsService.findById.mockRejectedValue(new NotFoundException());
 
       await expect(service.update('f1', { department_id: 'missing-dept' }, actor)).rejects.toThrow();
+    });
+  });
+
+  describe('bulkImport', () => {
+    it('resolves department_code to department_id and imports the row', async () => {
+      departmentsService.findByCode.mockResolvedValue({ id: 'd1', code: 'CSE' });
+      prisma.faculty.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.role.findUnique.mockResolvedValue({ id: 'role-faculty', name: 'FACULTY' });
+      prisma.user.create.mockResolvedValue({ id: 'user-1', email: 'jane@example.com' });
+      prisma.faculty.create.mockResolvedValue({ id: 'f1', employeeCode: 'EMP1' });
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'employee_code', 'name', 'email'],
+        [['CSE', 'EMP1', 'Jane Doe', 'jane@example.com']],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 1,
+          failureCount: 0,
+          results: [{ row: 2, status: 'SUCCESS', id: 'f1' }],
+        }),
+      );
+    });
+
+    it('reports a duplicate employee_code as a per-row FAILURE', async () => {
+      departmentsService.findByCode.mockResolvedValue({ id: 'd1', code: 'CSE' });
+      prisma.faculty.findUnique.mockResolvedValue({ id: 'existing', employeeCode: 'EMP1' });
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'employee_code', 'name', 'email'],
+        [['CSE', 'EMP1', 'Jane Doe', 'jane@example.com']],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 0,
+          failureCount: 1,
+          results: [expect.objectContaining({ row: 2, status: 'FAILURE' })],
+        }),
+      );
     });
   });
 });

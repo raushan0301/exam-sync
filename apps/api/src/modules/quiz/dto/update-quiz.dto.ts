@@ -4,7 +4,6 @@ import {
   IsArray,
   IsDateString,
   IsInt,
-  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
@@ -44,14 +43,9 @@ export class UpdateQuizDto {
   duration_minutes?: number;
 
   @IsOptional()
-  @IsNumber()
-  @Min(0)
-  total_marks?: number;
-
-  @IsOptional()
   @IsInt()
   @Min(1)
-  question_count?: number;
+  student_count?: number;
 
   @IsOptional()
   @IsString()

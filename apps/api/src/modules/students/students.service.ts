@@ -1,10 +1,9 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import * as crypto from 'crypto';
-import { parse as parseCsv } from 'csv-parse/sync';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, Student, ImportJob, AcademicStatus } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { generateDefaultPassword } from '../../common/auth/generate-default-password';
 import {
   cursorFindManyArgs,
   PaginatedResult,
@@ -13,6 +12,8 @@ import {
 } from '../../common/pagination/paginate';
 import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
 import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
+import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
+import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
 import { ProgramsService, BatchesService } from '../academic-structure';
 import { PasswordService } from '../auth';
 import { StudentsAccessRepository } from './students-access.repository';
@@ -50,8 +51,9 @@ export class StudentsService {
     // diverge would be a data-integrity gap the schema itself doesn't
     // prevent. Disclosed in this phase's pre-implementation plan.
     if (batch.programId !== dto.program_id) {
+      const actualProgram = await this.programsService.findById(batch.programId);
       throw new ConflictException(
-        `Batch does not belong to the specified program (batch's program is "${batch.programId}").`,
+        `Batch does not belong to the specified program (batch's program is "${actualProgram.name}").`,
       );
     }
 
@@ -67,11 +69,12 @@ export class StudentsService {
       throw new ConflictException(`A user with email "${dto.email}" already exists.`);
     }
 
-    // No self-registration or invite flow exists yet (Phase 3 scope note) —
-    // a random temporary password is generated and hashed through the same
-    // PasswordService login uses; it is never returned to any caller.
-    // Delivering it to the student (invite email) is Phase 15's job.
-    const temporaryPassword = crypto.randomBytes(24).toString('base64url');
+    // No self-registration or invite flow exists yet — the account gets a
+    // deterministic default password (roll_number + name, lowercase, no
+    // spaces) instead of a random one nobody could ever retrieve. The
+    // account is forced to change it on first login (mustChangePassword
+    // below), so this default can never be a standing credential.
+    const temporaryPassword = generateDefaultPassword(dto.roll_number, dto.name);
     const passwordHash = await this.passwordService.hash(temporaryPassword);
 
     const student = await this.prisma
@@ -88,7 +91,7 @@ export class StudentsService {
         }
 
         const user = await tx.user.create({
-          data: { email: dto.email, passwordHash, isActive: true },
+          data: { email: dto.email, passwordHash, isActive: true, mustChangePassword: true },
         });
         await tx.userRole.create({ data: { userId: user.id, roleId: studentRole.id } });
 
@@ -168,8 +171,9 @@ export class StudentsService {
     if (dto.batch_id) {
       const batch = await this.batchesService.findById(dto.batch_id);
       if (batch.programId !== targetProgramId) {
+        const actualProgram = await this.programsService.findById(batch.programId);
         throw new ConflictException(
-          `Batch does not belong to the specified program (batch's program is "${batch.programId}").`,
+          `Batch does not belong to the specified program (batch's program is "${actualProgram.name}").`,
         );
       }
     }
@@ -221,33 +225,55 @@ export class StudentsService {
     return student;
   }
 
+  /** `GET /students/bulk-import/template` (ADMIN). */
+  /** Example row is a real existing student (+ their program's/batch's real codes) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
+  async generateBulkImportTemplate(): Promise<Buffer> {
+    const sample = await this.prisma.student.findFirst({
+      where: { status: 'ACTIVE', program: { status: 'ACTIVE' }, batch: { status: 'ACTIVE' } },
+      orderBy: { createdAt: 'desc' },
+      include: { program: true, batch: true, user: true },
+    });
+    return generateExcelTemplate({
+      entityName: 'Student',
+      uniqueFieldsNote: 'Unique key: roll_number (email must also be unique)',
+      columns: [
+        { header: 'name', example: sample?.name ?? 'Jane Doe', note: 'Full name.' },
+        { header: 'email', example: sample?.user.email ?? 'jane.doe@example.com', note: 'Unique — used to provision the student login.' },
+        { header: 'program_code', example: sample?.program.code ?? 'BTECH-CSE', note: 'Must match an existing Program\'s code.' },
+        { header: 'batch_year', example: sample?.batch.year ?? '4', note: 'Cohort label of the batch — a single year ("2026") or a span ("2023-2027").' },
+        { header: 'batch_section', example: sample?.batch.section ?? '4C2', note: 'Coarse section of the batch.' },
+        { header: 'batch_subsection', example: sample?.batch.subsection ?? '4C24', note: 'Subsection of the batch — combined with program_code + batch_year + batch_section to identify the exact batch.' },
+        { header: 'roll_number', example: sample?.rollNumber ?? 'CSE2026001', note: 'Unique — cannot repeat an existing roll number.' },
+      ],
+    });
+  }
+
   /**
    * `POST /students/bulk-import` (IMPLEMENTATION_PLAN.md Phase 3:
    * "async job scaffold — actual queue wiring can be minimal/synchronous
-   * here, upgraded in Phase 15"). Processes the whole CSV synchronously
-   * within this call — the 202+job_id response shape the controller wraps
-   * this in already matches what Phase 15's real async queue will produce,
-   * so no client-facing contract change is needed when that lands.
+   * here, upgraded in Phase 15"). Processes the whole workbook
+   * synchronously within this call — the 202+job_id response shape the
+   * controller wraps this in already matches what Phase 15's real async
+   * queue will produce, so no client-facing contract change is needed
+   * when that lands.
    *
-   * Expected CSV columns: name,email,program_id,batch_id,roll_number
-   * (header row required). Each row is processed independently — one bad
-   * row never aborts the rest (EDGE_CASES.md EC-044: "valid rows are
-   * committed, invalid rows are reported individually with reason").
+   * Upgraded from CSV+UUID foreign keys to .xlsx with human-readable
+   * `program_code`/`batch_year`/`batch_section` columns (deliberate,
+   * intended change — admin-only endpoint, no external contract to
+   * preserve). Each row is processed independently — one bad row never
+   * aborts the rest (EDGE_CASES.md EC-044: "valid rows are committed,
+   * invalid rows are reported individually with reason").
    */
-  async bulkImport(csvBuffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
-    let records: Record<string, string>[];
-    try {
-      records = parseCsv(csvBuffer, { columns: true, skip_empty_lines: true, trim: true });
-    } catch (err) {
-      return this.importJobsService.create({
-        resourceType: 'students',
-        totalRows: 0,
-        successCount: 0,
-        failureCount: 0,
-        results: [{ row: 0, status: 'FAILURE', error: `CSV could not be parsed: ${(err as Error).message}` }],
-        createdByUserId: actor.id,
-      });
-    }
+  async bulkImport(buffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
+    const records = await parseExcelBuffer(buffer, [
+      'name',
+      'email',
+      'program_code',
+      'batch_year',
+      'batch_section',
+      'batch_subsection',
+      'roll_number',
+    ]);
 
     const results: ImportRowResult[] = [];
     let successCount = 0;
@@ -257,11 +283,28 @@ export class StudentsService {
       const rowNumber = i + 2; // +1 for 0-index, +1 for the header row
       const record = records[i];
       try {
+        const program = await this.programsService.findByCode(record.program_code);
+        if (!program) {
+          throw new BadRequestException(`Program code '${record.program_code}' not found`);
+        }
+
+        const batch = await this.batchesService.findByProgramYearSectionSubsection(
+          program.id,
+          record.batch_year,
+          record.batch_section,
+          record.batch_subsection,
+        );
+        if (!batch) {
+          throw new BadRequestException(
+            `No batch found for program '${record.program_code}', year ${record.batch_year}, section '${record.batch_section}', subsection '${record.batch_subsection}'`,
+          );
+        }
+
         const dto: CreateStudentDto = {
           name: record.name,
           email: record.email,
-          program_id: record.program_id,
-          batch_id: record.batch_id,
+          program_id: program.id,
+          batch_id: batch.id,
           roll_number: record.roll_number,
         };
         const student = await this.create(dto, actor);

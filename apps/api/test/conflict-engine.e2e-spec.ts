@@ -63,7 +63,7 @@ describe('Conflict Engine (e2e) — Phase 10 (real BR-019 student-overlap detect
     departmentId = dept.id;
     const prog = await prisma.program.create({ data: { departmentId, name: 'B.Tech CSE', code: progCode } });
     programId = prog.id;
-    const batchA = await prisma.batch.create({ data: { programId, year: 2026, section: 'A' } });
+    const batchA = await prisma.batch.create({ data: { programId, year: '2026', section: 'A', subsection: 'A' } });
     batchAId = batchA.id;
     const dbms = await prisma.subject.create({
       data: { departmentId, code: `DBMS-${suffix}`, name: 'Database Management Systems' },
@@ -136,7 +136,7 @@ describe('Conflict Engine (e2e) — Phase 10 (real BR-019 student-overlap detect
   // conflicts too — a real correctness signal from the new engine, not a
   // flake, but not what each test means to isolate).
   async function createIsolatedBatch() {
-    const batch = await prisma.batch.create({ data: { programId, year: 2026, section: `P10-${Date.now()}-${Math.random()}` } });
+    const batch = await prisma.batch.create({ data: { programId, year: '2026', section: `P10-${Date.now()}-${Math.random()}`, subsection: `P10-${Date.now()}-${Math.random()}` } });
     for (const subjectId of [dbmsSubjectId, osSubjectId]) {
       await request(app.getHttpServer())
         .post('/faculty-assignments')
@@ -185,7 +185,16 @@ describe('Conflict Engine (e2e) — Phase 10 (real BR-019 student-overlap detect
     const created = await request(app.getHttpServer())
       .post('/quizzes')
       .set('Authorization', `Bearer ${facultyAToken}`)
-      .send({ title: `P10 Quiz ${suffix}-${quizCounter}`, subject_id: subjectId, batch_ids: [batchId], academic_year: '2026', semester: 1 })
+      .send({
+        title: `P10 Quiz ${suffix}-${quizCounter}`,
+        subject_id: subjectId,
+        batch_ids: [batchId],
+        academic_year: '2026',
+        semester: 1,
+        student_count: 60,
+        preferred_date: '2026-05-01',
+        preferred_time: '10:00',
+      })
       .expect(201);
 
     await request(app.getHttpServer())
@@ -194,8 +203,7 @@ describe('Conflict Engine (e2e) — Phase 10 (real BR-019 student-overlap detect
       .set('If-Match', String(created.body.version))
       .send({
         duration_minutes: 60,
-        total_marks: 100,
-        question_count: 20,
+        student_count: 60,
         quiz_type: 'QUIZ',
         preferred_date: '2026-05-01',
         preferred_time: '10:00',

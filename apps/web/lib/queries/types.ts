@@ -27,8 +27,7 @@ export interface Quiz {
   subjectId: string;
   createdByFacultyId: string;
   durationMinutes: number | null;
-  totalMarks: number | null;
-  questionCount: number | null;
+  studentCount: number | null;
   instructions: string | null;
   quizType: string | null;
   preferredDate: string | null;
@@ -36,10 +35,37 @@ export interface Quiz {
   academicYear: string;
   semester: number;
   status: QuizStatus;
+  /** Faculty's preliminary room request (RoomSuggestionService.suggestForQuiz), shown to admin as a conflict preview during approval. */
+  requestedRoomIds: string[];
+  backupRoomId: string | null;
+  roomAllocationStrategy: string | null;
+  /** Set when an ADMIN adjusts this room request (swap, backup removed) while reviewing — shown back to the faculty. Cleared on the faculty's own next request. */
+  roomAdjustmentNote: string | null;
   /** Optimistic-lock version (BR-051) — required as `If-Match` on PATCH/approve. */
   version: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Only present on `GET /quizzes` (list) rows, not `GET /quizzes/{id}` —
+   * the exam session this quiz is CURRENTLY actively attached to, if any.
+   * `null`/absent means not yet scheduled (or its attachment was detached).
+   */
+  examSession?: { id: string; status: ExamSessionStatus } | null;
+}
+
+/** A room actually booked for the exam session a quiz was attached to (exam_session_rooms) — the FINAL allocation, distinct from `Quiz.requestedRoomIds`'s preliminary recommendation. */
+export interface QuizAllocatedRoom {
+  id: string;
+  building: string;
+  floor: number;
+  roomNumber: string;
+  capacity: number;
+  allocatedCapacity: number;
+}
+
+/** GET /quizzes/{id} response shape — same fields as Quiz, plus the active exam session (with its finally-allocated rooms, once any exist). */
+export interface QuizDetail extends Quiz {
+  examSession: { id: string; status: ExamSessionStatus; rooms: QuizAllocatedRoom[] } | null;
 }
 
 export type QuizApprovalAction = 'SUBMITTED' | 'APPROVED' | 'REJECTED' | 'RESUBMITTED';
@@ -95,6 +121,11 @@ export interface Incident {
   notes?: string | null;
   evidenceMetadata?: Record<string, unknown> | null;
   createdAt: string;
+  /** Resolved display labels for the FK ids above — see IncidentsService.list's own comment for why; render these, never the raw *Id fields. */
+  examSessionName: string;
+  roomLabel: string | null;
+  studentLabel: string | null;
+  quizTitle: string | null;
 }
 
 /**
@@ -152,8 +183,9 @@ export interface Program {
 export interface Batch {
   id: string;
   programId: string;
-  year: number;
+  year: string;
   section: string;
+  subsection: string;
   status: AcademicStatus;
   createdAt: string;
   updatedAt: string;
@@ -217,9 +249,9 @@ export interface ImportJob {
 // Verified directly against apps/api/src/modules/exam-session/*.ts and
 // packages/db/prisma/schema.prisma's `ExamSession` model. Field names are
 // camelCase (no @map translation applied to the JSON response), same
-// convention as Quiz above. There is NO `GET /exam-sessions` list
-// endpoint on the real backend (verified against exam-sessions.controller.ts)
-// — see the frontend milestone report for how that gap is handled.
+// convention as Quiz above. `GET /exam-sessions` (list, paginated) was
+// ADDED by the faculty-lifecycle-ownership change — ADMIN sees every
+// session unscoped, FACULTY sees only sessions they own/co-instruct.
 
 export type ExamSessionStatus =
   | 'DRAFT'
@@ -251,6 +283,12 @@ export interface ExamSession {
   endTime: string;
   status: ExamSessionStatus;
   createdByAdminId: string;
+  /** Faculty's requested candidate rooms while status is ROOM_ALLOCATION (pending admin review). */
+  requestedRoomIds: string[];
+  backupRoomId: string | null;
+  roomAllocationStrategy: string | null;
+  /** Set when an admin sends a room request back for changes; cleared on the next request/allocate. */
+  roomRejectionReason: string | null;
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -278,6 +316,9 @@ export interface ExamSessionRoom {
 export interface ExamSessionDetail extends ExamSession {
   quizzes: Quiz[];
   rooms: ExamSessionRoom[];
+  backupRoom: ExamSessionRoom | null;
+  /** True once every allocated room has a VALIDATED/FINALIZED seating plan — the real `status` enum can't express "seating done, just waiting on invigilators" (SEATING_GENERATION covers both), so the progress stepper uses this to show "Seating Generation" as complete and "Assign Invigilator" as the actual next step. */
+  seatingReady: boolean;
 }
 
 /**
@@ -310,6 +351,71 @@ export interface ConflictCheckResult {
   warnings: ConflictDetail[];
 }
 
+/** GET /exam-sessions/{id}/rooms/suggest — RoomSuggestionService's per-strategy room preview. */
+export interface SuggestedRoom {
+  roomId: string;
+  building: string;
+  floor: number;
+  roomNumber: string;
+  capacity: number;
+  allocated: number;
+}
+
+export type RoomSuggestionStrategy = 'FEWEST_ROOMS' | 'SEQUENTIAL' | 'BALANCED_SPREAD';
+
+export interface RoomSuggestionResult {
+  strategy: RoomSuggestionStrategy;
+  label: string;
+  description: string;
+  roomCount: number;
+  totalCapacity: number;
+  utilizationPercent: number;
+  rooms: SuggestedRoom[];
+}
+
+export interface AvailableRoomOption {
+  roomId: string;
+  building: string;
+  floor: number;
+  roomNumber: string;
+  capacity: number;
+}
+
+export interface RoomSuggestionResponse {
+  totalStudents: number;
+  shortfall: boolean;
+  availableRoomCount: number;
+  strategies: RoomSuggestionResult[];
+  /** Every available room for this date/time, not just the ones a strategy picked — for a manual "pick any room" dropdown. */
+  allRooms: AvailableRoomOption[];
+}
+
+/** GET /exam-sessions/{id}/rooms/preview — live availability for the admin review screen. */
+export interface RoomAvailabilityRow {
+  roomId: string;
+  building: string;
+  floor: number;
+  roomNumber: string;
+  capacity: number;
+  available: boolean;
+  reason?: string;
+  alternatives?: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[];
+}
+
+export interface StudentScheduleConflict {
+  studentId: string;
+  conflictingExamSessionId: string;
+  message: string;
+}
+
+export interface RoomAvailabilityPreview {
+  requestedRooms: RoomAvailabilityRow[];
+  backupRoom: RoomAvailabilityRow | null;
+  strategy: string | null;
+  /** Quiz-stage only — eligible students already booked elsewhere at an overlapping time (BR-019), checked against the quiz's own preferred slot so this shows up before approval. Always [] at the exam-session stage. */
+  studentConflicts: StudentScheduleConflict[];
+}
+
 // -- Rooms / Room Allocation / Student Assignment / Faculty Assignments
 // (Milestone 7) --------------------------------------------------------
 // Verified directly against packages/db/prisma/schema.prisma's Room,
@@ -320,6 +426,25 @@ export interface ConflictCheckResult {
 // applied to the JSON response — same convention as every model above.
 
 export type RoomStatus = 'ACTIVE' | 'MAINTENANCE' | 'INACTIVE';
+
+/**
+ * `GET /rooms/availability?date=...` response entry — added for the
+ * faculty-lifecycle-ownership change's room-availability calendar.
+ * Verified against `RoomsService.getAvailabilityCalendar`'s return shape.
+ */
+export interface RoomBookedRange {
+  start_time: string;
+  end_time: string;
+  source: 'EXAM_SESSION' | 'AVAILABILITY_BLOCK';
+  exam_session_id?: string;
+  exam_session_name?: string;
+  reason?: string | null;
+}
+
+export interface RoomAvailabilityCalendarEntry {
+  room: Room;
+  bookedRanges: RoomBookedRange[];
+}
 
 /** `rooms` — verified against rooms.service.ts's raw Prisma return shape. */
 export interface Room {
@@ -382,6 +507,10 @@ export interface RosterEntry {
   cancelledAt: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Resolved off this row's own quiz/student relations — stays correct even after the quiz is detached (e.g. session cancellation), unlike cross-referencing the exam session's current `quizzes` list. */
+  quizTitle: string;
+  studentName: string;
+  studentRollNumber: string;
 }
 
 /** Immediate (synchronous, despite the `202`) result of `POST /exam-sessions/{id}/assign-students`. */
@@ -411,6 +540,19 @@ export interface FacultyAssignment {
   createdAt: string;
   updatedAt: string;
   endedAt: string | null;
+}
+
+/** `student_subject_enrollment` — `status` defaults to ENROLLED; `droppedAt` is set, never hard-deleted, on a drop. */
+export interface StudentSubjectEnrollment {
+  id: string;
+  studentId: string;
+  subjectId: string;
+  batchId: string;
+  academicYear: string;
+  semester: number;
+  status: 'ENROLLED' | 'DROPPED';
+  enrolledAt: string;
+  droppedAt: string | null;
 }
 
 // -- Seating (Milestone 8) -----------------------------------------------
@@ -503,6 +645,17 @@ export interface Invigilator {
   createdAt: string;
 }
 
+/**
+ * `GET /faculty/{id}/invigilation-duties` response shape only — carries
+ * the session name/schedule and room label alongside the base
+ * `Invigilator` fields, since an invigilator on someone ELSE's session
+ * can't call `GET /exam-sessions/{id}` themselves to look these up.
+ */
+export interface InvigilatorDuty extends Invigilator {
+  examSession: { name: string; sessionDate: string; startTime: string; endTime: string; status: ExamSessionStatus };
+  room: { building: string; roomNumber: string };
+}
+
 export type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'LATE' | 'EXCUSED' | 'MEDICAL' | 'OTHER';
 
 /**
@@ -525,6 +678,16 @@ export interface Attendance {
   locked: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * `GET /exam-sessions/{id}/attendance` response shape only — carries the
+ * student name/roll number, quiz title, and seat label alongside the base
+ * `Attendance` fields, since the raw row only has ids.
+ */
+export interface AttendanceOverviewRow extends Attendance {
+  quizStudentAssignment: { student: { name: string; rollNumber: string }; quiz: { title: string } };
+  seat: { seatLabel: string };
 }
 
 /** `attendance_history` row — appended by every PATCH /attendance/{id} that actually changes `status`. */
@@ -589,6 +752,7 @@ export type AuditAction = 'CREATE' | 'UPDATE' | 'DEACTIVATE' | 'REACTIVATE';
 export interface AuditLogEntry {
   id: string;
   actorId: string;
+  actorEmail: string;
   action: AuditAction;
   entityType: string;
   entityId: string;

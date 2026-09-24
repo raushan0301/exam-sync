@@ -1,4 +1,5 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
+import { buildXlsxBuffer, readTemplateExampleRow } from '../../common/bulk-import/test-utils';
 import { Prisma } from '@exam-sync/db';
 import { SubjectsService } from './subjects.service';
 import { DepartmentsService } from './departments.service';
@@ -14,6 +15,7 @@ function buildPrismaMock() {
     subject: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
     },
@@ -22,26 +24,53 @@ function buildPrismaMock() {
   } as any;
 }
 
-const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('SubjectsService', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
-  let departmentsService: { findById: jest.Mock };
-  let programsService: { findById: jest.Mock };
+  let departmentsService: { findById: jest.Mock; findByCode: jest.Mock };
+  let programsService: { findById: jest.Mock; findByCode: jest.Mock };
+  let importJobsService: { create: jest.Mock };
   let service: SubjectsService;
 
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
-    departmentsService = { findById: jest.fn() };
-    programsService = { findById: jest.fn() };
+    departmentsService = { findById: jest.fn(), findByCode: jest.fn() };
+    programsService = { findById: jest.fn(), findByCode: jest.fn() };
+    importJobsService = { create: jest.fn().mockResolvedValue({ id: 'job-1' }) };
     service = new SubjectsService(
       prisma,
       auditHook as unknown as AuditHookService,
       departmentsService as unknown as DepartmentsService,
       programsService as unknown as ProgramsService,
+      importJobsService as any,
     );
+  });
+
+  describe('generateBulkImportTemplate', () => {
+    it('uses a real existing subject (+ its department\'s/program\'s real codes) as the example row', async () => {
+      prisma.subject.findFirst.mockResolvedValue({
+        code: 'CS450', name: 'Operating Systems', credits: 3.5,
+        department: { code: 'CSE' }, program: { code: 'BTECH-CSE' },
+      });
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.department_code).toBe('CSE');
+      expect(row.program_code).toBe('BTECH-CSE');
+      expect(row.code).toBe('CS450');
+      expect(row.credits).toBe('3.5');
+    });
+
+    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
+      prisma.subject.findFirst.mockResolvedValue(null);
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.code).toBe('CS301');
+    });
   });
 
   describe('create', () => {
@@ -139,6 +168,64 @@ describe('SubjectsService', () => {
     it('resolves for an active subject', async () => {
       prisma.subject.findUnique.mockResolvedValue({ id: 's1', code: 'DBMS', isActive: true });
       await expect(service.assertActiveOrThrow('s1')).resolves.toBeDefined();
+    });
+  });
+
+  describe('bulkImport', () => {
+    it('resolves department_code (required) and program_code (optional) and imports the row', async () => {
+      departmentsService.findByCode.mockResolvedValue({ id: 'd1', code: 'CSE' });
+      programsService.findByCode.mockResolvedValue({ id: 'p1', code: 'BTCSE' });
+      prisma.subject.findUnique.mockResolvedValue(null);
+      prisma.__tx.subject.create.mockResolvedValue({ id: 's1', code: 'CS301' });
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'program_code', 'code', 'name', 'credits'],
+        [['CSE', 'BTCSE', 'CS301', 'Data Structures', 4]],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 1,
+          failureCount: 0,
+          results: [{ row: 2, status: 'SUCCESS', id: 's1' }],
+        }),
+      );
+    });
+
+    it('accepts a half-credit value like 3.5 (credits is a float, not an integer)', async () => {
+      departmentsService.findByCode.mockResolvedValue({ id: 'd1', code: 'CSE' });
+      prisma.subject.findUnique.mockResolvedValue(null);
+      prisma.__tx.subject.create.mockResolvedValue({ id: 's2', code: 'CS302' });
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'code', 'name', 'credits'],
+        [['CSE', 'CS302', 'Lab Work', 3.5]],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ successCount: 1, failureCount: 0 }),
+      );
+    });
+
+    it('reports a duplicate subject code as a per-row FAILURE', async () => {
+      departmentsService.findByCode.mockResolvedValue({ id: 'd1', code: 'CSE' });
+      prisma.subject.findUnique.mockResolvedValue({ id: 'existing', code: 'CS301' });
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'code', 'name'],
+        [['CSE', 'CS301', 'Data Structures']],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 0,
+          failureCount: 1,
+          results: [expect.objectContaining({ row: 2, status: 'FAILURE' })],
+        }),
+      );
     });
   });
 });

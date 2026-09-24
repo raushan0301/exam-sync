@@ -25,6 +25,14 @@ import RoomDetailPage from '@/app/admin/rooms/[id]/page';
 
 const NOW = '2026-01-01T00:00:00.000Z';
 
+/** TimeInput renders three <select>s (Hour/Minute/AM-PM) inside a role="group" named by the field's label, instead of a single typeable text field. */
+async function setTimeField(groupName: RegExp, hour12: string, minute: string, period: 'AM' | 'PM') {
+  const group = screen.getByRole('group', { name: groupName });
+  await userEvent.selectOptions(within(group).getByLabelText('Hour'), hour12);
+  await userEvent.selectOptions(within(group).getByLabelText('Minute'), minute);
+  await userEvent.selectOptions(within(group).getByLabelText('AM or PM'), period);
+}
+
 function signInAsAdmin() {
   setTokens(VALID_ACCESS_TOKEN, VALID_REFRESH_TOKEN);
 }
@@ -141,8 +149,8 @@ describe('Room detail', () => {
     await userEvent.click(screen.getByRole('button', { name: /add block/i }));
 
     await userEvent.type(screen.getByLabelText(/^date/i), '2026-05-01');
-    await userEvent.type(screen.getByLabelText(/start time/i), '09:00');
-    await userEvent.type(screen.getByLabelText(/end time/i), '11:00');
+    await setTimeField(/start time/i, '9', '00', 'AM');
+    await setTimeField(/end time/i, '11', '00', 'AM');
     await userEvent.type(screen.getByLabelText(/reason/i), 'Maintenance');
 
     await userEvent.click(screen.getByRole('button', { name: /^add block$/i }));

@@ -3,6 +3,7 @@ import { Prisma, AcademicStatus } from '@exam-sync/db';
 import { DepartmentsService } from './departments.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { buildXlsxBuffer, readTemplateExampleRow } from '../../common/bulk-import/test-utils';
 
 function buildPrismaMock() {
   const tx = {
@@ -12,6 +13,7 @@ function buildPrismaMock() {
     department: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
     },
@@ -20,17 +22,45 @@ function buildPrismaMock() {
   } as any;
 }
 
-const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('DepartmentsService', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
   let service: DepartmentsService;
 
+  let importJobsService: { create: jest.Mock };
+
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
-    service = new DepartmentsService(prisma, auditHook as unknown as AuditHookService);
+    importJobsService = { create: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+    service = new DepartmentsService(
+      prisma,
+      auditHook as unknown as AuditHookService,
+      importJobsService as any,
+    );
+  });
+
+  describe('generateBulkImportTemplate', () => {
+    it('uses a real existing department as the example row instead of a fictional placeholder', async () => {
+      prisma.department.findFirst.mockResolvedValue({ id: 'd1', code: 'ECE', name: 'Electronics & Comms' });
+
+      const buffer = await service.generateBulkImportTemplate();
+      const row = await readTemplateExampleRow(buffer);
+
+      expect(row.code).toBe('ECE');
+      expect(row.name).toBe('Electronics & Comms');
+    });
+
+    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
+      prisma.department.findFirst.mockResolvedValue(null);
+
+      const buffer = await service.generateBulkImportTemplate();
+      const row = await readTemplateExampleRow(buffer);
+
+      expect(row.code).toBe('CSE');
+    });
   });
 
   describe('create', () => {
@@ -128,6 +158,42 @@ describe('DepartmentsService', () => {
     it('throws 404 for a non-existent department', async () => {
       prisma.department.findUnique.mockResolvedValue(null);
       await expect(service.assertActiveOrThrow('missing')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('bulkImport', () => {
+    it('imports a valid row and records a SUCCESS job result', async () => {
+      prisma.department.findUnique.mockResolvedValue(null);
+      prisma.__tx.department.create.mockResolvedValue({ id: 'd1', code: 'CSE', name: 'CSE' });
+      const buffer = await buildXlsxBuffer(['code', 'name'], [['CSE', 'Computer Science']]);
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resourceType: 'departments',
+          totalRows: 1,
+          successCount: 1,
+          failureCount: 0,
+          results: [{ row: 2, status: 'SUCCESS', id: 'd1' }],
+        }),
+      );
+    });
+
+    it('reports a duplicate code as a per-row FAILURE without aborting the job', async () => {
+      prisma.department.findUnique.mockResolvedValue({ id: 'existing', code: 'CSE' });
+      const buffer = await buildXlsxBuffer(['code', 'name'], [['CSE', 'Computer Science']]);
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          totalRows: 1,
+          successCount: 0,
+          failureCount: 1,
+          results: [expect.objectContaining({ row: 2, status: 'FAILURE' })],
+        }),
+      );
     });
   });
 });

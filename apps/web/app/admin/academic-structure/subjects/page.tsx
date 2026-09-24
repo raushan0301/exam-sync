@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Plus } from 'lucide-react';
+import { Plus, Upload } from 'lucide-react';
 import {
   Button,
   Input,
@@ -20,10 +20,17 @@ import {
 } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { useSubjects } from '@/lib/queries/useSubjects';
 import { useDepartments } from '@/lib/queries/useDepartments';
 import { usePrograms } from '@/lib/queries/usePrograms';
-import { useCreateSubject, useUpdateSubject } from '@/lib/mutations/useSubjectMutations';
+import {
+  useCreateSubject,
+  useUpdateSubject,
+  useBulkImportSubjects,
+  downloadSubjectTemplate,
+} from '@/lib/mutations/useSubjectMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { Subject } from '@/lib/queries/types';
 
@@ -32,7 +39,7 @@ const subjectSchema = z.object({
   program_id: z.string().uuid().optional().or(z.literal('')),
   code: z.string().min(1, 'Code is required.'),
   name: z.string().min(1, 'Name is required.'),
-  credits: z.coerce.number().int().min(0, 'Credits must be 0 or more.').optional().or(z.literal('')),
+  credits: z.coerce.number().min(0, 'Credits must be 0 or more.').optional().or(z.literal('')),
 });
 type SubjectFormValues = z.infer<typeof subjectSchema>;
 
@@ -43,6 +50,7 @@ export default function SubjectsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Subject | null>(null);
   const [deactivating, setDeactivating] = useState<Subject | null>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = useSubjects({
     search,
@@ -59,6 +67,7 @@ export default function SubjectsPage() {
   const createMutation = useCreateSubject();
   const updateMutation = useUpdateSubject(editing?.id ?? '');
   const deactivateMutation = useUpdateSubject(deactivating?.id ?? '');
+  const bulkImportMutation = useBulkImportSubjects();
 
   const form = useForm<SubjectFormValues>({
     resolver: zodResolver(subjectSchema),
@@ -135,9 +144,18 @@ export default function SubjectsPage() {
           <h1 className="text-xl font-semibold text-text">Subjects</h1>
           <p className="text-sm text-text-muted">Manage subjects offered under departments and programs.</p>
         </div>
-        <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
-          New Subject
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            leadingIcon={<Upload size={16} aria-hidden="true" />}
+            onClick={() => setBulkImportOpen(true)}
+          >
+            Bulk Import
+          </Button>
+          <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
+            New Subject
+          </Button>
+        </div>
       </div>
 
       <FilterBar>
@@ -224,6 +242,7 @@ export default function SubjectsPage() {
               {(field) => (
                 <Input
                   type="number"
+                  step="0.5"
                   {...field}
                   value={(field.value as number | '') ?? ''}
                   onChange={(e) => field.onChange(e.target.value === '' ? '' : Number(e.target.value))}
@@ -247,6 +266,15 @@ export default function SubjectsPage() {
         destructive={!!deactivating?.isActive}
         loading={deactivateMutation.isPending}
         onConfirm={confirmDeactivate}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Subject"
+        onDownloadTemplate={downloadSubjectTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

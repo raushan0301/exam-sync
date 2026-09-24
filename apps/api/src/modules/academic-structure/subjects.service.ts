@@ -1,5 +1,5 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, Subject } from '@exam-sync/db';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma, Subject, ImportJob } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
@@ -9,6 +9,10 @@ import {
   resolveLimit,
   toPaginatedResult,
 } from '../../common/pagination/paginate';
+import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
+import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
+import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
+import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
 import { DepartmentsService } from './departments.service';
 import { ProgramsService } from './programs.service';
 import { CreateSubjectDto } from './dto/create-subject.dto';
@@ -30,6 +34,7 @@ export class SubjectsService {
     private readonly auditHook: AuditHookService,
     private readonly departmentsService: DepartmentsService,
     private readonly programsService: ProgramsService,
+    private readonly importJobsService: ImportJobsService,
   ) {}
 
   async create(dto: CreateSubjectDto, actor: AuthenticatedUser): Promise<Subject> {
@@ -164,5 +169,92 @@ export class SubjectsService {
       throw new ConflictException(`Subject code "${code}" already exists.`);
     }
     throw err;
+  }
+
+  /** `GET /subjects/bulk-import/template` (ADMIN). */
+  /** Example row is a real existing subject (+ its department's/program's real codes) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
+  async generateBulkImportTemplate(): Promise<Buffer> {
+    const sample = await this.prisma.subject.findFirst({
+      where: { isActive: true, department: { status: 'ACTIVE' } },
+      orderBy: { createdAt: 'desc' },
+      include: { department: true, program: true },
+    });
+    return generateExcelTemplate({
+      entityName: 'Subject',
+      uniqueFieldsNote: 'Unique key: code',
+      columns: [
+        { header: 'department_code', example: sample?.department.code ?? 'CSE', note: 'Must match an existing Department\'s code.' },
+        { header: 'program_code', example: sample?.program?.code ?? '', note: 'Optional — must match an existing Program\'s code when given, blank otherwise.' },
+        { header: 'code', example: sample?.code ?? 'CS301', note: 'Unique — cannot repeat an existing subject code.' },
+        { header: 'name', example: sample?.name ?? 'Data Structures', note: 'Display name.' },
+        { header: 'credits', example: sample?.credits != null ? String(sample.credits) : '4.5', note: 'Optional — a number, whole or half-credit (e.g. 4, 3.5).' },
+      ],
+    });
+  }
+
+  /** `POST /subjects/bulk-import` (ADMIN). Resolves `department_code` (required) and `program_code` (optional) to ids per row. */
+  async bulkImport(buffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
+    const records = await parseExcelBuffer(buffer, ['department_code', 'code', 'name']);
+
+    const results: ImportRowResult[] = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (let i = 0; i < records.length; i++) {
+      const rowNumber = i + 2;
+      const record = records[i];
+      try {
+        const department = await this.departmentsService.findByCode(record.department_code);
+        if (!department) {
+          throw new BadRequestException(`Department code '${record.department_code}' not found`);
+        }
+
+        let programId: string | undefined;
+        const programCode = record.program_code?.trim();
+        if (programCode) {
+          const program = await this.programsService.findByCode(programCode);
+          if (!program) {
+            throw new BadRequestException(`Program code '${programCode}' not found`);
+          }
+          programId = program.id;
+        }
+
+        let credits: number | undefined;
+        const creditsRaw = record.credits?.trim();
+        if (creditsRaw) {
+          credits = Number(creditsRaw);
+          if (!Number.isFinite(credits)) {
+            throw new BadRequestException(`'credits' must be a number`);
+          }
+        }
+
+        const dto: CreateSubjectDto = {
+          department_id: department.id,
+          program_id: programId,
+          code: record.code,
+          name: record.name,
+          credits,
+        };
+        const subject = await this.create(dto, actor);
+        results.push({ row: rowNumber, status: 'SUCCESS', id: subject.id });
+        successCount++;
+      } catch (err) {
+        results.push({
+          row: rowNumber,
+          status: 'FAILURE',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        });
+        failureCount++;
+      }
+    }
+
+    return this.importJobsService.create({
+      resourceType: 'subjects',
+      totalRows: records.length,
+      successCount,
+      failureCount,
+      results,
+      createdByUserId: actor.id,
+    });
   }
 }

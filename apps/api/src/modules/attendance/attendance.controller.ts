@@ -7,7 +7,7 @@ import { Roles } from '../../common/auth/roles.decorator';
 import { CurrentUser } from '../../common/auth/current-user.decorator';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 
-/** Matches API_CONTRACT.md "Attendance" — the 4 documented routes, plus 2 undocumented `start`/`complete` admin actions (see `ExamSessionLifecycleService`'s header comment for why). */
+/** Matches API_CONTRACT.md "Attendance" — the 4 documented routes, plus 2 undocumented `start`/`complete` FACULTY actions, ownership-gated inside the service (see `ExamSessionLifecycleService`'s header comment for why they exist and why they're FACULTY, not ADMIN). */
 @Controller()
 export class AttendanceController {
   constructor(
@@ -51,13 +51,13 @@ export class AttendanceController {
     });
   }
 
-  @Roles(ROLE.ADMIN)
+  @Roles(ROLE.FACULTY)
   @Post('exam-sessions/:id/start')
   start(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {
     return this.lifecycleService.start(id, actor);
   }
 
-  @Roles(ROLE.ADMIN)
+  @Roles(ROLE.FACULTY)
   @Post('exam-sessions/:id/complete')
   complete(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {
     return this.lifecycleService.complete(id, actor);

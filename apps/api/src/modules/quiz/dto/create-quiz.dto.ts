@@ -4,7 +4,6 @@ import {
   IsArray,
   IsDateString,
   IsInt,
-  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
@@ -49,15 +48,10 @@ export class CreateQuizDto {
   @Min(1)
   duration_minutes?: number;
 
-  @IsOptional()
-  @IsNumber()
-  @Min(0)
-  total_marks?: number;
-
-  @IsOptional()
+  /** Expected headcount for this quiz's cohort — required so RoomSuggestionService has something real to size rooms against. */
   @IsInt()
   @Min(1)
-  question_count?: number;
+  student_count!: number;
 
   @IsOptional()
   @IsString()
@@ -68,11 +62,10 @@ export class CreateQuizDto {
   @MinLength(1)
   quiz_type?: string;
 
-  @IsOptional()
+  /** Required (not optional) — the faculty must commit to a preferred slot up front; it's what room suggestion and admin scheduling are built around. */
   @IsDateString()
-  preferred_date?: string;
+  preferred_date!: string;
 
-  @IsOptional()
   @Matches(/^\d{2}:\d{2}(:\d{2})?$/, { message: 'preferred_time must be in HH:MM or HH:MM:SS format' })
-  preferred_time?: string;
+  preferred_time!: string;
 }

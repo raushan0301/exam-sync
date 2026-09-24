@@ -71,7 +71,8 @@ describe('Admin > Academic Structure > Batches', () => {
     await user.selectOptions(within(dialog).getByLabelText(/Program/i), PROGRAM_ID);
     await user.clear(within(dialog).getByLabelText(/Year/i));
     await user.type(within(dialog).getByLabelText(/Year/i), '2026');
-    await user.type(within(dialog).getByLabelText(/Section/i), 'A');
+    await user.type(within(dialog).getByLabelText(/^Section/i), 'A');
+    await user.type(within(dialog).getByLabelText(/^Subsection/i), 'A1');
     await user.click(within(dialog).getByRole('button', { name: 'Create' }));
 
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());

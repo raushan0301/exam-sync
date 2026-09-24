@@ -95,7 +95,16 @@ export class ConflictEngineService {
             endTime: { gt: input.startTime },
           },
         },
-        select: { studentId: true, examSessionId: true },
+        // Human-readable names for the conflict message below — a raw
+        // UUID tells a faculty/admin nothing actionable; joining these two
+        // relations costs nothing extra since this query is already
+        // scoped to at most `eligibleStudentIds.size` rows.
+        select: {
+          studentId: true,
+          examSessionId: true,
+          student: { select: { name: true, rollNumber: true } },
+          examSession: { select: { name: true } },
+        },
         distinct: ['studentId'],
       });
 
@@ -104,7 +113,7 @@ export class ConflictEngineService {
           type: 'STUDENT_OVERLAP',
           studentId: overlap.studentId,
           conflictingExamSessionId: overlap.examSessionId,
-          message: `Student "${overlap.studentId}" already has an active assignment in exam session "${overlap.examSessionId}", whose time window overlaps this session (BR-019).`,
+          message: `${overlap.student.name} (${overlap.student.rollNumber}) already has an active assignment in "${overlap.examSession.name}", whose time window overlaps this session (BR-019).`,
         });
       }
     }
@@ -155,13 +164,14 @@ export class ConflictEngineService {
         },
       },
     });
+    const roomLabel = (room: { building: string; roomNumber: string }) => `${room.building} · Room ${room.roomNumber}`;
 
     for (const room of rooms) {
       if (room.status !== RoomStatus.ACTIVE) {
         hard.push({
           type: 'ROOM_UNAVAILABLE',
           roomId: room.id,
-          message: `Room "${room.id}" is not ACTIVE (status "${room.status}") and cannot be allocated (BR-022).`,
+          message: `Room "${roomLabel(room)}" is not ACTIVE (status "${room.status}") and cannot be allocated (BR-022).`,
         });
         continue;
       }
@@ -169,7 +179,7 @@ export class ConflictEngineService {
         hard.push({
           type: 'ROOM_UNAVAILABLE',
           roomId: room.id,
-          message: `Room "${room.id}" has a blocked availability window overlapping this session (BR-022).`,
+          message: `Room "${roomLabel(room)}" has a blocked availability window overlapping this session (BR-022).`,
         });
         continue;
       }
@@ -183,8 +193,24 @@ export class ConflictEngineService {
           sessionDate: input.sessionDate,
           startTime: { lt: input.endTime },
           endTime: { gt: input.startTime },
+          // Defense in depth, matching checkSessionAssembly/
+          // checkInvigilatorAssignment's own CANCELLED exclusion —
+          // `ExamSessionsService.cancel` now deletes a cancelled
+          // session's own `exam_session_rooms` rows outright (the
+          // unconditional BR-018 EXCLUDE constraint can't see session
+          // status, so a leftover row would block reallocation forever),
+          // but this still guards any row that predates that fix.
+          examSession: { status: { not: ExamSessionStatus.CANCELLED } },
         },
-        select: { roomId: true, examSessionId: true },
+        // Same human-readable-message treatment as checkSessionAssembly
+        // above — a raw UUID pair tells nobody which room or session is
+        // actually in conflict.
+        select: {
+          roomId: true,
+          examSessionId: true,
+          room: { select: { building: true, roomNumber: true } },
+          examSession: { select: { name: true } },
+        },
       });
 
       for (const overlap of overlaps) {
@@ -192,7 +218,7 @@ export class ConflictEngineService {
           type: 'ROOM_OVERLAP',
           roomId: overlap.roomId,
           conflictingExamSessionId: overlap.examSessionId,
-          message: `Room "${overlap.roomId}" is already allocated to exam session "${overlap.examSessionId}", whose time window overlaps this session (BR-018).`,
+          message: `Room "${roomLabel(overlap.room)}" is already allocated to exam session "${overlap.examSession.name}", whose time window overlaps this session (BR-018).`,
         });
       }
     }
@@ -241,17 +267,30 @@ export class ConflictEngineService {
           endTime: { gt: input.startTime },
         },
       },
-      select: { examSessionId: true, roomId: true },
+      // Human-readable names for the message below, same treatment as
+      // checkSessionAssembly/checkRoomAllocation above — a raw UUID triple
+      // tells the caller nothing actionable.
+      select: {
+        examSessionId: true,
+        roomId: true,
+        room: { select: { building: true, roomNumber: true } },
+        examSession: { select: { name: true } },
+      },
     });
 
-    for (const overlap of overlaps) {
-      hard.push({
-        type: 'FACULTY_OVERLAP',
-        facultyId: input.facultyId,
-        roomId: overlap.roomId,
-        conflictingExamSessionId: overlap.examSessionId,
-        message: `Faculty "${input.facultyId}" is already invigilating room "${overlap.roomId}" in exam session "${overlap.examSessionId}", whose time window overlaps this assignment (BR-031).`,
-      });
+    if (overlaps.length > 0) {
+      const faculty = await client.faculty.findUnique({ where: { id: input.facultyId }, select: { name: true } });
+      const facultyLabel = faculty?.name ?? input.facultyId;
+
+      for (const overlap of overlaps) {
+        hard.push({
+          type: 'FACULTY_OVERLAP',
+          facultyId: input.facultyId,
+          roomId: overlap.roomId,
+          conflictingExamSessionId: overlap.examSessionId,
+          message: `${facultyLabel} is already invigilating ${overlap.room.building} · Room ${overlap.room.roomNumber} in exam session "${overlap.examSession.name}", whose time window overlaps this assignment (BR-031).`,
+        });
+      }
     }
 
     this.logger.debug(

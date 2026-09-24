@@ -4,8 +4,10 @@ import { Request } from 'express';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { RefreshDto } from './dto/refresh.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { Public } from '../../common/auth/public.decorator';
 import { CurrentUser } from '../../common/auth/current-user.decorator';
+import { AllowWhenPasswordChangeRequired } from '../../common/auth/allow-password-change-required.decorator';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 
 /**
@@ -39,10 +41,25 @@ export class AuthController {
     });
   }
 
+  @AllowWhenPasswordChangeRequired()
   @Post('logout')
   @HttpCode(HttpStatus.NO_CONTENT)
   async logout(@CurrentUser() user: AuthenticatedUser, @Req() req: Request): Promise<void> {
     await this.authService.logout(user.id, {
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
+  }
+
+  @AllowWhenPasswordChangeRequired()
+  @Post('change-password')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async changePassword(
+    @Body() dto: ChangePasswordDto,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request,
+  ): Promise<void> {
+    await this.authService.changePassword(user.id, dto.current_password, dto.new_password, {
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'],
     });

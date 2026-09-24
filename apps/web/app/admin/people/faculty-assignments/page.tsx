@@ -1,13 +1,15 @@
 'use client';
 
 import { useState } from 'react';
-import { useForm, FormProvider } from 'react-hook-form';
+import { useForm, FormProvider, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import {
   Button,
+  Card,
   Select,
   Input,
+  Checkbox,
   Modal,
   ConfirmationDialog,
   FormField,
@@ -27,7 +29,7 @@ import type { FacultyAssignment } from '@/lib/queries/types';
 
 const assignmentSchema = z.object({
   subject_id: z.string().uuid('Select a subject.'),
-  batch_id: z.string().uuid('Select a batch.'),
+  batch_ids: z.array(z.string().uuid()).min(1, 'Select at least one batch.'),
   academic_year: z.string().min(1, 'Academic year is required.'),
   semester: z.coerce.number().int().min(1, 'Semester must be at least 1.'),
   role: z.enum(['PRIMARY_INSTRUCTOR', 'CO_INSTRUCTOR']),
@@ -61,18 +63,47 @@ export default function FacultyAssignmentsPage() {
 
   const form = useForm<AssignmentFormValues>({
     resolver: zodResolver(assignmentSchema),
-    defaultValues: { subject_id: '', batch_id: '', academic_year: '', semester: 1, role: 'PRIMARY_INSTRUCTOR' },
+    defaultValues: { subject_id: '', batch_ids: [], academic_year: '', semester: 1, role: 'PRIMARY_INSTRUCTOR' },
   });
 
   async function onSubmit(values: AssignmentFormValues) {
-    try {
-      await createMutation.mutateAsync({ faculty_id: facultyId, ...values });
+    const { batch_ids, ...rest } = values;
+    // Each batch is its own independent assignment row on the backend
+    // (FacultySubjectBatchAssignment has no batch_ids[] — unlike Quiz,
+    // each row has its own lifecycle, e.g. "End" one batch without
+    // affecting the others) — so one batch failing (e.g. a duplicate) must
+    // not block the rest, same "one bad row never blocks the rest"
+    // philosophy already used for bulk-import.
+    const results = await Promise.allSettled(
+      batch_ids.map((batch_id) => createMutation.mutateAsync({ faculty_id: facultyId, batch_id, ...rest })),
+    );
+
+    const failures = results
+      .map((r, i) => ({ r, batchId: batch_ids[i] }))
+      .filter((x): x is { r: PromiseRejectedResult; batchId: string } => x.r.status === 'rejected');
+
+    if (failures.length === 0) {
       setAddOpen(false);
-      form.reset({ subject_id: '', batch_id: '', academic_year: '', semester: 1, role: 'PRIMARY_INSTRUCTOR' });
-    } catch (err) {
-      const mapped = mapError(err);
-      form.setError('root', { message: mapped.description });
+      form.reset({ subject_id: '', batch_ids: [], academic_year: '', semester: 1, role: 'PRIMARY_INSTRUCTOR' });
+      return;
     }
+
+    const succeededCount = results.length - failures.length;
+    const failureLines = failures.map(({ r, batchId }) => {
+      const label = batchById.get(batchId)
+        ? `${batchById.get(batchId)!.section}/${batchById.get(batchId)!.subsection}`
+        : batchId;
+      return `${label}: ${mapError(r.reason).description}`;
+    });
+    form.setError('root', {
+      message:
+        succeededCount > 0
+          ? `Assigned ${succeededCount} of ${results.length} batch(es). Failed — ${failureLines.join('; ')}`
+          : `Could not create the assignment — ${failureLines.join('; ')}`,
+    });
+    // Only clear the batches that succeeded, so retrying only resubmits the failed ones.
+    const failedIds = new Set(failures.map((f) => f.batchId));
+    form.setValue('batch_ids', batch_ids.filter((id) => failedIds.has(id)));
   }
 
   async function confirmEnd() {
@@ -86,7 +117,7 @@ export default function FacultyAssignmentsPage() {
     {
       key: 'batch',
       header: 'Batch',
-      render: (a) => (batchById.get(a.batchId) ? `${batchById.get(a.batchId)!.section} (${batchById.get(a.batchId)!.year})` : a.batchId),
+      render: (a) => (batchById.get(a.batchId) ? `${batchById.get(a.batchId)!.section}/${batchById.get(a.batchId)!.subsection} (${batchById.get(a.batchId)!.year})` : a.batchId),
     },
     { key: 'year', header: 'Academic Year', render: (a) => a.academicYear },
     { key: 'semester', header: 'Semester', render: (a) => a.semester },
@@ -95,6 +126,12 @@ export default function FacultyAssignmentsPage() {
   ];
 
   const rootError = form.formState.errors.root?.message;
+
+  const assignmentItems = assignmentsQuery.data?.items ?? [];
+  // Same split used elsewhere for a terminal/ended state — an assignment
+  // that's already ENDED is history, not something to act on.
+  const activeAssignments = assignmentItems.filter((a) => !a.endedAt);
+  const historyAssignments = assignmentItems.filter((a) => a.endedAt);
 
   return (
     <div className="flex flex-col gap-4">
@@ -122,26 +159,39 @@ export default function FacultyAssignmentsPage() {
           {assignmentsQuery.isLoading ? (
             <SkeletonText lines={4} />
           ) : (
-            <DataTable
-              columns={columns}
-              data={assignmentsQuery.data?.items ?? []}
-              getRowKey={(a) => a.id}
-              isLoading={assignmentsQuery.isLoading}
-              isError={assignmentsQuery.isError}
-              onRetry={() => assignmentsQuery.refetch()}
-              retrying={assignmentsQuery.isFetching}
-              errorTitle="Couldn't load teaching assignments"
-              emptyTitle="No teaching assignments"
-              emptyDescription="This faculty member has no recorded teaching assignments yet."
-              emptyAction={<Button size="sm" onClick={() => setAddOpen(true)}>Add Assignment</Button>}
-              renderActions={(a) =>
-                !a.endedAt ? (
+            <>
+              <DataTable
+                columns={columns}
+                data={activeAssignments}
+                getRowKey={(a) => a.id}
+                isLoading={assignmentsQuery.isLoading}
+                isError={assignmentsQuery.isError}
+                onRetry={() => assignmentsQuery.refetch()}
+                retrying={assignmentsQuery.isFetching}
+                errorTitle="Couldn't load teaching assignments"
+                emptyTitle="No teaching assignments"
+                emptyDescription="This faculty member has no recorded teaching assignments yet."
+                emptyAction={<Button size="sm" onClick={() => setAddOpen(true)}>Add Assignment</Button>}
+                renderActions={(a) => (
                   <div className="flex justify-end">
                     <Button size="sm" variant="tertiary" onClick={() => setEnding(a)}>End</Button>
                   </div>
-                ) : null
-              }
-            />
+                )}
+              />
+
+              {historyAssignments.length > 0 && (
+                <Card header={<h2 className="text-sm font-semibold text-text">History</h2>} padding="dense">
+                  <DataTable
+                    columns={columns}
+                    data={historyAssignments}
+                    getRowKey={(a) => a.id}
+                    isLoading={false}
+                    isError={false}
+                    emptyTitle="No ended assignments yet"
+                  />
+                </Card>
+              )}
+            </>
           )}
         </>
       )}
@@ -171,17 +221,49 @@ export default function FacultyAssignmentsPage() {
                 />
               )}
             </FormField>
-            <FormField<AssignmentFormValues> name="batch_id" label="Batch" required>
-              {(field) => (
-                <Select
-                  {...field}
-                  value={(field.value as string) ?? ''}
-                  onChange={(e) => field.onChange(e.target.value)}
-                  options={(batchesQuery.data?.items ?? []).map((b) => ({ value: b.id, label: `${b.section} (${b.year})` }))}
-                  placeholder="Select a batch"
-                />
-              )}
-            </FormField>
+            <Controller
+              name="batch_ids"
+              control={form.control}
+              render={({ field, fieldState }) => {
+                const batches = batchesQuery.data?.items ?? [];
+                const selected = field.value as string[];
+                return (
+                  <div className="flex flex-col gap-2">
+                    <span className="text-sm font-medium text-text">
+                      Batches <span className="text-danger-text">*</span>
+                    </span>
+                    <p className="text-xs text-text-muted">
+                      Select one or more batches — a separate assignment is created for each.
+                    </p>
+                    <div className="flex max-h-48 flex-col gap-1 overflow-y-auto rounded border border-border p-2">
+                      {batches.length === 0 && (
+                        <p className="text-sm text-text-muted">No active batches available.</p>
+                      )}
+                      {batches.map((b) => {
+                        const checked = selected.includes(b.id);
+                        return (
+                          <Checkbox
+                            key={b.id}
+                            label={`${b.section}/${b.subsection} (${b.year})`}
+                            checked={checked}
+                            onChange={(e) => {
+                              field.onChange(
+                                e.target.checked ? [...selected, b.id] : selected.filter((id) => id !== b.id),
+                              );
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                    {fieldState.error && (
+                      <p role="alert" className="text-xs text-danger-text">
+                        {fieldState.error.message}
+                      </p>
+                    )}
+                  </div>
+                );
+              }}
+            />
             <FormField<AssignmentFormValues> name="academic_year" label="Academic Year" required>
               {(field) => <Input {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} placeholder="e.g. 2025-2026" />}
             </FormField>

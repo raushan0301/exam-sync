@@ -10,6 +10,7 @@ import { UsersService } from './users.service';
 import { AssignRoleDto } from './dto/assign-role.dto';
 import { Roles } from '../../common/auth/roles.decorator';
 import { CurrentUser } from '../../common/auth/current-user.decorator';
+import { AllowWhenPasswordChangeRequired } from '../../common/auth/allow-password-change-required.decorator';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 
 /**
@@ -28,6 +29,11 @@ import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 export class UsersController {
   constructor(private readonly usersService: UsersService) {}
 
+  // The frontend's own discovery mechanism for `mustChangePassword` is a
+  // GET /users/me call right after login (IdentityProvider) — that would
+  // be a chicken-and-egg problem if this endpoint itself were blocked by
+  // it, so it's explicitly exempted.
+  @AllowWhenPasswordChangeRequired()
   @Get('me')
   async me(@CurrentUser() user: AuthenticatedUser) {
     return this.usersService.findMe(user.id);

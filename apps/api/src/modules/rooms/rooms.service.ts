@@ -1,5 +1,5 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, Room, RoomAvailability, RoomSeat, RoomStatus } from '@exam-sync/db';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma, Room, RoomAvailability, RoomSeat, RoomStatus, ImportJob } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
@@ -9,6 +9,10 @@ import {
   resolveLimit,
   toPaginatedResult,
 } from '../../common/pagination/paginate';
+import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
+import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
+import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
+import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { UpdateRoomDto } from './dto/update-room.dto';
 import { UpdateSeatDto } from './dto/update-seat.dto';
@@ -48,6 +52,7 @@ export class RoomsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditHook: AuditHookService,
+    private readonly importJobsService: ImportJobsService,
   ) {}
 
   /**
@@ -302,6 +307,82 @@ export class RoomsService {
    * undocumented but harmless default; Phase 12's real allocation makes
    * its own choice regardless.
    */
+  /**
+   * `GET /rooms/availability?date=YYYY-MM-DD[&room_id=...]` — backs the new
+   * visual room-availability calendar (faculty picking a room/time BEFORE
+   * allocating; admin's read-only schedule view). For every room (or one,
+   * if `roomId` is given), returns its real booked time ranges on `date`:
+   * `exam_session_rooms` rows for that date (an actual allocation — joined
+   * with the owning `ExamSession` for a human label) PLUS `room_availability`
+   * blocks for that same date (an admin-declared maintenance/unavailable
+   * block, same source `findAvailable` above already checks). Unlike
+   * `findAvailable`, this does NOT filter by `ACTIVE` status or capacity —
+   * it's a visibility view of what's booked, not an eligibility filter.
+   */
+  async getAvailabilityCalendar(
+    date: string,
+    roomId?: string,
+  ): Promise<
+    Array<{
+      room: Room;
+      bookedRanges: Array<{
+        start_time: string;
+        end_time: string;
+        source: 'EXAM_SESSION' | 'AVAILABILITY_BLOCK';
+        exam_session_id?: string;
+        exam_session_name?: string;
+        reason?: string | null;
+      }>;
+    }>
+  > {
+    if (!date || Number.isNaN(this.toDate(date).getTime())) {
+      throw new BadRequestException('date (YYYY-MM-DD) is required.');
+    }
+    const day = this.toDate(date);
+
+    const rooms = await this.prisma.room.findMany({
+      where: roomId ? { id: roomId } : {},
+      orderBy: [{ building: 'asc' }, { roomNumber: 'asc' }],
+    });
+
+    const roomIds = rooms.map((r) => r.id);
+
+    const [sessionBookings, availabilityBlocks] = await Promise.all([
+      this.prisma.examSessionRoom.findMany({
+        where: { roomId: { in: roomIds }, sessionDate: day },
+        include: { examSession: { select: { id: true, name: true } } },
+      }),
+      this.prisma.roomAvailability.findMany({
+        where: { roomId: { in: roomIds }, date: day },
+      }),
+    ]);
+
+    const timeLabel = (t: Date): string => t.toISOString().slice(11, 16);
+
+    return rooms.map((room) => ({
+      room,
+      bookedRanges: [
+        ...sessionBookings
+          .filter((b) => b.roomId === room.id)
+          .map((b) => ({
+            start_time: timeLabel(b.startTime),
+            end_time: timeLabel(b.endTime),
+            source: 'EXAM_SESSION' as const,
+            exam_session_id: b.examSession.id,
+            exam_session_name: b.examSession.name,
+          })),
+        ...availabilityBlocks
+          .filter((b) => b.roomId === room.id)
+          .map((b) => ({
+            start_time: timeLabel(b.startTime),
+            end_time: timeLabel(b.endTime),
+            source: 'AVAILABILITY_BLOCK' as const,
+            reason: b.reason,
+          })),
+      ].sort((a, b) => a.start_time.localeCompare(b.start_time)),
+    }));
+  }
+
   async findAvailable(params: FindAvailableRoomsParams): Promise<Room[]> {
     const date = this.toDate(params.date);
     const startTime = this.toTime(params.start_time);
@@ -349,5 +430,91 @@ export class RoomsService {
       );
     }
     throw err;
+  }
+
+  /** `GET /rooms/bulk-import/template` (ADMIN). */
+  /** Example row is a real existing room — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
+  async generateBulkImportTemplate(): Promise<Buffer> {
+    const sample = await this.prisma.room.findFirst({ where: { status: 'ACTIVE' }, orderBy: { createdAt: 'desc' } });
+    return generateExcelTemplate({
+      entityName: 'Room',
+      uniqueFieldsNote: 'Unique combination: building + room_number',
+      columns: [
+        { header: 'building', example: sample?.building ?? 'Main Block', note: 'Building name.' },
+        { header: 'room_number', example: sample?.roomNumber ?? 'A101', note: 'Unique together with building.' },
+        { header: 'floor', example: sample ? String(sample.floor) : '1', note: 'Integer floor number.' },
+        { header: 'capacity', example: sample ? String(sample.capacity) : '60', note: 'Integer seating capacity.' },
+        { header: 'rows', example: sample ? String(sample.rows) : '10', note: 'Integer number of seat rows.' },
+        { header: 'columns', example: sample ? String(sample.columns) : '6', note: 'Integer number of seat columns.' },
+      ],
+    });
+  }
+
+  /** `POST /rooms/bulk-import` (ADMIN). No FK resolution needed; duplicate (building, room_number) is a per-row failure. */
+  async bulkImport(buffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
+    const records = await parseExcelBuffer(buffer, [
+      'building',
+      'room_number',
+      'floor',
+      'capacity',
+      'rows',
+      'columns',
+    ]);
+
+    const results: ImportRowResult[] = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (let i = 0; i < records.length; i++) {
+      const rowNumber = i + 2;
+      const record = records[i];
+      try {
+        const numericFields: Record<string, number> = {};
+        for (const field of ['floor', 'capacity', 'rows', 'columns'] as const) {
+          const value = Number(record[field]);
+          if (!Number.isFinite(value) || !Number.isInteger(value)) {
+            throw new BadRequestException(`'${field}' must be a number`);
+          }
+          numericFields[field] = value;
+        }
+
+        const existingRoom = await this.prisma.room.findUnique({
+          where: { building_roomNumber: { building: record.building, roomNumber: record.room_number } },
+        });
+        if (existingRoom) {
+          throw new ConflictException(
+            `Room '${record.room_number}' already exists in building '${record.building}'`,
+          );
+        }
+
+        const dto: CreateRoomDto = {
+          building: record.building,
+          room_number: record.room_number,
+          floor: numericFields.floor,
+          capacity: numericFields.capacity,
+          rows: numericFields.rows,
+          columns: numericFields.columns,
+        };
+        const room = await this.create(dto, actor);
+        results.push({ row: rowNumber, status: 'SUCCESS', id: room.id });
+        successCount++;
+      } catch (err) {
+        results.push({
+          row: rowNumber,
+          status: 'FAILURE',
+          error: err instanceof Error ? err.message : 'Unknown error',
+        });
+        failureCount++;
+      }
+    }
+
+    return this.importJobsService.create({
+      resourceType: 'rooms',
+      totalRows: records.length,
+      successCount,
+      failureCount,
+      results,
+      createdByUserId: actor.id,
+    });
   }
 }

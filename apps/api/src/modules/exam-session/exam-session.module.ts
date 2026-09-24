@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ExamSessionsController } from './exam-sessions.controller';
 import { ExamSessionsService } from './exam-sessions.service';
 import { ExamSessionsAccessRepository } from './exam-sessions-access.repository';
+import { ExamSessionOwnershipService } from './exam-session-ownership.service';
 import { ConflictEngineModule } from '../conflict-engine';
 import { FacultyModule } from '../faculty';
 import { QuizModule } from '../quiz';
@@ -18,7 +19,7 @@ import { QuizModule } from '../quiz';
 @Module({
   imports: [ConflictEngineModule, FacultyModule, QuizModule],
   controllers: [ExamSessionsController],
-  providers: [ExamSessionsService, ExamSessionsAccessRepository],
-  exports: [ExamSessionsService],
+  providers: [ExamSessionsService, ExamSessionsAccessRepository, ExamSessionOwnershipService],
+  exports: [ExamSessionsService, ExamSessionOwnershipService],
 })
 export class ExamSessionModule {}

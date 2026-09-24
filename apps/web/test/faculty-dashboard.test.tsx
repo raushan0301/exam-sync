@@ -11,6 +11,8 @@ import {
   SESSION_TOKENS,
   setMockQuizzes,
   setMockIncidents,
+  setMockFaculty,
+  setMockInvigilators,
 } from './msw/handlers';
 import FacultyDashboardPage from '@/app/faculty/dashboard/page';
 
@@ -22,9 +24,16 @@ vi.mock('next/navigation', () => ({
 // Register a faculty session token distinct from the shared STUDENT one.
 const FACULTY_ACCESS_TOKEN = 'faculty-dashboard-access-token';
 SESSION_TOKENS[FACULTY_ACCESS_TOKEN] = FACULTY_USER;
+const NOW = '2026-01-01T00:00:00.000Z';
 
 function signInAsFaculty() {
   setTokens(FACULTY_ACCESS_TOKEN, STUDENT_REFRESH_TOKEN);
+  // GET /faculty/me needs a Faculty row whose userId matches FACULTY_USER —
+  // the dashboard's Invigilation Duties card resolves it on every render.
+  setMockFaculty([
+    { id: 'fac-dashboard-1', userId: FACULTY_USER.id, name: 'Dr. Smith', departmentId: 'dept-1', employeeCode: 'DS1', status: 'ACTIVE', createdAt: NOW, updatedAt: NOW },
+  ]);
+  setMockInvigilators([]);
 }
 
 describe('Faculty dashboard', () => {

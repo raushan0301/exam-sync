@@ -32,6 +32,19 @@ export interface SeatMapProps {
    * click, it never calls a mutation itself.
    */
   onAttendanceSeatClick?: (assignment: SeatingAssignment, attendance: Attendance | undefined) => void;
+  /**
+   * `coloring="attendance"` only: a display-only status override per
+   * seatId, applied ON TOP of `attendanceBySeatId` for color/tooltip
+   * purposes — lets the caller show the new status the instant a seat is
+   * clicked, instead of waiting on the mark/update round trip and the
+   * subsequent query refetch (two network round trips of visible lag
+   * otherwise). Deliberately NOT used for the click callback's own
+   * `attendance` argument — that still reflects the real record (its
+   * `id`/`locked` are what the next mutation call actually needs), so an
+   * optimistic entry only ever affects what's painted, never the mutation
+   * logic built on top of it.
+   */
+  attendanceOverrideBySeatId?: Map<string, AttendanceStatus>;
 }
 
 const ATTENDANCE_COLORS: Record<AttendanceStatus, string> = {
@@ -67,7 +80,14 @@ const ATTENDANCE_STATUS_LABELS: Record<AttendanceStatus, string> = {
  * deliberate deferral); attendance status is a distinct field from seat
  * assignment and marking it never moves a student's seat.
  */
-export function SeatMap({ seats, assignments, coloring = 'subject', attendanceBySeatId, onAttendanceSeatClick }: SeatMapProps) {
+export function SeatMap({
+  seats,
+  assignments,
+  coloring = 'subject',
+  attendanceBySeatId,
+  onAttendanceSeatClick,
+  attendanceOverrideBySeatId,
+}: SeatMapProps) {
   const [openSeatId, setOpenSeatId] = useState<string | null>(null);
 
   const assignmentBySeatId = useMemo(() => {
@@ -111,11 +131,15 @@ export function SeatMap({ seats, assignments, coloring = 'subject', attendanceBy
 
   const isAttendanceMode = coloring === 'attendance';
 
+  function effectiveStatus(seatId: string): AttendanceStatus | undefined {
+    return attendanceOverrideBySeatId?.get(seatId) ?? attendanceBySeatId?.get(seatId)?.status;
+  }
+
   function seatColor(assignment: SeatingAssignment | undefined, seatId: string): string | undefined {
     if (!assignment) return undefined;
     if (isAttendanceMode) {
-      const att = attendanceBySeatId?.get(seatId);
-      return att ? ATTENDANCE_COLORS[att.status] : UNMARKED_COLOR;
+      const status = effectiveStatus(seatId);
+      return status ? ATTENDANCE_COLORS[status] : UNMARKED_COLOR;
     }
     return subjectColors.get(assignment.quiz.id);
   }
@@ -123,11 +147,11 @@ export function SeatMap({ seats, assignments, coloring = 'subject', attendanceBy
   function seatLabel(assignment: SeatingAssignment | undefined, seatId: string, seatLabelText: string): string {
     if (!assignment) return `Seat ${seatLabelText}, empty`;
     if (isAttendanceMode) {
-      const att = attendanceBySeatId?.get(seatId);
-      const statusText = att ? ATTENDANCE_STATUS_LABELS[att.status] : 'not yet marked';
-      return `Seat ${seatLabelText}, ${assignment.student.name}, attendance ${statusText}`;
+      const status = effectiveStatus(seatId);
+      const statusText = status ? ATTENDANCE_STATUS_LABELS[status] : 'not yet marked';
+      return `Seat ${seatLabelText}, ${assignment.student.name} (${assignment.student.rollNumber}), attendance ${statusText}`;
     }
-    return `Seat ${seatLabelText}, occupied by ${assignment.student.name}, ${assignment.quiz.title}`;
+    return `Seat ${seatLabelText}, occupied by ${assignment.student.name} (${assignment.student.rollNumber}), ${assignment.quiz.title}`;
   }
 
   function onSeatClick(seatId: string, assignment: SeatingAssignment | undefined) {
@@ -184,7 +208,7 @@ export function SeatMap({ seats, assignments, coloring = 'subject', attendanceBy
       {isAttendanceMode ? (
         <div className="flex flex-wrap items-center gap-3 text-xs text-text-muted">
           <span className="font-medium text-text">Legend:</span>
-          {(Object.keys(ATTENDANCE_COLORS) as AttendanceStatus[]).map((status) => (
+          {(['PRESENT', 'ABSENT'] as AttendanceStatus[]).map((status) => (
             <span key={status} className="flex items-center gap-1.5">
               <span className="inline-block h-3 w-3 rounded-sm" style={{ backgroundColor: ATTENDANCE_COLORS[status] }} aria-hidden="true" />
               {ATTENDANCE_STATUS_LABELS[status]}
@@ -198,6 +222,7 @@ export function SeatMap({ seats, assignments, coloring = 'subject', attendanceBy
             <span className="inline-block h-3 w-3 rounded-sm border border-border bg-surface" aria-hidden="true" />
             Empty
           </span>
+          <span className="text-text-subtle">Click a seat to toggle Present/Absent — hover for roll no. &amp; name.</span>
         </div>
       ) : (
         legendEntries.length > 0 && (

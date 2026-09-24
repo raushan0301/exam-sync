@@ -15,6 +15,7 @@ import {
   Modal,
   FormField,
   Input,
+  TimeInput,
   EmptyState,
 } from '@/components/ui';
 import { useRoom } from '@/lib/queries/useRooms';
@@ -22,6 +23,7 @@ import { useRoomSeats } from '@/lib/queries/useRoomSeats';
 import { useRoomAvailabilityBlocks } from '@/lib/queries/useRoomAvailabilityBlocks';
 import { useUpdateRoomSeat, useCreateAvailabilityBlock } from '@/lib/mutations/useRoomMutations';
 import { mapError } from '@/lib/error-mapping';
+import { formatTimeRange } from '@/lib/format-time';
 import type { RoomSeat } from '@/lib/queries/types';
 
 const blockSchema = z.object({
@@ -42,7 +44,18 @@ type BlockFormValues = z.infer<typeof blockSchema>;
  */
 export default function RoomDetailPage() {
   const params = useParams<{ id: string }>();
-  const roomId = params.id;
+  // Next.js can reuse this same component instance across navigations
+  // between two different room ids (client-side route change, no full
+  // remount) — without a key tied to the id, `selectedSeat`/
+  // `blockModalOpen`/the availability-block form's local state would
+  // leak from the previous room into the next one. Same fix already
+  // applied to ExamSessionDetailView/QuizDetailView's own page.tsx
+  // wrappers; this page has no existing wrapper to key, so one is added
+  // here just for that purpose.
+  return <RoomDetailInner key={params.id} roomId={params.id} />;
+}
+
+function RoomDetailInner({ roomId }: { roomId: string }) {
   const roomQuery = useRoom(roomId);
   const seatsQuery = useRoomSeats(roomId);
   const blocksQuery = useRoomAvailabilityBlocks(roomId, { limit: 50 });
@@ -69,10 +82,15 @@ export default function RoomDetailPage() {
   }
 
   async function toggleSeatField(seat: RoomSeat, field: 'is_active' | 'is_accessible') {
-    await updateSeatMutation.mutateAsync({
-      seatId: seat.id,
-      [field]: field === 'is_active' ? !seat.isActive : !seat.isAccessible,
-    } as never);
+    try {
+      await updateSeatMutation.mutateAsync({
+        seatId: seat.id,
+        [field]: field === 'is_active' ? !seat.isActive : !seat.isAccessible,
+      } as never);
+    } catch {
+      // surfaced below via updateSeatMutation.isError/.error, modal stays open
+      return;
+    }
     setSelectedSeat(null);
   }
 
@@ -181,7 +199,7 @@ export default function RoomDetailPage() {
             {blocksQuery.data!.items.map((block) => (
               <li key={block.id} className="flex items-center justify-between rounded border border-border px-3 py-2 text-sm">
                 <span className="text-text">
-                  {block.date.slice(0, 10)} · {block.startTime.slice(0, 5) || block.startTime} – {block.endTime.slice(0, 5) || block.endTime}
+                  {block.date.slice(0, 10)} · {formatTimeRange(block.startTime, block.endTime)}
                 </span>
                 <span className="text-text-muted">{block.reason}</span>
               </li>
@@ -237,10 +255,10 @@ export default function RoomDetailPage() {
               {(field) => <Input type="date" {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
             </FormField>
             <FormField<BlockFormValues> name="start_time" label="Start Time" required>
-              {(field) => <Input type="time" {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
+              {(field) => <TimeInput id={field.id} ariaLabel="Start Time" value={(field.value as string) ?? ''} onChange={(v) => field.onChange(v)} />}
             </FormField>
             <FormField<BlockFormValues> name="end_time" label="End Time" required>
-              {(field) => <Input type="time" {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
+              {(field) => <TimeInput id={field.id} ariaLabel="End Time" value={(field.value as string) ?? ''} onChange={(v) => field.onChange(v)} />}
             </FormField>
             <FormField<BlockFormValues> name="reason" label="Reason" required>
               {(field) => <Input {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}

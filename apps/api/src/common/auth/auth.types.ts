@@ -17,6 +17,7 @@ export interface AuthenticatedUser {
   id: string;
   email: string;
   roles: string[];
+  mustChangePassword: boolean;
 }
 
 /** Well-known role names (ARCHITECTURE_REVIEW.md task: initial roles). */

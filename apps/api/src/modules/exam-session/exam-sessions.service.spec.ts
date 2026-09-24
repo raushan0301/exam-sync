@@ -1,9 +1,11 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
-import { ExamSessionStatus, Prisma, QuizStatus } from '@exam-sync/db';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { ExamSessionStatus, Prisma, QuizStatus, SeatingPlanStatus } from '@exam-sync/db';
 import { ExamSessionsService } from './exam-sessions.service';
 import { ConflictEngineService } from '../conflict-engine';
-import { QuizzesService } from '../quiz';
+import { QuizzesService, QuizOwnershipService } from '../quiz';
+import { FacultyService } from '../faculty';
 import { ExamSessionsAccessRepository } from './exam-sessions-access.repository';
+import { ExamSessionOwnershipService } from './exam-session-ownership.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
@@ -14,16 +16,34 @@ function buildPrismaMock() {
     examSession: { create: jest.fn(), update: jest.fn() },
     quizStudentAssignment: { findMany: jest.fn().mockResolvedValue([]) },
     student: { findMany: jest.fn().mockResolvedValue([]) },
+    examSessionRoom: { findMany: jest.fn().mockResolvedValue([]), deleteMany: jest.fn() },
+    examSessionRoomQuiz: { deleteMany: jest.fn() },
+    examInvigilator: { deleteMany: jest.fn() },
+    seatingPlan: { updateMany: jest.fn() },
   };
   return {
-    examSession: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
+    examSession: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     examSessionQuiz: { findMany: jest.fn(), findFirst: jest.fn() },
+    examSessionRoom: { findMany: jest.fn() },
+    seatingPlan: { findMany: jest.fn() },
+    examInvigilator: { findMany: jest.fn() },
     $transaction: jest.fn((cb: any) => cb(tx)),
     __tx: tx,
   } as any;
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+// `admin` is kept only for the read-only/getConflicts describe block below —
+// every MUTATING method (attach/detach, reschedule, cancel) is FACULTY-only
+// at the controller (`@Roles(ROLE.FACULTY)`, see exam-sessions.controller.ts)
+// since the faculty-lifecycle-ownership change; this service layer doesn't
+// re-check the role itself (that's RolesGuard's job, see roles.guard.spec.ts),
+// so `admin` here just stands in for "some authenticated actor" in tests that
+// predate that change and never exercised role-checking logic. The
+// ownership-mock defaults to `true` in `beforeEach` below so those pre-existing
+// tests keep testing what they always tested; ownership-DENIAL is its own
+// dedicated describe block further down.
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
+const faculty: AuthenticatedUser = { id: 'faculty-user-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
 
 describe('ExamSessionsService (create, attach/detach, reschedule, cancel — conflictEngine mocked; real Conflict Engine has its own spec)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
@@ -32,6 +52,9 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
   let quizzesService: { findById: jest.Mock };
   let accessRepository: { findScoped: jest.Mock };
   let notificationsOutbox: { queue: jest.Mock };
+  let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
+  let quizOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
+  let facultyService: { findByUserId: jest.Mock };
   let service: ExamSessionsService;
 
   beforeEach(() => {
@@ -41,6 +64,12 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     quizzesService = { findById: jest.fn() };
     accessRepository = { findScoped: jest.fn() };
     notificationsOutbox = { queue: jest.fn() };
+    // Ownership defaults to `true`/`true` so every test written BEFORE the
+    // faculty-lifecycle-ownership change keeps exercising exactly what it
+    // always exercised; ownership-DENIAL gets its own describe block below.
+    examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
+    quizOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
+    facultyService = { findByUserId: jest.fn().mockResolvedValue({ id: 'faculty-1' }) };
 
     service = new ExamSessionsService(
       prisma,
@@ -49,6 +78,9 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       quizzesService as unknown as QuizzesService,
       accessRepository as unknown as ExamSessionsAccessRepository,
       notificationsOutbox as unknown as NotificationsOutboxService,
+      examSessionOwnershipService as unknown as ExamSessionOwnershipService,
+      quizOwnershipService as unknown as QuizOwnershipService,
+      facultyService as unknown as FacultyService,
     );
   });
 
@@ -101,7 +133,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     it('collects an UNAPPROVED_QUIZ hard conflict for a non-APPROVED quiz — never attaches it', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.examSessionQuiz.findMany.mockResolvedValue([]);
-      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', status: QuizStatus.DRAFT });
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.DRAFT });
 
       const error = await service
         .attachAndDetachQuizzes('s1', { add: ['quiz-1'], remove: [] }, admin)
@@ -117,7 +149,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     it('BR-053: collects a QUIZ_ALREADY_ATTACHED_ELSEWHERE hard conflict for a quiz active in a different session', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.examSessionQuiz.findMany.mockResolvedValue([]);
-      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', status: QuizStatus.APPROVED });
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.APPROVED });
       prisma.examSessionQuiz.findFirst.mockResolvedValue({ examSessionId: 'OTHER-SESSION', quizId: 'quiz-1' });
 
       const error = await service
@@ -175,7 +207,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     it('attaches an approved, unattached quiz via upsert (handles re-attach-after-detach correctly)', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.examSessionQuiz.findMany.mockResolvedValue([]);
-      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', status: QuizStatus.APPROVED });
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.APPROVED });
       prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, version: 2 });
 
@@ -218,7 +250,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     it('consults the conflict-engine STUB when adding quizzes — merges its (currently always-empty) hard list', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.examSessionQuiz.findMany.mockResolvedValue([]);
-      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', status: QuizStatus.APPROVED });
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.APPROVED });
       prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, version: 2 });
 
@@ -246,7 +278,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     it('a Conflict Engine hard conflict found INSIDE the transaction (a genuine race the app-level pre-check could not see) aborts the write — nothing is attached', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.examSessionQuiz.findMany.mockResolvedValue([]);
-      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', status: QuizStatus.APPROVED });
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.APPROVED });
       prisma.examSessionQuiz.findFirst.mockResolvedValue(null); // pre-check outside the tx sees no conflict yet
       conflictEngine.checkSessionAssembly.mockResolvedValue({
         hard: [{ type: 'STUDENT_OVERLAP', studentId: 'student-1', message: 'conflict' }],
@@ -263,7 +295,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     it('maps a concurrent BR-053 unique-constraint violation (P2002) on the upsert itself to a clean 409, never a raw 500 (ADR-003 Implementation Notes)', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.examSessionQuiz.findMany.mockResolvedValue([]);
-      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', status: QuizStatus.APPROVED });
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.APPROVED });
       prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
       prisma.__tx.examSessionQuiz.upsert.mockRejectedValue(
         new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
@@ -414,6 +446,43 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       );
     });
 
+    it('releases every room already allocated to this session, so the room/time window is free for a future session (BR-018 EXCLUDE constraint has no visibility into session status)', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+      prisma.__tx.examSessionRoom.findMany.mockResolvedValue([{ id: 'esr-1' }, { id: 'esr-2' }]);
+
+      await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+
+      expect(prisma.__tx.examSessionRoomQuiz.deleteMany).toHaveBeenCalledWith({
+        where: { examSessionRoomId: { in: ['esr-1', 'esr-2'] } },
+      });
+      expect(prisma.__tx.examSessionRoom.deleteMany).toHaveBeenCalledWith({ where: { examSessionId: 's1' } });
+    });
+
+    it('skips the room-release deletes entirely when no room was ever allocated', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+      prisma.__tx.examSessionRoom.findMany.mockResolvedValue([]);
+
+      await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+
+      expect(prisma.__tx.examSessionRoomQuiz.deleteMany).not.toHaveBeenCalled();
+      expect(prisma.__tx.examSessionRoom.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('releases every invigilator assignment and supersedes every non-superseded seating plan for the cancelled session — same "stop looking active" treatment as rooms', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+
+      await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+
+      expect(prisma.__tx.examInvigilator.deleteMany).toHaveBeenCalledWith({ where: { examSessionId: 's1' } });
+      expect(prisma.__tx.seatingPlan.updateMany).toHaveBeenCalledWith({
+        where: { examSessionId: 's1', status: { notIn: [SeatingPlanStatus.SUPERSEDED] } },
+        data: { status: SeatingPlanStatus.SUPERSEDED, version: { increment: 1 } },
+      });
+    });
+
     it('fans out EXAM_SESSION_CANCELLED notifications to every currently-ASSIGNED student, in the SAME transaction (BR-042)', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
@@ -451,10 +520,10 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
         startTime: new Date('1970-01-01T10:00:00Z'),
         endTime: new Date('1970-01-01T11:00:00Z'),
       };
-      prisma.examSession.findUnique.mockResolvedValue(session);
+      accessRepository.findScoped.mockResolvedValue(session);
       prisma.examSessionQuiz.findMany.mockResolvedValue([{ quizId: 'quiz-1' }]);
 
-      const result = await service.getConflicts('s1');
+      const result = await service.getConflicts('s1', admin);
 
       expect(result).toEqual({ hard: [], warnings: [] });
       expect(conflictEngine.checkSessionAssembly).toHaveBeenCalledWith(
@@ -463,6 +532,208 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       // Never mutates anything — this is a dry-run.
       expect(prisma.examSession.update).not.toHaveBeenCalled();
       expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('faculty-lifecycle-ownership: stakeholder/owner gating', () => {
+    const draftSession = {
+      id: 's1',
+      status: ExamSessionStatus.DRAFT,
+      sessionDate: new Date('2026-05-01'),
+      startTime: new Date('1970-01-01T10:00:00Z'),
+      endTime: new Date('1970-01-01T11:00:00Z'),
+    };
+
+    it('attachAndDetachQuizzes: 404s a non-stakeholder faculty when the session already has active attachments (cannot piggyback onto someone else\'s session)', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.examSessionQuiz.findMany.mockResolvedValue([{ quizId: 'someone-elses-quiz' }]);
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(
+        service.attachAndDetachQuizzes('s1', { add: [], remove: [] }, faculty),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('attachAndDetachQuizzes: allows the FIRST attach on a brand-new session (zero active attachments) with no stakeholder check', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.examSessionQuiz.findMany.mockResolvedValue([]); // no active attachments yet
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.APPROVED });
+      prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, version: 2 });
+
+      await service.attachAndDetachQuizzes('s1', { add: ['quiz-1'], remove: [] }, faculty);
+
+      expect(examSessionOwnershipService.isOwnerOrCoInstructor).not.toHaveBeenCalled();
+      expect(quizOwnershipService.isOwnerOrCoInstructor).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'quiz-1' }),
+        faculty,
+      );
+    });
+
+    it('attachAndDetachQuizzes: rejects attaching a quiz the acting faculty does not own/co-instruct, with a specific, actionable message', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.examSessionQuiz.findMany.mockResolvedValue([]);
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-not-mine', title: 'Not My Quiz', status: QuizStatus.APPROVED });
+      quizOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      const error = await service
+        .attachAndDetachQuizzes('s1', { add: ['quiz-not-mine'], remove: [] }, faculty)
+        .catch((e) => e);
+
+      expect(error).toBeInstanceOf(ForbiddenException);
+      expect(error.message).toContain('Not My Quiz');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('reschedule: 404s a faculty who owns/co-instructs none of the session\'s attached quizzes (IDOR-safe, mirrors quizzes.service.ts PATCH)', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(
+        service.reschedule('s1', { session_date: '2026-06-01', start_time: '09:00', end_time: '10:00' }, faculty),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('cancel: 404s a faculty who owns/co-instructs none of the session\'s attached quizzes', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(service.cancel('s1', { reason: 'x' }, faculty)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('list — GET /exam-sessions (new: admin unscoped, faculty scoped to own/co-instructed)', () => {
+    it('ADMIN: returns every session, unscoped, with no ownership lookups at all', async () => {
+      prisma.examSession.findMany = jest.fn().mockResolvedValue([{ id: 's1' }, { id: 's2' }]);
+
+      const result = await service.list(admin, {});
+
+      expect(result.items).toEqual([{ id: 's1' }, { id: 's2' }]);
+      expect(facultyService.findByUserId).not.toHaveBeenCalled();
+    });
+
+    it('FACULTY: returns only sessions where they own/co-instruct at least one active attachment', async () => {
+      prisma.examSessionQuiz.findMany.mockResolvedValue([
+        { examSessionId: 's1', quiz: { id: 'q1' } },
+        { examSessionId: 's2', quiz: { id: 'q2' } },
+      ]);
+      quizOwnershipService.isOwnerOrCoInstructor
+        .mockResolvedValueOnce(true) // q1 -> s1 owned
+        .mockResolvedValueOnce(false); // q2 -> s2 not owned
+      prisma.examSession.findMany = jest.fn().mockResolvedValue([{ id: 's1' }]);
+
+      const result = await service.list(faculty, {});
+
+      expect(result.items).toEqual([{ id: 's1' }]);
+      expect(prisma.examSession.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: { in: ['s1'] } } }),
+      );
+    });
+
+    it('FACULTY with no faculty account at all: returns an empty page rather than erroring', async () => {
+      facultyService.findByUserId.mockResolvedValue(null);
+
+      const result = await service.list(faculty, {});
+
+      expect(result.items).toEqual([]);
+    });
+
+    it('FACULTY: also sees a session they created even before any quiz is attached (an orphan from a failed first attach)', async () => {
+      prisma.examSessionQuiz.findMany.mockResolvedValue([]); // no active attachments anywhere
+      prisma.examSession.findMany = jest.fn().mockResolvedValue([{ id: 'orphan-1' }]);
+
+      const result = await service.list(faculty, {});
+
+      expect(result.items).toEqual([{ id: 'orphan-1' }]);
+      expect(prisma.examSession.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { createdByAdminId: faculty.id }, select: { id: true } }),
+      );
+    });
+  });
+
+  describe('getDetail — seatingReady field (faculty-facing progress stepper)', () => {
+    it('is false when the session has no allocated rooms', async () => {
+      accessRepository.findScoped.mockResolvedValue({ id: 's1', status: ExamSessionStatus.ASSIGNING_STUDENTS });
+      prisma.examSessionQuiz.findMany.mockResolvedValue([]);
+      prisma.examSessionRoom.findMany.mockResolvedValue([]);
+
+      const result = await service.getDetail('s1', admin);
+
+      expect(result.seatingReady).toBe(false);
+    });
+
+    it('is false when a room has no validated/finalized plan yet', async () => {
+      accessRepository.findScoped.mockResolvedValue({ id: 's1', status: ExamSessionStatus.SEATING_GENERATION });
+      prisma.examSessionQuiz.findMany.mockResolvedValue([]);
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1', room: { id: 'room-1' }, allocatedCapacity: 30 }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([]);
+
+      const result = await service.getDetail('s1', admin);
+
+      expect(result.seatingReady).toBe(false);
+    });
+
+    it('is true once every allocated room has a validated or finalized plan', async () => {
+      accessRepository.findScoped.mockResolvedValue({ id: 's1', status: ExamSessionStatus.SEATING_GENERATION });
+      prisma.examSessionQuiz.findMany.mockResolvedValue([]);
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1', room: { id: 'room-1' }, allocatedCapacity: 30 }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+
+      const result = await service.getDetail('s1', admin);
+
+      expect(result.seatingReady).toBe(true);
+    });
+  });
+
+  describe('maybeAdvanceToReadyForFinalization — SEATING_GENERATION -> READY_FOR_FINALIZATION requires EVERY room to have both a validated/finalized plan AND an invigilator', () => {
+    it('does nothing when the session has no allocated rooms yet', async () => {
+      prisma.examSessionRoom.findMany.mockResolvedValue([]);
+
+      await service.maybeAdvanceToReadyForFinalization('s1');
+
+      expect(prisma.examSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('does NOT advance when a room has no validated/finalized seating plan yet', async () => {
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([]);
+
+      await service.maybeAdvanceToReadyForFinalization('s1');
+
+      expect(prisma.examSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('does NOT advance when every room has a plan but NO room has an invigilator assigned yet', async () => {
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+      prisma.examInvigilator.findMany.mockResolvedValue([]);
+
+      await service.maybeAdvanceToReadyForFinalization('s1');
+
+      expect(prisma.examSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('does NOT advance when only SOME rooms have an invigilator', async () => {
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }, { roomId: 'room-2' }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }, { roomId: 'room-2' }]);
+      prisma.examInvigilator.findMany.mockResolvedValue([{ roomId: 'room-1' }]); // room-2 has none
+
+      await service.maybeAdvanceToReadyForFinalization('s1');
+
+      expect(prisma.examSession.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('advances to READY_FOR_FINALIZATION once every room has both a validated/finalized plan AND an invigilator', async () => {
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+      prisma.examInvigilator.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+
+      await service.maybeAdvanceToReadyForFinalization('s1');
+
+      expect(prisma.examSession.updateMany).toHaveBeenCalledWith({
+        where: { id: 's1', status: ExamSessionStatus.SEATING_GENERATION },
+        data: { status: ExamSessionStatus.READY_FOR_FINALIZATION, version: { increment: 1 } },
+      });
     });
   });
 });

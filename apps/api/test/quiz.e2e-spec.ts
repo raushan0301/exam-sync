@@ -66,9 +66,9 @@ describe('Quiz Management (e2e) — Phase 6', () => {
     departmentId = dept.id;
     const prog = await prisma.program.create({ data: { departmentId, name: 'B.Tech CSE', code: progCode } });
     programId = prog.id;
-    const batchA = await prisma.batch.create({ data: { programId, year: 2026, section: 'A' } });
+    const batchA = await prisma.batch.create({ data: { programId, year: '2026', section: 'A', subsection: 'A' } });
     batchAId = batchA.id;
-    const batchB = await prisma.batch.create({ data: { programId, year: 2026, section: 'B' } });
+    const batchB = await prisma.batch.create({ data: { programId, year: '2026', section: 'B', subsection: 'B' } });
     batchBId = batchB.id;
     const dbms = await prisma.subject.create({
       data: { departmentId, code: `DBMS-${suffix}`, name: 'Database Management Systems' },
@@ -190,6 +190,9 @@ describe('Quiz Management (e2e) — Phase 6', () => {
           batch_ids: [batchAId],
           academic_year: '2026',
           semester: 1,
+          student_count: 60,
+          preferred_date: '2026-05-01',
+          preferred_time: '10:00',
         })
         .expect(201);
 
@@ -253,7 +256,7 @@ describe('Quiz Management (e2e) — Phase 6', () => {
   });
 
   describe('POST /quizzes/{id}/submit — 422 incomplete (the documented Phase 6 test case)', () => {
-    it('422s because the minimal DRAFT is missing duration_minutes/total_marks/question_count/quiz_type/preferred_date/preferred_time', async () => {
+    it('422s because the minimal DRAFT is missing duration_minutes/quiz_type', async () => {
       const res = await request(app.getHttpServer())
         .post(`/quizzes/${draftQuizId}/submit`)
         .set('Authorization', `Bearer ${facultyAToken}`)
@@ -303,11 +306,7 @@ describe('Quiz Management (e2e) — Phase 6', () => {
         .set('If-Match', String(draftQuizVersion))
         .send({
           duration_minutes: 60,
-          total_marks: 100,
-          question_count: 20,
           quiz_type: 'QUIZ',
-          preferred_date: '2026-05-01',
-          preferred_time: '10:00',
         })
         .expect(200);
 
@@ -350,7 +349,16 @@ describe('Quiz Management (e2e) — Phase 6', () => {
       const created = await request(app.getHttpServer())
         .post('/quizzes')
         .set('Authorization', `Bearer ${facultyAToken}`)
-        .send({ title: 'DBMS Quiz 2', subject_id: dbmsSubjectId, batch_ids: [batchAId], academic_year: '2026', semester: 1 })
+        .send({
+          title: 'DBMS Quiz 2',
+          subject_id: dbmsSubjectId,
+          batch_ids: [batchAId],
+          academic_year: '2026',
+          semester: 1,
+          student_count: 60,
+          preferred_date: '2026-06-01',
+          preferred_time: '09:00',
+        })
         .expect(201);
       secondQuizId = created.body.id;
 
@@ -360,11 +368,7 @@ describe('Quiz Management (e2e) — Phase 6', () => {
         .set('If-Match', String(created.body.version))
         .send({
           duration_minutes: 45,
-          total_marks: 50,
-          question_count: 10,
           quiz_type: 'QUIZ',
-          preferred_date: '2026-06-01',
-          preferred_time: '09:00',
         })
         .expect(200);
     });

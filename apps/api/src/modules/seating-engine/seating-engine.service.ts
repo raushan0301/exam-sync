@@ -21,7 +21,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { QuizzesService } from '../quiz';
 import { GenerateSeatingDto } from './dto/generate-seating.dto';
 
@@ -80,6 +80,7 @@ export class SeatingEngineService {
     private readonly examSessionsService: ExamSessionsService,
     private readonly quizzesService: QuizzesService,
     private readonly notificationsOutbox: NotificationsOutboxService,
+    private readonly examSessionOwnershipService: ExamSessionOwnershipService,
   ) {}
 
   /**
@@ -95,6 +96,9 @@ export class SeatingEngineService {
     actor: AuthenticatedUser,
   ): Promise<SeatingGenerationSummary> {
     const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
 
     // EC-032 idempotency is checked FIRST, before the session-status guard
     // below: a session with even ONE room's plan already VALIDATED may
@@ -128,19 +132,93 @@ export class SeatingEngineService {
       throw new NotFoundException('This room is not allocated to this exam session.');
     }
 
-    const { students, seats } = await this.resolveCohort(examSessionId, examSessionRoom.id, dto.room_id);
+    return this.createPlan(examSessionId, examSessionRoom.id, dto.room_id, dto.strategy, actor);
+  }
+
+  /**
+   * `POST /exam-sessions/{id}/seating/regenerate` (FACULTY, ownership-
+   * gated) — lets the owning/co-instructing faculty pick a different
+   * strategy for a room BEFORE finalizing (`generate`'s own EC-032
+   * idempotency short-circuit means calling `generate` again for the same
+   * room just returns the SAME plan, strategy ignored — there was
+   * previously no way to change it once a DRAFT/VALIDATED/FAILED plan
+   * existed). Marks the room's current plan SUPERSEDED (an until-now
+   * unused `SeatingPlanStatus` value already in the schema) and creates a
+   * fresh one via the same `createPlan` path `generate` uses. Blocked once
+   * the room's plan is already FINALIZED — that lock is intentional
+   * (ARCHITECTURE.md §V: finalization is a one-way door) and regeneration
+   * must not be able to undo it.
+   */
+  async regenerate(
+    examSessionId: string,
+    dto: GenerateSeatingDto,
+    actor: AuthenticatedUser,
+  ): Promise<SeatingGenerationSummary> {
+    await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
+
+    const examSessionRoom = await this.prisma.examSessionRoom.findUnique({
+      where: { roomId_examSessionId: { roomId: dto.room_id, examSessionId } },
+    });
+    if (!examSessionRoom) {
+      throw new NotFoundException('This room is not allocated to this exam session.');
+    }
+
+    const existing = await this.prisma.seatingPlan.findFirst({
+      where: { examSessionId, roomId: dto.room_id },
+      orderBy: { generatedAt: 'desc' },
+    });
+    if (!existing) {
+      throw new ConflictException('No seating plan has been generated for this room yet — use generate instead.');
+    }
+    if (existing.status === SeatingPlanStatus.FINALIZED) {
+      throw new ConflictException('This room\'s seating plan has already been finalized and cannot be regenerated.');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      const superseded = await tx.seatingPlan.update({
+        where: { id: existing.id },
+        data: { status: SeatingPlanStatus.SUPERSEDED, version: { increment: 1 } },
+      });
+      await this.auditHook.record(
+        {
+          actor,
+          action: 'UPDATE',
+          entityType: 'SeatingPlan',
+          entityId: existing.id,
+          oldValue: { status: existing.status },
+          newValue: { status: superseded.status },
+        },
+        tx,
+      );
+    });
+
+    return this.createPlan(examSessionId, examSessionRoom.id, dto.room_id, dto.strategy, actor);
+  }
+
+  /** Shared by `generate` and `regenerate`: build the cohort, run the pure generator, persist + validate the result, and advance the session if this was the last room needed. */
+  private async createPlan(
+    examSessionId: string,
+    examSessionRoomId: string,
+    roomId: string,
+    strategy: GenerateSeatingDto['strategy'],
+    actor: AuthenticatedUser,
+  ): Promise<SeatingGenerationSummary> {
+    const { students, seats } = await this.resolveCohort(examSessionId, examSessionRoomId, roomId);
 
     const generated = generateSeating({
       seats,
       students,
-      strategy: dto.strategy,
-      seed: `${examSessionId}:${dto.room_id}`,
+      strategy,
+      seed: `${examSessionId}:${roomId}`,
     });
 
     const plan = await this.prisma
       .$transaction(async (tx) => {
         const created = await tx.seatingPlan.create({
-          data: { examSessionId, roomId: dto.room_id, strategy: dto.strategy, status: SeatingPlanStatus.DRAFT },
+          data: { examSessionId, roomId, strategy, status: SeatingPlanStatus.DRAFT },
         });
 
         if (generated.assignments.length > 0) {
@@ -199,7 +277,7 @@ export class SeatingEngineService {
             action: 'CREATE',
             entityType: 'SeatingPlan',
             entityId: updated.id,
-            newValue: { status: updated.status, roomId: dto.room_id, strategy: dto.strategy },
+            newValue: { status: updated.status, roomId, strategy },
           },
           tx,
         );
@@ -236,9 +314,18 @@ export class SeatingEngineService {
     return { ...plan, assignments };
   }
 
-  /** `GET /seating-jobs/{id}` (ADMIN) — this phase's synchronous, single-room generation already produces its own natural job-like record (the `SeatingPlan` itself); no separate job abstraction is layered on top. */
-  async getJob(planId: string): Promise<SeatingGenerationSummary> {
+  /**
+   * `GET /seating-jobs/{id}` (ADMIN, FACULTY) — this phase's synchronous,
+   * single-room generation already produces its own natural job-like
+   * record (the `SeatingPlan` itself); no separate job abstraction is
+   * layered on top. SeatingPanel.tsx polls this immediately after a
+   * faculty member generates seating for their own session, so it must be
+   * reachable by the owning/co-instructing faculty, not admin-only — same
+   * ADMIN-unscoped/FACULTY-scoped-404 pattern as `findByIdScoped`.
+   */
+  async getJob(planId: string, actor: AuthenticatedUser): Promise<SeatingGenerationSummary> {
     const plan = await this.findById(planId);
+    await this.examSessionsService.findByIdScoped(plan.examSessionId, actor);
     return this.toSummary(plan);
   }
 
@@ -251,6 +338,9 @@ export class SeatingEngineService {
    */
   async finalize(planId: string, actor: AuthenticatedUser): Promise<SeatingPlan> {
     const plan = await this.findById(planId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(plan.examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (plan.status !== SeatingPlanStatus.VALIDATED) {
       throw new ConflictException(
         `Seating plan is in status "${plan.status}" and can only be finalized from VALIDATED.`,
@@ -291,10 +381,22 @@ export class SeatingEngineService {
     );
 
     const updated = await this.prisma.$transaction(async (tx) => {
-      const finalized = await tx.seatingPlan.update({
-        where: { id: planId },
+      // Atomic conditional update, not a plain `update` — the VALIDATED
+      // check above is a separate read outside this transaction, so two
+      // concurrent `finalize` calls on the same plan could both pass it
+      // before either commits. Guarding the WHERE on `status: VALIDATED`
+      // means only the first transaction's write actually matches; the
+      // second gets `count: 0` and cleanly 409s instead of both
+      // committing and double-queuing every SEAT_ASSIGNED notification
+      // plus a duplicate audit row.
+      const { count } = await tx.seatingPlan.updateMany({
+        where: { id: planId, status: SeatingPlanStatus.VALIDATED },
         data: { status: SeatingPlanStatus.FINALIZED, finalizedAt: new Date() },
       });
+      if (count === 0) {
+        throw new ConflictException('This seating plan was already finalized by a concurrent request.');
+      }
+      const finalized = await tx.seatingPlan.findUniqueOrThrow({ where: { id: planId } });
 
       for (const assignment of persistedAssignments) {
         const recipientId = studentUserIds.get(assignment.studentId);
@@ -437,31 +539,19 @@ export class SeatingEngineService {
     return { students, seats };
   }
 
-  /** ARCHITECTURE.md §AD-2 #2: ROOM_ALLOCATION→SEATING_GENERATION already happened in Phase 12; the NEXT transition (SEATING_GENERATION→READY_FOR_FINALIZATION) requires ALL of the session's allocated rooms to have a VALIDATED (or FINALIZED) plan — this phase's own boundary to own. */
+  /**
+   * ARCHITECTURE.md §AD-2 #2: ROOM_ALLOCATION→SEATING_GENERATION already
+   * happened in Phase 12; the NEXT transition
+   * (SEATING_GENERATION→READY_FOR_FINALIZATION) requires ALL of the
+   * session's allocated rooms to have a VALIDATED (or FINALIZED) plan AND
+   * at least one invigilator assigned — see
+   * `ExamSessionsService.maybeAdvanceToReadyForFinalization`'s own
+   * comment for why that check lives there instead (shared with
+   * `InvigilationService`, since either a plan or an invigilator
+   * assignment can be the LAST piece that makes a session ready).
+   */
   private async maybeAdvanceSessionToReadyForFinalization(examSessionId: string): Promise<void> {
-    const rooms = await this.prisma.examSessionRoom.findMany({ where: { examSessionId }, select: { roomId: true } });
-    if (rooms.length === 0) {
-      return;
-    }
-
-    const validatedOrFinalizedPlans = await this.prisma.seatingPlan.findMany({
-      where: {
-        examSessionId,
-        roomId: { in: rooms.map((r) => r.roomId) },
-        status: { in: [SeatingPlanStatus.VALIDATED, SeatingPlanStatus.FINALIZED] },
-      },
-      select: { roomId: true },
-    });
-    const roomsWithGoodPlan = new Set(validatedOrFinalizedPlans.map((p) => p.roomId));
-    const allRoomsReady = rooms.every((r) => roomsWithGoodPlan.has(r.roomId));
-    if (!allRoomsReady) {
-      return;
-    }
-
-    await this.prisma.examSession.updateMany({
-      where: { id: examSessionId, status: ExamSessionStatus.SEATING_GENERATION },
-      data: { status: ExamSessionStatus.READY_FOR_FINALIZATION, version: { increment: 1 } },
-    });
+    await this.examSessionsService.maybeAdvanceToReadyForFinalization(examSessionId);
   }
 
   private toSummary(plan: SeatingPlan): SeatingGenerationSummary {

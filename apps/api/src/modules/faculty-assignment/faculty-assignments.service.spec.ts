@@ -21,7 +21,7 @@ function buildPrismaMock() {
   } as any;
 }
 
-const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('FacultyAssignmentsService — the core M:N junction (BR-007/008/009)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;

@@ -15,23 +15,26 @@ import { QuizApprovalHistoryService } from './quiz-approval-history.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
+import { EnrollmentsService } from '../enrollment';
 
 function buildPrismaMock() {
   const tx = {
     quiz: { create: jest.fn(), update: jest.fn() },
     quizBatch: { createMany: jest.fn(), deleteMany: jest.fn(), findMany: jest.fn() },
+    user: { findMany: jest.fn().mockResolvedValue([]) },
   };
   return {
     quiz: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
     quizBatch: { findMany: jest.fn() },
     facultySubjectBatchAssignment: { findMany: jest.fn() },
+    examSessionQuiz: { findMany: jest.fn().mockResolvedValue([]), findFirst: jest.fn().mockResolvedValue(null) },
     $transaction: jest.fn((cb: any) => cb(tx)),
     __tx: tx,
   } as any;
 }
 
-const facultyActor: AuthenticatedUser = { id: 'user-faculty-1', email: 'f@example.com', roles: ['FACULTY'] };
-const adminActor: AuthenticatedUser = { id: 'user-admin-1', email: 'a@example.com', roles: ['ADMIN'] };
+const facultyActor: AuthenticatedUser = { id: 'user-faculty-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
+const adminActor: AuthenticatedUser = { id: 'user-admin-1', email: 'a@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 6 + 7)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
@@ -44,6 +47,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
   let accessRepository: { findScoped: jest.Mock };
   let approvalHistoryService: { record: jest.Mock; listForQuiz: jest.Mock };
   let notificationsOutbox: { queue: jest.Mock };
+  let enrollmentsService: { findEligibleStudentIds: jest.Mock };
   let service: QuizzesService;
 
   const createDto = {
@@ -52,6 +56,9 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
     batch_ids: ['batch-A'],
     academic_year: '2026',
     semester: 1,
+    student_count: 60,
+    preferred_date: '2026-05-01',
+    preferred_time: '10:00',
   };
 
   beforeEach(() => {
@@ -65,6 +72,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
     accessRepository = { findScoped: jest.fn() };
     approvalHistoryService = { record: jest.fn(), listForQuiz: jest.fn() };
     notificationsOutbox = { queue: jest.fn() };
+    enrollmentsService = { findEligibleStudentIds: jest.fn() };
     prisma.quizBatch.findMany.mockResolvedValue([]); // default; overridden per-test where batch ids matter
     facultyService.findById.mockResolvedValue({ id: 'faculty-1', userId: 'user-faculty-1' });
 
@@ -79,7 +87,19 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       accessRepository as unknown as QuizAccessRepository,
       approvalHistoryService as unknown as QuizApprovalHistoryService,
       notificationsOutbox as unknown as NotificationsOutboxService,
+      enrollmentsService as unknown as EnrollmentsService,
     );
+  });
+
+  describe('getEligibleStudentCount', () => {
+    it('returns the real enrolled-eligible count for the given subject/batches/year/semester', async () => {
+      enrollmentsService.findEligibleStudentIds.mockResolvedValue(['s1', 's2', 's3']);
+
+      const result = await service.getEligibleStudentCount('subject-DBMS', ['batch-A', 'batch-B'], '2026', 1);
+
+      expect(result).toEqual({ count: 3 });
+      expect(enrollmentsService.findEligibleStudentIds).toHaveBeenCalledWith('subject-DBMS', ['batch-A', 'batch-B'], '2026', 1);
+    });
   });
 
   describe('create — BR-010', () => {
@@ -103,12 +123,23 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
 
     it('BR-010: rejects creation for a subject/batch the faculty is NOT assigned to teach — 403', async () => {
       facultyService.findByUserId.mockResolvedValue({ id: 'faculty-1' });
-      subjectsService.findById.mockResolvedValue({ id: 'subject-DBMS' });
-      batchesService.findById.mockResolvedValue({ id: 'batch-A' });
+      subjectsService.findById.mockResolvedValue({ id: 'subject-DBMS', code: 'DBMS', name: 'Databases' });
+      batchesService.findById.mockResolvedValue({ id: 'batch-A', section: 'A', subsection: 'A1', year: '2026' });
       facultyAssignmentsService.hasActiveAssignment.mockResolvedValue(false);
 
       await expect(service.create(createDto, facultyActor)).rejects.toThrow(ForbiddenException);
       expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('BR-010 rejection message names the actual subject/batch, not a raw id — shown verbatim to the faculty member', async () => {
+      facultyService.findByUserId.mockResolvedValue({ id: 'faculty-1' });
+      subjectsService.findById.mockResolvedValue({ id: 'subject-DBMS', code: 'DBMS', name: 'Databases' });
+      batchesService.findById.mockResolvedValue({ id: 'batch-A', section: 'A', subsection: 'A1', year: '2026' });
+      facultyAssignmentsService.hasActiveAssignment.mockResolvedValue(false);
+
+      await expect(service.create(createDto, facultyActor)).rejects.toThrow(
+        'You are not assigned to teach "DBMS — Databases" for batch "A/A1 (2026)"',
+      );
     });
 
     it('rejects creation when ANY one of multiple target batches is unassigned (all-or-nothing)', async () => {
@@ -164,10 +195,33 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
   });
 
   describe('findByIdScoped', () => {
-    it('delegates to the access repository (IDOR-safe, ADMIN-or-owner-or-co-instructor)', async () => {
+    it('delegates to the access repository (IDOR-safe, ADMIN-or-owner-or-co-instructor) and enriches with null examSession when unattached', async () => {
       accessRepository.findScoped.mockResolvedValue({ id: 'q1' });
-      await expect(service.findByIdScoped('q1', facultyActor)).resolves.toEqual({ id: 'q1' });
+      prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
+
+      await expect(service.findByIdScoped('q1', facultyActor)).resolves.toEqual({ id: 'q1', examSession: null });
       expect(accessRepository.findScoped).toHaveBeenCalledWith('q1', facultyActor);
+    });
+
+    it('enriches with the active exam session + its allocated rooms when attached', async () => {
+      accessRepository.findScoped.mockResolvedValue({ id: 'q1' });
+      prisma.examSessionQuiz.findFirst.mockResolvedValue({
+        examSession: {
+          id: 'session-1',
+          status: 'SEATING_GENERATION',
+          allocatedRooms: [
+            { allocatedCapacity: 30, room: { id: 'room-1', building: 'A', floor: 1, roomNumber: '101', capacity: 40 } },
+          ],
+        },
+      });
+
+      const result = await service.findByIdScoped('q1', facultyActor);
+
+      expect(result.examSession).toEqual({
+        id: 'session-1',
+        status: 'SEATING_GENERATION',
+        rooms: [{ id: 'room-1', building: 'A', floor: 1, roomNumber: '101', capacity: 40, allocatedCapacity: 30 }],
+      });
     });
   });
 
@@ -199,6 +253,21 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       });
       // The faculty_id filter is not present anywhere in the FACULTY-scoped query.
       expect(callArgs.where.AND[1].createdByFacultyId).toBeUndefined();
+    });
+
+    it('denormalizes the active exam session (id/status) onto each quiz, so a faculty can\'t start a second session for an already-scheduled one', async () => {
+      prisma.quiz.findMany.mockResolvedValue([{ id: 'q1' }, { id: 'q2' }]);
+      prisma.examSessionQuiz.findMany.mockResolvedValue([
+        { quizId: 'q1', examSession: { id: 'session-1', status: 'IN_PROGRESS' } },
+      ]);
+
+      const result = await service.list({}, adminActor);
+
+      expect(prisma.examSessionQuiz.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { quizId: { in: ['q1', 'q2'] }, isActiveAttachment: true } }),
+      );
+      expect(result.items.find((q) => q.id === 'q1')?.examSession).toEqual({ id: 'session-1', status: 'IN_PROGRESS' });
+      expect(result.items.find((q) => q.id === 'q2')?.examSession).toBeNull();
     });
   });
 
@@ -260,7 +329,8 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       prisma.quiz.findUnique.mockResolvedValue(existingDraft);
       ownershipService.isOwnerOrCoInstructor.mockResolvedValue(true);
       facultyService.findByUserId.mockResolvedValue({ id: 'faculty-1' });
-      batchesService.findById.mockResolvedValue({ id: 'batch-C' });
+      subjectsService.findById.mockResolvedValue({ id: 'subject-DBMS', code: 'DBMS', name: 'Databases' });
+      batchesService.findById.mockResolvedValue({ id: 'batch-C', section: 'C', subsection: 'C1', year: '2026' });
       facultyAssignmentsService.hasActiveAssignment.mockResolvedValue(false);
 
       await expect(
@@ -289,8 +359,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       academicYear: '2026',
       semester: 1,
       durationMinutes: 60,
-      totalMarks: 100,
-      questionCount: 20,
+      studentCount: 60,
       quizType: 'QUIZ',
       preferredDate: new Date('2026-05-01'),
       preferredTime: new Date('1970-01-01T10:00:00Z'),
@@ -319,11 +388,11 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       await expect(service.submit('q1', facultyActor)).rejects.toThrow(ForbiddenException);
     });
 
-    it('422s on an incomplete quiz — missing duration_minutes/total_marks/etc.', async () => {
+    it('422s on an incomplete quiz — missing duration_minutes/student_count/etc.', async () => {
       prisma.quiz.findUnique.mockResolvedValue({
         ...baseQuiz,
         durationMinutes: null,
-        totalMarks: null,
+        studentCount: null,
         quizType: null,
       });
       facultyService.findByUserId.mockResolvedValue({ id: 'faculty-1' });
@@ -333,7 +402,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       const error = await service.submit('q1', facultyActor).catch((e) => e);
       expect(error).toBeInstanceOf(UnprocessableEntityException);
       expect(error.message).toMatch(/duration_minutes/);
-      expect(error.message).toMatch(/total_marks/);
+      expect(error.message).toMatch(/student_count/);
       expect(error.message).toMatch(/quiz_type/);
     });
 
@@ -374,6 +443,29 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       expect(auditHook.record).toHaveBeenCalledWith(
         expect.objectContaining({ entityType: 'Quiz', action: 'UPDATE' }),
         expect.anything(),
+      );
+    });
+
+    it('notifies every ADMIN user that a quiz was submitted for review', async () => {
+      prisma.quiz.findUnique.mockResolvedValue(baseQuiz);
+      facultyService.findByUserId.mockResolvedValue({ id: 'faculty-1' });
+      prisma.quizBatch.findMany.mockResolvedValue([{ batchId: 'batch-A' }]);
+      facultyAssignmentsService.hasActiveAssignment.mockResolvedValue(true);
+      prisma.__tx.quiz.update.mockResolvedValue({ ...baseQuiz, status: QuizStatus.SUBMITTED, version: 2 });
+      prisma.__tx.user.findMany.mockResolvedValue([{ id: 'admin-1' }, { id: 'admin-2' }]);
+
+      await service.submit('q1', facultyActor);
+
+      expect(prisma.__tx.user.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { roles: { some: { role: { name: 'ADMIN' } } } } }),
+      );
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ recipientType: 'ADMIN', recipientId: 'admin-1', eventType: 'QUIZ_SUBMITTED', entityId: 'q1' }),
+      );
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ recipientType: 'ADMIN', recipientId: 'admin-2', eventType: 'QUIZ_SUBMITTED', entityId: 'q1' }),
       );
     });
 

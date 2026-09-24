@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import {
   ExamSession,
   ExamSessionStatus,
@@ -7,15 +7,26 @@ import {
   Prisma,
   QuizStatus,
   QuizStudentAssignmentStatus,
+  SeatingPlanStatus,
 } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { runSerializable } from '../../common/prisma/serializable-transaction';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
+import {
+  PaginatedResult,
+  PaginationParams,
+  cursorFindManyArgs,
+  resolveLimit,
+  toPaginatedResult,
+} from '../../common/pagination/paginate';
+import { ROLE } from '../../common/auth/auth.types';
 import { ConflictEngineService, ConflictCheckResult, ConflictDetail } from '../conflict-engine';
-import { QuizzesService } from '../quiz';
+import { QuizzesService, QuizOwnershipService } from '../quiz';
+import { FacultyService } from '../faculty';
 import { ExamSessionsAccessRepository } from './exam-sessions-access.repository';
+import { ExamSessionOwnershipService } from './exam-session-ownership.service';
 import { CreateExamSessionDto } from './dto/create-exam-session.dto';
 import { RescheduleExamSessionDto } from './dto/reschedule-exam-session.dto';
 import { CancelExamSessionDto } from './dto/cancel-exam-session.dto';
@@ -46,6 +57,9 @@ export class ExamSessionsService {
     private readonly quizzesService: QuizzesService,
     private readonly accessRepository: ExamSessionsAccessRepository,
     private readonly notificationsOutbox: NotificationsOutboxService,
+    private readonly examSessionOwnershipService: ExamSessionOwnershipService,
+    private readonly quizOwnershipService: QuizOwnershipService,
+    private readonly facultyService: FacultyService,
   ) {}
 
   /**
@@ -75,6 +89,22 @@ export class ExamSessionsService {
     return students.map((s) => s.userId);
   }
 
+  /**
+   * `POST /exam-sessions` — FACULTY only. Deliberately does NOT require a
+   * `quiz_id` up front (option (a) from the faculty-lifecycle-ownership
+   * change spec): `CreateExamSessionDto` is left untouched, so a session
+   * is created bare, momentarily un-owned, and ownership is enforced at
+   * the FIRST `PATCH :id/quizzes` attach instead (see
+   * `attachAndDetachQuizzes`'s own comment). This was the smaller change
+   * to the existing contract — requiring `quiz_id` at creation would have
+   * meant reshaping `CreateExamSessionDto` and this endpoint's request
+   * body, a documented API_CONTRACT.md shape, for a gap that a same-
+   * transaction-adjacent follow-up call already closes in practice (no
+   * other write is possible on an unowned session before that first
+   * attach — every other mutating endpoint requires stakeholder
+   * ownership, which a zero-quiz session cannot satisfy for anyone but
+   * the original creator's own next attach call).
+   */
   async create(dto: CreateExamSessionDto, actor: AuthenticatedUser): Promise<ExamSession> {
     return this.prisma.$transaction(async (tx) => {
       const session = await tx.examSession.create({
@@ -116,6 +146,87 @@ export class ExamSessionsService {
   }
 
   /**
+   * `GET /exam-sessions` — new list endpoint backing both the faculty "My
+   * Exam Sessions" list and the admin read-only "all scheduled sessions"
+   * dashboard (neither existed before the faculty-lifecycle-ownership
+   * change). ADMIN: every session, unscoped, newest first. FACULTY: only
+   * sessions where they own/co-instruct at least one currently
+   * ACTIVELY-attached quiz — resolved via a simple `IN` over
+   * `ExamSessionOwnershipService`'s underlying rule, applied per-quiz
+   * rather than per-session (a session appears once regardless of how
+   * many of its attachments the faculty owns).
+   */
+  async list(
+    actor: AuthenticatedUser,
+    params: PaginationParams,
+  ): Promise<PaginatedResult<ExamSession>> {
+    const limit = resolveLimit(params.limit);
+    const isAdmin = actor.roles.includes(ROLE.ADMIN);
+
+    if (isAdmin) {
+      const rows = await this.prisma.examSession.findMany({
+        ...cursorFindManyArgs(params.cursor, limit),
+        orderBy: { createdAt: 'desc' },
+      });
+      return toPaginatedResult(rows, limit);
+    }
+
+    const actingFaculty = await this.facultyService.findByUserId(actor.id);
+    if (!actingFaculty) {
+      return toPaginatedResult([], limit);
+    }
+
+    // Every currently-active attachment across every session, resolved
+    // per-quiz through the SAME QuizOwnershipService rule the rest of
+    // this module already relies on (own-or-co-instruct) — reused here
+    // rather than hand-rolling a second, parallel Prisma query for the
+    // same rule (which drifted out of sync from the real one on the
+    // FIRST attempt: FacultySubjectBatchAssignment has no `isActive`
+    // column, only `endedAt: null`). This list is over active
+    // attachments, not over all exam sessions, so it stays small in
+    // practice even without pushing the filter into SQL.
+    const activeAttachments = await this.prisma.examSessionQuiz.findMany({
+      where: { isActiveAttachment: true },
+      include: { quiz: true },
+    });
+
+    const ownedSessionIds = new Set<string>();
+    for (const attachment of activeAttachments) {
+      if (ownedSessionIds.has(attachment.examSessionId)) {
+        continue;
+      }
+      if (await this.quizOwnershipService.isOwnerOrCoInstructor(attachment.quiz, actor)) {
+        ownedSessionIds.add(attachment.examSessionId);
+      }
+    }
+
+    // A session this faculty created is theirs to see even before any
+    // quiz is attached, or after the only attach attempt failed (e.g. a
+    // conflict) and left it an orphan — mirrors
+    // ExamSessionsAccessRepository's own `createdByAdminId` check, so a
+    // session that fails to appear here doesn't ALSO 404 on its detail
+    // page (or vice versa).
+    const ownSessions = await this.prisma.examSession.findMany({
+      where: { createdByAdminId: actor.id },
+      select: { id: true },
+    });
+    for (const s of ownSessions) {
+      ownedSessionIds.add(s.id);
+    }
+
+    if (ownedSessionIds.size === 0) {
+      return toPaginatedResult([], limit);
+    }
+
+    const rows = await this.prisma.examSession.findMany({
+      ...cursorFindManyArgs(params.cursor, limit),
+      where: { id: { in: [...ownedSessionIds] } },
+      orderBy: { createdAt: 'desc' },
+    });
+    return toPaginatedResult(rows, limit);
+  }
+
+  /**
    * "full detail incl. quizzes, rooms, status" (API_CONTRACT.md) —
    * `rooms` now included (Phase 12 created `exam_session_rooms`; Phase
    * 8's own comment here explicitly deferred this exact field until the
@@ -137,10 +248,34 @@ export class ExamSessionsService {
       }),
     ]);
 
+    // Whether every allocated room already has a VALIDATED/FINALIZED
+    // seating plan — the SAME condition
+    // `maybeAdvanceToReadyForFinalization` checks before also requiring
+    // an invigilator per room. The real `status` enum can't express
+    // "seating is done, just waiting on invigilators" (SEATING_GENERATION
+    // covers both), so this is surfaced separately for the faculty-facing
+    // progress stepper to show "Seating Generation" as complete and
+    // "Assign Invigilator" as the actual next step, instead of looking
+    // stuck once seating finishes but before an invigilator is assigned.
+    let seatingReady = false;
+    if (roomAllocations.length > 0) {
+      const plans = await this.prisma.seatingPlan.findMany({
+        where: {
+          examSessionId: id,
+          roomId: { in: roomAllocations.map((a) => a.roomId) },
+          status: { in: [SeatingPlanStatus.VALIDATED, SeatingPlanStatus.FINALIZED] },
+        },
+        select: { roomId: true },
+      });
+      const roomsWithGoodPlan = new Set(plans.map((p) => p.roomId));
+      seatingReady = roomAllocations.every((a) => roomsWithGoodPlan.has(a.roomId));
+    }
+
     return {
       ...session,
       quizzes: attachments.map((a) => a.quiz),
       rooms: roomAllocations.map((a) => ({ ...a.room, allocatedCapacity: a.allocatedCapacity })),
+      seatingReady,
     };
   }
 
@@ -187,8 +322,31 @@ export class ExamSessionsService {
     });
     const currentlyAttachedIds = new Set(currentlyAttached.map((r) => r.quizId));
 
+    // Faculty-lifecycle-ownership gate (ExamSessionOwnershipService's own
+    // header comment): a session with at least one currently-ACTIVE
+    // attachment already has a "stake-holding" faculty, and the acting
+    // faculty must be one of them to touch it further — this is what
+    // stops a faculty from piling their own quiz onto someone else's
+    // combined multi-subject session. A session with ZERO active
+    // attachments (brand new, or every quiz has since been detached) has
+    // no stake-holder yet, so ANY faculty may make the first attachment —
+    // "you can only add to a session you already have a stake in, or
+    // you're creating the first attachment on a brand-new session."
+    // "Exists but isn't yours" on a write is a 404 here, matching
+    // quizzes.service.ts's own PATCH convention (IDOR-safe).
+    if (currentlyAttachedIds.size > 0) {
+      const isStakeholder = await this.examSessionOwnershipService.isOwnerOrCoInstructor(id, actor);
+      if (!isStakeholder) {
+        throw new NotFoundException();
+      }
+    }
+
     const hardConflicts: ConflictDetail[] = [];
     const quizzesToActuallyAdd: string[] = [];
+    // Reused below in the upsert's P2002 race-backstop catch — that block
+    // has no `quiz` object of its own, and it's not worth a fresh query on
+    // a rare race path just to name the quiz in the message.
+    const quizTitlesById = new Map<string, string>();
 
     for (const quizId of dto.add) {
       if (currentlyAttachedIds.has(quizId)) {
@@ -196,12 +354,22 @@ export class ExamSessionsService {
       }
 
       const quiz = await this.quizzesService.findById(quizId); // throws NotFoundException itself if missing
+      quizTitlesById.set(quizId, quiz.title);
+
+      // Every quiz being newly attached must itself be owned/co-instructed
+      // by the acting faculty — a faculty cannot attach someone ELSE's
+      // quiz to a session, combined or not.
+      if (!(await this.quizOwnershipService.isOwnerOrCoInstructor(quiz, actor))) {
+        throw new ForbiddenException(
+          `You do not own or co-instruct quiz "${quiz.title}" and cannot attach it to this exam session.`,
+        );
+      }
 
       if (quiz.status !== QuizStatus.APPROVED) {
         hardConflicts.push({
           type: 'UNAPPROVED_QUIZ',
           quizId,
-          message: `Quiz "${quizId}" is in status "${quiz.status}", not APPROVED, and cannot be attached (BR-011/BR-017).`,
+          message: `Quiz "${quiz.title}" is in status "${quiz.status}", not APPROVED, and cannot be attached (BR-011/BR-017).`,
         });
         continue;
       }
@@ -213,7 +381,7 @@ export class ExamSessionsService {
         hardConflicts.push({
           type: 'QUIZ_ALREADY_ATTACHED_ELSEWHERE',
           quizId,
-          message: `Quiz "${quizId}" is already actively attached to a different exam session (BR-053).`,
+          message: `Quiz "${quiz.title}" is already actively attached to a different exam session (BR-053).`,
         });
         continue;
       }
@@ -280,7 +448,7 @@ export class ExamSessionsService {
                 {
                   type: 'QUIZ_ALREADY_ATTACHED_ELSEWHERE',
                   quizId,
-                  message: `Quiz "${quizId}" was concurrently attached to a different exam session (BR-053).`,
+                  message: `Quiz "${quizTitlesById.get(quizId) ?? quizId}" was concurrently attached to a different exam session (BR-053).`,
                 },
               ],
             });
@@ -332,6 +500,9 @@ export class ExamSessionsService {
     actor: AuthenticatedUser,
   ): Promise<ExamSession> {
     const session = await this.findById(id);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(id, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (session.status !== ExamSessionStatus.DRAFT) {
       throw new ConflictException(
         `Exam session is in status "${session.status}" and cannot be rescheduled.`,
@@ -428,6 +599,9 @@ export class ExamSessionsService {
    */
   async cancel(id: string, dto: CancelExamSessionDto, actor: AuthenticatedUser): Promise<ExamSession> {
     const session = await this.findById(id);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(id, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (NON_CANCELLABLE_STATUSES.includes(session.status)) {
       throw new ConflictException(
         `Exam session is in status "${session.status}" and cannot be cancelled.`,
@@ -438,6 +612,41 @@ export class ExamSessionsService {
       await tx.examSessionQuiz.updateMany({
         where: { examSessionId: id, isActiveAttachment: true },
         data: { isActiveAttachment: false, detachedAt: new Date() },
+      });
+
+      // Release any rooms already allocated to this session (Phase 12) —
+      // `exam_session_rooms` carries an unconditional Postgres EXCLUDE
+      // constraint (BR-018) that has no way to see this session's status,
+      // so a leftover row here would permanently block that room/time
+      // window from ever being allocated again, even to a brand-new
+      // session for the SAME re-approved quiz. Deleting on cancel is what
+      // actually "frees the room" — the equivalent of `isActiveAttachment:
+      // false` above, for rooms instead of quizzes. Children first (no
+      // cascade configured on this FK).
+      const releasedRooms = await tx.examSessionRoom.findMany({ where: { examSessionId: id }, select: { id: true } });
+      if (releasedRooms.length > 0) {
+        await tx.examSessionRoomQuiz.deleteMany({ where: { examSessionRoomId: { in: releasedRooms.map((r) => r.id) } } });
+        await tx.examSessionRoom.deleteMany({ where: { examSessionId: id } });
+      }
+
+      // Same "release everything so it doesn't linger as a stale, still-
+      // looks-active record" treatment as rooms above, for the other two
+      // things a session can accumulate before it's cancelled:
+      // - Invigilators: no DB constraint blocks re-assigning the same
+      //   faculty elsewhere (unlike rooms' EXCLUDE constraint), but a
+      //   leftover row here still shows up as "actively invigilating" on
+      //   that faculty's own duties list for a session that will never
+      //   run — hard-deleted, matching `InvigilationService.remove`'s own
+      //   established convention (`ExamInvigilator` has no soft-delete
+      //   column, unlike `QuizStudentAssignment`'s CANCELLED status).
+      // - Seating plans: marked SUPERSEDED rather than deleted — plans
+      //   are audit-relevant history (soft_constraint_score, violation
+      //   reports) the same way a regenerated plan is superseded rather
+      //   than removed, not silently discarded.
+      await tx.examInvigilator.deleteMany({ where: { examSessionId: id } });
+      await tx.seatingPlan.updateMany({
+        where: { examSessionId: id, status: { notIn: [SeatingPlanStatus.SUPERSEDED] } },
+        data: { status: SeatingPlanStatus.SUPERSEDED, version: { increment: 1 } },
       });
 
       const cancelled = await tx.examSession.update({
@@ -476,9 +685,9 @@ export class ExamSessionsService {
     return updated;
   }
 
-  /** `GET /exam-sessions/{id}/conflicts` — ADMIN-only dry-run, no commit. */
-  async getConflicts(id: string): Promise<ConflictCheckResult> {
-    const session = await this.findById(id);
+  /** `GET /exam-sessions/{id}/conflicts` — dry-run, no commit. Scoped identically to `GET /exam-sessions/{id}` (ADMIN unscoped, FACULTY owner/co-instructor only) — previously ADMIN-only with no scoping check at all. */
+  async getConflicts(id: string, actor: AuthenticatedUser): Promise<ConflictCheckResult> {
+    const session = await this.findByIdScoped(id, actor);
     const attachedQuizIds = (
       await this.prisma.examSessionQuiz.findMany({
         where: { examSessionId: id, isActiveAttachment: true },
@@ -492,6 +701,53 @@ export class ExamSessionsService {
       sessionDate: session.sessionDate,
       startTime: session.startTime,
       endTime: session.endTime,
+    });
+  }
+
+  /**
+   * SEATING_GENERATION -> READY_FOR_FINALIZATION (ARCHITECTURE.md §AD-2
+   * #2) requires ALL of the session's allocated rooms to have a
+   * VALIDATED/FINALIZED seating plan AND at least one invigilator
+   * assigned — a session isn't "ready to finalize" if nobody has been
+   * assigned to actually invigilate one of its rooms. Called from both
+   * `SeatingEngineService` (after a plan is validated/finalized) and
+   * `InvigilationService` (after an invigilator is assigned) since either
+   * one can be the LAST piece that makes the session ready, depending on
+   * which order the admin/faculty does them in.
+   */
+  async maybeAdvanceToReadyForFinalization(examSessionId: string): Promise<void> {
+    const rooms = await this.prisma.examSessionRoom.findMany({ where: { examSessionId }, select: { roomId: true } });
+    if (rooms.length === 0) {
+      return;
+    }
+
+    const validatedOrFinalizedPlans = await this.prisma.seatingPlan.findMany({
+      where: {
+        examSessionId,
+        roomId: { in: rooms.map((r) => r.roomId) },
+        status: { in: [SeatingPlanStatus.VALIDATED, SeatingPlanStatus.FINALIZED] },
+      },
+      select: { roomId: true },
+    });
+    const roomsWithGoodPlan = new Set(validatedOrFinalizedPlans.map((p) => p.roomId));
+    const allRoomsReady = rooms.every((r) => roomsWithGoodPlan.has(r.roomId));
+    if (!allRoomsReady) {
+      return;
+    }
+
+    const invigilatorAssignments = await this.prisma.examInvigilator.findMany({
+      where: { examSessionId, roomId: { in: rooms.map((r) => r.roomId) } },
+      select: { roomId: true },
+    });
+    const roomsWithInvigilator = new Set(invigilatorAssignments.map((a) => a.roomId));
+    const allRoomsInvigilated = rooms.every((r) => roomsWithInvigilator.has(r.roomId));
+    if (!allRoomsInvigilated) {
+      return;
+    }
+
+    await this.prisma.examSession.updateMany({
+      where: { id: examSessionId, status: ExamSessionStatus.SEATING_GENERATION },
+      data: { status: ExamSessionStatus.READY_FOR_FINALIZATION, version: { increment: 1 } },
     });
   }
 

@@ -1,4 +1,4 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException } from '@nestjs/common';
 import { Prisma, AcademicStatus } from '@exam-sync/db';
 import { StudentsService } from './students.service';
 import { ProgramsService, BatchesService } from '../academic-structure';
@@ -7,13 +7,14 @@ import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { StudentsAccessRepository } from './students-access.repository';
 import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { buildXlsxBuffer, readTemplateExampleRow } from '../../common/bulk-import/test-utils';
 
 function buildPrismaMock() {
   const tx = {
     role: { findUnique: jest.fn() },
     user: { create: jest.fn(), update: jest.fn(), findUnique: jest.fn() },
     userRole: { create: jest.fn() },
-    student: { create: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
+    student: { create: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
   };
   return {
     ...tx,
@@ -21,13 +22,13 @@ function buildPrismaMock() {
   } as any;
 }
 
-const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('StudentsService', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
-  let programsService: { findById: jest.Mock };
-  let batchesService: { findById: jest.Mock };
+  let programsService: { findById: jest.Mock; findByCode: jest.Mock };
+  let batchesService: { findById: jest.Mock; findByProgramYearSectionSubsection: jest.Mock };
   let passwordService: { hash: jest.Mock };
   let accessRepository: any;
   let importJobsService: { create: jest.Mock };
@@ -36,8 +37,8 @@ describe('StudentsService', () => {
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
-    programsService = { findById: jest.fn() };
-    batchesService = { findById: jest.fn() };
+    programsService = { findById: jest.fn(), findByCode: jest.fn() };
+    batchesService = { findById: jest.fn(), findByProgramYearSectionSubsection: jest.fn() };
     passwordService = { hash: jest.fn().mockResolvedValue('hashed-temp-password') };
     accessRepository = {};
     importJobsService = { create: jest.fn() };
@@ -51,6 +52,33 @@ describe('StudentsService', () => {
       accessRepository as StudentsAccessRepository,
       importJobsService as unknown as ImportJobsService,
     );
+  });
+
+  describe('generateBulkImportTemplate', () => {
+    it('uses a real existing student (+ their program\'s/batch\'s real codes) as the example row', async () => {
+      prisma.student.findFirst.mockResolvedValue({
+        name: 'Real Student', rollNumber: 'ECE2025042',
+        program: { code: 'BTECH-ECE' }, batch: { year: '2025-2029', section: '1E1', subsection: '1E12' },
+        user: { email: 'real.student@example.edu' },
+      });
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.name).toBe('Real Student');
+      expect(row.email).toBe('real.student@example.edu');
+      expect(row.program_code).toBe('BTECH-ECE');
+      expect(row.batch_year).toBe('2025-2029');
+      expect(row.batch_subsection).toBe('1E12');
+      expect(row.roll_number).toBe('ECE2025042');
+    });
+
+    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
+      prisma.student.findFirst.mockResolvedValue(null);
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.roll_number).toBe('CSE2026001');
+    });
   });
 
   describe('create', () => {
@@ -104,7 +132,10 @@ describe('StudentsService', () => {
       expect(prisma.userRole.create).toHaveBeenCalledWith({
         data: { userId: 'user-1', roleId: 'role-student' },
       });
-      expect(passwordService.hash).toHaveBeenCalled();
+      expect(passwordService.hash).toHaveBeenCalledWith('CSE-001_adalovelace');
+      expect(prisma.user.create).toHaveBeenCalledWith({
+        data: { email: dto.email, passwordHash: 'hashed-temp-password', isActive: true, mustChangePassword: true },
+      });
       expect(auditHook.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'CREATE', entityType: 'Student' }),
         expect.anything(),
@@ -169,6 +200,7 @@ describe('StudentsService', () => {
     it('rejects reassignment to a batch that does not belong to the target program', async () => {
       prisma.student.findUnique.mockResolvedValue({ id: 's1', userId: 'user-1', programId: 'p1', batchId: 'b1', status: 'ACTIVE' });
       batchesService.findById.mockResolvedValue({ id: 'b2', programId: 'OTHER' });
+      programsService.findById.mockResolvedValue({ id: 'OTHER', name: 'Other Program' });
 
       await expect(service.update('s1', { batch_id: 'b2' }, actor)).rejects.toThrow(ConflictException);
     });
@@ -176,12 +208,14 @@ describe('StudentsService', () => {
 
   describe('bulkImport', () => {
     it('processes each row independently — one bad row never blocks the rest (EC-044)', async () => {
-      // Row 1 (program "p1") succeeds; row 2 references a program that
-      // doesn't exist ("MISSING-PROGRAM"), so only that row fails.
-      programsService.findById.mockImplementation((id: string) => {
-        if (id === 'p1') return Promise.resolve({ id: 'p1' });
-        return Promise.reject(new NotFoundException());
+      // Row 1 (program "BTCSE") succeeds; row 2 references a program code
+      // that doesn't exist ("MISSING-PROGRAM"), so only that row fails.
+      programsService.findByCode.mockImplementation((code: string) => {
+        if (code === 'BTCSE') return Promise.resolve({ id: 'p1', code: 'BTCSE' });
+        return Promise.resolve(null);
       });
+      programsService.findById.mockResolvedValue({ id: 'p1', code: 'BTCSE' });
+      batchesService.findByProgramYearSectionSubsection.mockResolvedValue({ id: 'b1', programId: 'p1' });
       batchesService.findById.mockResolvedValue({ id: 'b1', programId: 'p1' });
       prisma.role.findUnique.mockResolvedValue({ id: 'role-student', name: 'STUDENT' });
       prisma.user.create.mockResolvedValue({ id: 'user-x' });
@@ -189,10 +223,12 @@ describe('StudentsService', () => {
       prisma.user.findUnique.mockResolvedValue(null);
       prisma.student.create.mockResolvedValue({ id: 'student-ok' });
 
-      const csv = Buffer.from(
-        'name,email,program_id,batch_id,roll_number\n' +
-          'Ada,ada@example.com,p1,b1,ROLL-1\n' +
-          'Bob,bob@example.com,MISSING-PROGRAM,b1,ROLL-2\n',
+      const buffer = await buildXlsxBuffer(
+        ['name', 'email', 'program_code', 'batch_year', 'batch_section', 'batch_subsection', 'roll_number'],
+        [
+          ['Ada', 'ada@example.com', 'BTCSE', '2026', 'A', 'A1', 'ROLL-1'],
+          ['Bob', 'bob@example.com', 'MISSING-PROGRAM', '2026', 'A', 'A1', 'ROLL-2'],
+        ],
       );
 
       let capturedResults: any;
@@ -201,7 +237,7 @@ describe('StudentsService', () => {
         return Promise.resolve({ id: 'job-1', ...input });
       });
 
-      const job = await service.bulkImport(csv, actor);
+      const job = await service.bulkImport(buffer, actor);
 
       expect(job.id).toBe('job-1');
       expect(capturedResults.totalRows).toBe(2);
@@ -211,19 +247,29 @@ describe('StudentsService', () => {
         expect.objectContaining({ row: 2, status: 'SUCCESS', id: 'student-ok' }),
       );
       expect(capturedResults.results[1]).toEqual(
-        expect.objectContaining({ row: 3, status: 'FAILURE' }),
+        expect.objectContaining({ row: 3, status: 'FAILURE', error: expect.stringContaining('MISSING-PROGRAM') }),
       );
     });
 
-    it('reports a job with zero rows for an unparseable CSV rather than throwing', async () => {
-      const garbage = Buffer.from('this","is not"valid,csv\n"unterminated');
+    it('reports a per-row FAILURE when the (program, year, section, subsection) batch cannot be found', async () => {
+      programsService.findByCode.mockResolvedValue({ id: 'p1', code: 'BTCSE' });
+      batchesService.findByProgramYearSectionSubsection.mockResolvedValue(null);
       importJobsService.create.mockResolvedValue({ id: 'job-error' });
 
-      const job = await service.bulkImport(garbage, actor);
+      const buffer = await buildXlsxBuffer(
+        ['name', 'email', 'program_code', 'batch_year', 'batch_section', 'batch_subsection', 'roll_number'],
+        [['Ada', 'ada@example.com', 'BTCSE', '2026', 'Z', 'Z1', 'ROLL-1']],
+      );
 
-      expect(job.id).toBe('job-error');
+      await service.bulkImport(buffer, actor);
+
       expect(importJobsService.create).toHaveBeenCalledWith(
-        expect.objectContaining({ totalRows: 0, failureCount: 0 }),
+        expect.objectContaining({
+          totalRows: 1,
+          successCount: 0,
+          failureCount: 1,
+          results: [expect.objectContaining({ status: 'FAILURE', error: expect.stringContaining('No batch found') })],
+        }),
       );
     });
   });

@@ -6,7 +6,8 @@ import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
 
 /**
- * GET /users/me — response is EXACTLY { id, email, isActive, roles, createdAt }.
+ * GET /users/me — response is EXACTLY
+ * { id, email, isActive, roles, mustChangePassword, createdAt }.
  * There is no "name" field on this backend; UI that needs to display an
  * identity falls back to `email` (see components/shell/AppShell.tsx).
  */
@@ -15,6 +16,7 @@ export interface CurrentUser {
   email: string;
   isActive: boolean;
   roles: string[];
+  mustChangePassword: boolean;
   createdAt: string;
 }
 

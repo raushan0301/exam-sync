@@ -3,7 +3,7 @@
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Modal, Button, DateInput, Input, FormField, Alert } from '@/components/ui';
+import { Modal, Button, DateInput, TimeInput, FormField, Alert } from '@/components/ui';
 import { ApiError } from '@/lib/api-client';
 import { mapError } from '@/lib/error-mapping';
 import type { ConflictDetail, ExamSessionDetail } from '@/lib/queries/types';
@@ -89,10 +89,10 @@ export function RescheduleModal({ open, onOpenChange, session }: RescheduleModal
           </FormField>
           <div className="grid grid-cols-2 gap-4">
             <FormField<RescheduleFormValues> name="start_time" label="Start Time" required>
-              {(field) => <Input type="time" {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
+              {(field) => <TimeInput id={field.id} ariaLabel="Start Time" value={(field.value as string) ?? ''} onChange={(v) => field.onChange(v)} />}
             </FormField>
             <FormField<RescheduleFormValues> name="end_time" label="End Time" required>
-              {(field) => <Input type="time" {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} />}
+              {(field) => <TimeInput id={field.id} ariaLabel="End Time" value={(field.value as string) ?? ''} onChange={(v) => field.onChange(v)} />}
             </FormField>
           </div>
         </form>

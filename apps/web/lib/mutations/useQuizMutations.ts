@@ -12,12 +12,11 @@ export interface CreateQuizInput {
   academic_year: string;
   semester: number;
   duration_minutes?: number;
-  total_marks?: number;
-  question_count?: number;
+  student_count: number;
   instructions?: string;
   quiz_type?: string;
-  preferred_date?: string;
-  preferred_time?: string;
+  preferred_date: string;
+  preferred_time: string;
 }
 
 export type UpdateQuizInput = Partial<CreateQuizInput>;
@@ -93,6 +92,27 @@ export function useRejectQuiz(id: string) {
       queryClient.invalidateQueries({ queryKey: ['quizzes', 'list'] });
       queryClient.invalidateQueries({ queryKey: queryKeys.quiz(id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.quizApprovalHistory(id) });
+    },
+  });
+}
+
+export interface RequestQuizRoomsInput {
+  room_ids: string[];
+  backup_room_id?: string;
+  strategy?: string;
+  /** ADMIN only — a short note explaining an adjustment, shown back to the faculty. Ignored server-side when the caller is FACULTY. */
+  admin_note?: string;
+}
+
+/** POST /quizzes/{id}/rooms/request — FACULTY, ownership-gated. Saves the chosen room set + optional backup room onto the quiz (DRAFT/REJECTED only). */
+export function useRequestQuizRooms(id: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: RequestQuizRoomsInput) =>
+      apiFetch<Quiz>(`/quizzes/${id}/rooms/request`, { method: 'POST', body: input }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.quiz(id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.quizRoomConflicts(id) });
     },
   });
 }

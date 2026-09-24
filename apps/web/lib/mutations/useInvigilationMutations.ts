@@ -12,10 +12,11 @@ export interface AssignInvigilatorInput {
 }
 
 /**
- * POST /exam-sessions/{id}/invigilators — ADMIN only. Verified against
- * `InvigilationService.assign`. May 409 in three ways, all indistinguishable
- * to the caller except by message (no `details` on any of them here,
- * unlike room-allocation/seating's structured conflict details):
+ * POST /exam-sessions/{id}/invigilators — FACULTY only, ownership-gated.
+ * Verified against `InvigilationService.assign`. May 409 in three ways,
+ * all indistinguishable to the caller except by message (no `details` on
+ * any of them here, unlike room-allocation/seating's structured conflict
+ * details):
  *  - the exact-duplicate backstop ("already assigned ... for this room and
  *    session")
  *  - BR-031 overlap — "already invigilating an overlapping session" — this
@@ -33,10 +34,27 @@ export function useAssignInvigilator(examSessionId: string) {
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.examSession(examSessionId) });
-      // Duty lists are keyed by facultyId, which this mutation's response
-      // carries — invalidate broadly by the shared 'faculty' prefix isn't
-      // possible via the typed factory, so callers refetch their own
-      // invigilator list explicitly (see InvigilatorPanel's local state).
+      // Shorter prefix (no trailing params object) so this invalidates
+      // every paginated variant of the list, not just the exact-{} one.
+      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'invigilators', examSessionId] });
+    },
+  });
+}
+
+/**
+ * DELETE /exam-sessions/{id}/invigilators/{invigilatorId} — FACULTY only,
+ * ownership-gated. The only way to correct a wrong/outdated assignment
+ * (wrong faculty, room, or role) — there's no in-place edit, so
+ * `InvigilatorPanel` removes then re-assigns.
+ */
+export function useRemoveInvigilator(examSessionId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (invigilatorId: string) =>
+      apiFetch<void>(`/exam-sessions/${examSessionId}/invigilators/${invigilatorId}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.examSession(examSessionId) });
+      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'invigilators', examSessionId] });
     },
   });
 }

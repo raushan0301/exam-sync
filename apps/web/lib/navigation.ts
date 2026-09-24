@@ -46,7 +46,7 @@ export const ADMIN_NAV: NavEntry[] = [
     items: [
       { label: 'Students', href: '/admin/people/students' },
       { label: 'Faculty', href: '/admin/people/faculty' },
-      { label: 'Enrollments' },
+      { label: 'Enrollments', href: '/admin/people/enrollments' },
       { label: 'Faculty Assignments', href: '/admin/people/faculty-assignments' },
     ],
   },
@@ -57,7 +57,10 @@ export const ADMIN_NAV: NavEntry[] = [
       { label: 'Approval Queue', href: '/admin/quizzes/approval-queue' },
     ],
   },
-  { label: 'Exam Sessions', href: '/admin/exam-sessions/new' },
+  // Faculty-lifecycle-ownership change: admin no longer creates sessions
+  // (that page is gone) — this now points at the read-only "all scheduled
+  // sessions" list instead of the old create form.
+  { label: 'Exam Sessions', href: '/admin/exam-sessions' },
   { label: 'Rooms', href: '/admin/rooms' },
   { label: 'Invigilation' },
   { label: 'Attendance' },
@@ -71,10 +74,9 @@ export const ADMIN_NAV: NavEntry[] = [
 export const FACULTY_NAV: NavEntry[] = [
   { label: 'Dashboard', href: '/faculty/dashboard' },
   { label: 'My Quizzes', href: '/faculty/quizzes' },
-  { label: 'My Assignments' },
-  { label: 'Exam Sessions' },
+  { label: 'My Assignments', href: '/faculty/assignments' },
+  { label: 'Exam Sessions', href: '/faculty/exam-sessions' },
   { label: 'My Invigilation Duties', href: '/faculty/invigilation-duties' },
-  { label: 'Attendance' },
   {
     label: 'Incidents',
     items: [
@@ -121,7 +123,10 @@ export function dashboardPathForRole(role: string | null): string {
 /** Pure function (unit-tested): is `path` an authorized destination for `role`? */
 export function isPathAllowedForRole(path: string, role: string | null): boolean {
   if (!role) return false;
-  const match = ROLE_PATH_PREFIXES.find((p) => path.startsWith(p.prefix));
+  // The bare prefix itself (e.g. "/faculty") has no page.tsx — only its
+  // sub-routes (e.g. "/faculty/dashboard") are real, so require a "/" after
+  // the prefix; otherwise a stored `?redirect=/faculty` would 404 post-login.
+  const match = ROLE_PATH_PREFIXES.find((p) => path.startsWith(`${p.prefix}/`));
   if (!match) return false;
   return match.roles.includes(role);
 }

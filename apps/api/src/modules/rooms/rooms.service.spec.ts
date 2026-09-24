@@ -1,4 +1,5 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
+import { buildXlsxBuffer, readTemplateExampleRow } from '../../common/bulk-import/test-utils';
 import { Prisma, RoomStatus } from '@exam-sync/db';
 import { RoomsService } from './rooms.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
@@ -18,7 +19,7 @@ function buildPrismaMock() {
     roomAvailability: { create: jest.fn() },
   };
   return {
-    room: { create: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
+    room: { create: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), findFirst: jest.fn(), update: jest.fn() },
     roomSeat: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
     roomAvailability: { create: jest.fn(), findMany: jest.fn() },
     $transaction: jest.fn((cb: any) => cb(tx)),
@@ -26,17 +27,19 @@ function buildPrismaMock() {
   } as any;
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('RoomsService — Phase 11 (rooms, seats, availability calendar)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
   let service: RoomsService;
+  let importJobsService: { create: jest.Mock };
 
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
-    service = new RoomsService(prisma, auditHook as unknown as AuditHookService);
+    importJobsService = { create: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+    service = new RoomsService(prisma, auditHook as unknown as AuditHookService, importJobsService as any);
   });
 
   describe('create — seat map generation from rows×columns', () => {
@@ -302,6 +305,65 @@ describe('RoomsService — Phase 11 (rooms, seats, availability calendar)', () =
 
       const calledWith = prisma.room.findMany.mock.calls[0][0];
       expect(calledWith.where).not.toHaveProperty('capacity');
+    });
+  });
+
+  describe('generateBulkImportTemplate', () => {
+    it('uses a real existing room as the example row instead of a fictional placeholder', async () => {
+      prisma.room.findFirst.mockResolvedValue({ building: 'North Wing', roomNumber: 'N-204', floor: 2, capacity: 48, rows: 8, columns: 6 });
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.building).toBe('North Wing');
+      expect(row.room_number).toBe('N-204');
+      expect(row.capacity).toBe('48');
+    });
+
+    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
+      prisma.room.findFirst.mockResolvedValue(null);
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.building).toBe('Main Block');
+    });
+  });
+
+  describe('bulkImport', () => {
+    it('imports a valid row', async () => {
+      prisma.room.findUnique.mockResolvedValue(null);
+      prisma.__tx.room.create.mockResolvedValue({ id: 'r1', building: 'Main Block', roomNumber: 'A101' });
+      const buffer = await buildXlsxBuffer(
+        ['building', 'room_number', 'floor', 'capacity', 'rows', 'columns'],
+        [['Main Block', 'A101', 1, 60, 10, 6]],
+      );
+
+      await service.bulkImport(buffer, admin);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 1,
+          failureCount: 0,
+          results: [{ row: 2, status: 'SUCCESS', id: 'r1' }],
+        }),
+      );
+    });
+
+    it('reports an existing (building, room_number) combination as a per-row FAILURE', async () => {
+      prisma.room.findUnique.mockResolvedValue({ id: 'existing', building: 'Main Block', roomNumber: 'A101' });
+      const buffer = await buildXlsxBuffer(
+        ['building', 'room_number', 'floor', 'capacity', 'rows', 'columns'],
+        [['Main Block', 'A101', 1, 60, 10, 6]],
+      );
+
+      await service.bulkImport(buffer, admin);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 0,
+          failureCount: 1,
+          results: [expect.objectContaining({ row: 2, status: 'FAILURE', error: expect.stringContaining('already exists') })],
+        }),
+      );
     });
   });
 });

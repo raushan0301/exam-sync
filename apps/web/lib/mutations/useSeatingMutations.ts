@@ -43,6 +43,30 @@ export function useGenerateSeating(examSessionId: string) {
 }
 
 /**
+ * POST /exam-sessions/{id}/seating/regenerate — FACULTY only. Unlike
+ * `generate`, this is NOT idempotent by design — it marks the room's
+ * current DRAFT/VALIDATED/FAILED plan SUPERSEDED and always creates a
+ * fresh one with the given strategy. Lets a faculty change strategy after
+ * seeing the generated result but before finalizing; 409s if that room's
+ * plan is already FINALIZED (finalization is a one-way door).
+ */
+export function useRegenerateSeating(examSessionId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: GenerateSeatingInput) =>
+      apiFetch<SeatingGenerationSummary>(`/exam-sessions/${examSessionId}/seating/regenerate`, {
+        method: 'POST',
+        body: input,
+      }),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.examSession(examSessionId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.seatingPlan(data.seating_plan_id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.seatingJob(data.job_id) });
+    },
+  });
+}
+
+/**
  * POST /seating-plans/{id}/finalize — ADMIN only, no body. Re-validates
  * fresh (ADR-004) rather than trusting the plan's stale VALIDATED status,
  * so it can 409 in two DISTINCT ways that must be surfaced differently to

@@ -28,9 +28,13 @@ export interface UpdateSessionQuizzesInput {
  * version-conflict against on creation.
  */
 export function useCreateExamSession() {
+  const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (input: CreateExamSessionInput) =>
       apiFetch<ExamSession>('/exam-sessions', { method: 'POST', body: input }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'list'] });
+    },
   });
 }
 
@@ -49,6 +53,13 @@ export function useUpdateSessionQuizzes(id: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.examSession(id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.examSessionConflicts(id) });
+      // The list view (admin "Exam Sessions" / faculty "My Exam Sessions")
+      // is a SIBLING query key (['exam-sessions','list',...]), not a
+      // parent of `examSession(id)` (['exam-sessions','detail',id]) — so
+      // invalidating the detail key alone never touches it. Without this,
+      // the list keeps showing the pre-attach quiz count/status for up to
+      // its 30s staleTime after navigating back to it.
+      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'list'] });
     },
   });
 }
@@ -67,6 +78,7 @@ export function useRescheduleExamSession(id: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.examSession(id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.examSessionConflicts(id) });
+      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'list'] });
     },
   });
 }
@@ -84,6 +96,7 @@ export function useCancelExamSession(id: string) {
       apiFetch<ExamSession>(`/exam-sessions/${id}/cancel`, { method: 'POST', body: { reason } }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.examSession(id) });
+      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'list'] });
     },
   });
 }

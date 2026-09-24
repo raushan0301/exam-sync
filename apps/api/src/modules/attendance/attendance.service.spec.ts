@@ -29,9 +29,9 @@ function buildPrismaMock() {
   } as any;
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: [ROLE.ADMIN] };
-const facultyActor: AuthenticatedUser = { id: 'user-fac-1', email: 'f@example.com', roles: [ROLE.FACULTY] };
-const otherFacultyActor: AuthenticatedUser = { id: 'user-fac-2', email: 'f2@example.com', roles: [ROLE.FACULTY] };
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: [ROLE.ADMIN], mustChangePassword: false };
+const facultyActor: AuthenticatedUser = { id: 'user-fac-1', email: 'f@example.com', roles: [ROLE.FACULTY], mustChangePassword: false };
+const otherFacultyActor: AuthenticatedUser = { id: 'user-fac-2', email: 'f2@example.com', roles: [ROLE.FACULTY], mustChangePassword: false };
 
 const inProgressSession = { id: 's1', status: ExamSessionStatus.IN_PROGRESS };
 
@@ -290,6 +290,30 @@ describe('AttendanceService', () => {
       );
     });
 
+    it('includes the student/quiz/seat labels — the raw row only carries ids, which the overview table can\'t render usefully', async () => {
+      examSessionsService.findById.mockResolvedValue(inProgressSession);
+      prisma.attendance.findMany.mockResolvedValue([
+        {
+          id: 'att-1',
+          quizStudentAssignment: { student: { name: 'Jane Doe', rollNumber: 'R001' }, quiz: { title: 'Midterm' } },
+          seat: { seatLabel: 'A1' },
+        },
+      ]);
+
+      const result = await service.listForSession('s1', admin, {});
+
+      expect(prisma.attendance.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: {
+            quizStudentAssignment: { select: { student: { select: { name: true, rollNumber: true } }, quiz: { select: { title: true } } } },
+            seat: { select: { seatLabel: true } },
+          },
+        }),
+      );
+      expect(result.items[0].quizStudentAssignment.student.name).toBe('Jane Doe');
+      expect(result.items[0].seat.seatLabel).toBe('A1');
+    });
+
     it('a faculty invigilating no room in this session gets an empty page, not an error', async () => {
       examSessionsService.findById.mockResolvedValue(inProgressSession);
       facultyService.findByUserId.mockResolvedValue({ id: 'fac-1' });
@@ -322,7 +346,7 @@ describe('AttendanceService', () => {
       studentsService.findById.mockResolvedValue({ id: 'stu-1', userId: 'user-stu-1' });
       prisma.attendance.findMany.mockResolvedValue([{ id: 'att-1' }]);
 
-      const selfActor: AuthenticatedUser = { id: 'user-stu-1', email: 's@example.com', roles: [ROLE.STUDENT] };
+      const selfActor: AuthenticatedUser = { id: 'user-stu-1', email: 's@example.com', roles: [ROLE.STUDENT], mustChangePassword: false };
       const result = await service.getHistoryForStudent('stu-1', selfActor, {});
 
       expect(result.items).toHaveLength(1);
@@ -331,7 +355,7 @@ describe('AttendanceService', () => {
     it('404s (not 403) when a student requests a DIFFERENT student\'s history', async () => {
       studentsService.findById.mockResolvedValue({ id: 'stu-1', userId: 'user-stu-1' });
 
-      const otherStudent: AuthenticatedUser = { id: 'user-stu-2', email: 's2@example.com', roles: [ROLE.STUDENT] };
+      const otherStudent: AuthenticatedUser = { id: 'user-stu-2', email: 's2@example.com', roles: [ROLE.STUDENT], mustChangePassword: false };
       await expect(service.getHistoryForStudent('stu-1', otherStudent, {})).rejects.toThrow(NotFoundException);
     });
   });

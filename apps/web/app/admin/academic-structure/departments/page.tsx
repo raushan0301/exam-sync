@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Plus } from 'lucide-react';
+import { Plus, Upload } from 'lucide-react';
 import {
   Button,
   Input,
@@ -20,8 +20,15 @@ import {
 } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { useDepartments } from '@/lib/queries/useDepartments';
-import { useCreateDepartment, useUpdateDepartment } from '@/lib/mutations/useDepartmentMutations';
+import {
+  useCreateDepartment,
+  useUpdateDepartment,
+  useBulkImportDepartments,
+  downloadDepartmentTemplate,
+} from '@/lib/mutations/useDepartmentMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { Department } from '@/lib/queries/types';
 
@@ -38,6 +45,7 @@ export default function DepartmentsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Department | null>(null);
   const [deactivating, setDeactivating] = useState<Department | null>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = useDepartments({
     search,
@@ -49,6 +57,7 @@ export default function DepartmentsPage() {
   const createMutation = useCreateDepartment();
   const updateMutation = useUpdateDepartment(editing?.id ?? '');
   const deactivateMutation = useUpdateDepartment(deactivating?.id ?? '');
+  const bulkImportMutation = useBulkImportDepartments();
 
   const form = useForm<DepartmentFormValues>({
     resolver: zodResolver(departmentSchema),
@@ -108,9 +117,18 @@ export default function DepartmentsPage() {
           <h1 className="text-xl font-semibold text-text">Departments</h1>
           <p className="text-sm text-text-muted">Manage academic departments.</p>
         </div>
-        <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
-          New Department
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            leadingIcon={<Upload size={16} aria-hidden="true" />}
+            onClick={() => setBulkImportOpen(true)}
+          >
+            Bulk Import
+          </Button>
+          <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
+            New Department
+          </Button>
+        </div>
       </div>
 
       <FilterBar>
@@ -189,6 +207,15 @@ export default function DepartmentsPage() {
         destructive={deactivating?.status === 'ACTIVE'}
         loading={deactivateMutation.isPending}
         onConfirm={confirmDeactivate}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Department"
+        onDownloadTemplate={downloadDepartmentTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

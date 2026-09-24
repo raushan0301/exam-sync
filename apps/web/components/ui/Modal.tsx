@@ -47,14 +47,14 @@ export function Modal({
           onPointerDownOutside={(e) => preventDismiss && e.preventDefault()}
           onInteractOutside={(e) => preventDismiss && e.preventDefault()}
           className={cn(
-            'fixed left-1/2 top-1/2 z-modal w-[calc(100%-32px)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-surface shadow-elevated',
+            'fixed left-1/2 top-1/2 z-modal flex max-h-[85vh] w-[calc(100%-32px)] -translate-x-1/2 -translate-y-1/2 flex-col rounded-lg border border-border bg-surface shadow-elevated',
             'focus:outline-none',
             // Full-screen below `sm` per UX doc §12 responsive rule for Modal/Drawer.
-            'sm:w-full max-sm:fixed max-sm:inset-4 max-sm:top-4 max-sm:left-4 max-sm:translate-x-0 max-sm:translate-y-0 max-sm:h-[calc(100%-32px)] max-sm:overflow-y-auto',
+            'sm:w-full max-sm:fixed max-sm:inset-4 max-sm:top-4 max-sm:left-4 max-sm:h-[calc(100%-32px)] max-sm:max-h-none max-sm:translate-x-0 max-sm:translate-y-0',
           )}
           style={{ maxWidth }}
         >
-          <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-4">
+          <div className="flex shrink-0 items-start justify-between gap-4 border-b border-border px-5 py-4">
             <div>
               <Dialog.Title className="text-lg font-semibold text-text">{title}</Dialog.Title>
               {description && (
@@ -67,8 +67,8 @@ export function Modal({
               <IconButton icon={<X size={18} />} aria-label="Close dialog" size="md" />
             </Dialog.Close>
           </div>
-          <div className="px-5 py-4">{children}</div>
-          {footer && <div className="flex justify-end gap-2 border-t border-border px-5 py-4">{footer}</div>}
+          <div className="overflow-y-auto px-5 py-4">{children}</div>
+          {footer && <div className="flex shrink-0 justify-end gap-2 border-t border-border px-5 py-4">{footer}</div>}
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

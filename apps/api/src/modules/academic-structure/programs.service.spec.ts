@@ -1,4 +1,5 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
+import { buildXlsxBuffer, readTemplateExampleRow } from '../../common/bulk-import/test-utils';
 import { Prisma, AcademicStatus } from '@exam-sync/db';
 import { ProgramsService } from './programs.service';
 import { DepartmentsService } from './departments.service';
@@ -13,6 +14,7 @@ function buildPrismaMock() {
     program: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
     },
@@ -21,23 +23,45 @@ function buildPrismaMock() {
   } as any;
 }
 
-const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const actor: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('ProgramsService', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
-  let departmentsService: { findById: jest.Mock };
+  let departmentsService: { findById: jest.Mock; findByCode: jest.Mock };
+  let importJobsService: { create: jest.Mock };
   let service: ProgramsService;
 
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
-    departmentsService = { findById: jest.fn() };
+    departmentsService = { findById: jest.fn(), findByCode: jest.fn() };
+    importJobsService = { create: jest.fn().mockResolvedValue({ id: 'job-1' }) };
     service = new ProgramsService(
       prisma,
       auditHook as unknown as AuditHookService,
       departmentsService as unknown as DepartmentsService,
+      importJobsService as any,
     );
+  });
+
+  describe('generateBulkImportTemplate', () => {
+    it('uses a real existing program (+ its department\'s real code) as the example row', async () => {
+      prisma.program.findFirst.mockResolvedValue({ id: 'p1', code: 'BTECH-ECE', name: 'B.Tech ECE', department: { code: 'ECE' } });
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.department_code).toBe('ECE');
+      expect(row.code).toBe('BTECH-ECE');
+    });
+
+    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
+      prisma.program.findFirst.mockResolvedValue(null);
+
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+      expect(row.code).toBe('BTECH-CSE');
+    });
   });
 
   describe('create', () => {
@@ -107,6 +131,65 @@ describe('ProgramsService', () => {
     it('throws 409 for an inactive program', async () => {
       prisma.program.findUnique.mockResolvedValue({ id: 'p1', code: 'BTCSE', status: AcademicStatus.INACTIVE });
       await expect(service.assertActiveOrThrow('p1')).rejects.toThrow(ConflictException);
+    });
+  });
+
+  describe('bulkImport', () => {
+    it('resolves department_code to department_id and imports the row', async () => {
+      departmentsService.findByCode.mockResolvedValue({ id: 'd1', code: 'CSE' });
+      prisma.program.findUnique.mockResolvedValue(null);
+      prisma.__tx.program.create.mockResolvedValue({ id: 'p1', code: 'BTCSE' });
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'code', 'name'],
+        [['CSE', 'BTCSE', 'B.Tech CSE']],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 1,
+          failureCount: 0,
+          results: [{ row: 2, status: 'SUCCESS', id: 'p1' }],
+        }),
+      );
+    });
+
+    it('reports a duplicate code as a per-row FAILURE', async () => {
+      departmentsService.findByCode.mockResolvedValue({ id: 'd1', code: 'CSE' });
+      prisma.program.findUnique.mockResolvedValue({ id: 'existing', code: 'BTCSE' });
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'code', 'name'],
+        [['CSE', 'BTCSE', 'B.Tech CSE']],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 0,
+          failureCount: 1,
+          results: [expect.objectContaining({ row: 2, status: 'FAILURE' })],
+        }),
+      );
+    });
+
+    it('reports an unresolvable department_code as a per-row FAILURE', async () => {
+      departmentsService.findByCode.mockResolvedValue(null);
+      const buffer = await buildXlsxBuffer(
+        ['department_code', 'code', 'name'],
+        [['MISSING', 'BTCSE', 'B.Tech CSE']],
+      );
+
+      await service.bulkImport(buffer, actor);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 0,
+          failureCount: 1,
+          results: [expect.objectContaining({ status: 'FAILURE', error: expect.stringContaining('MISSING') })],
+        }),
+      );
     });
   });
 });

@@ -1,7 +1,7 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ExamSessionStatus, Prisma, QuizStatus, QuizStudentAssignmentStatus } from '@exam-sync/db';
 import { StudentAssignmentService } from './student-assignment.service';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService } from '../conflict-engine';
 import { QuizzesService } from '../quiz';
 import { StudentsService } from '../students';
@@ -41,7 +41,7 @@ function p2002(): Prisma.PrismaClientKnownRequestError {
   });
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('StudentAssignmentService — eligibility-derived assignment, roster add/remove, real BR-019 conflict-checking (Phase 10)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
@@ -52,6 +52,7 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
   let quizzesService: { findById: jest.Mock; getBatchIds: jest.Mock };
   let studentsService: { findById: jest.Mock };
   let enrollmentsService: { findEligibleStudentIds: jest.Mock };
+  let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let service: StudentAssignmentService;
 
   beforeEach(() => {
@@ -63,6 +64,7 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
     quizzesService = { findById: jest.fn(), getBatchIds: jest.fn() };
     studentsService = { findById: jest.fn() };
     enrollmentsService = { findEligibleStudentIds: jest.fn() };
+    examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
 
     service = new StudentAssignmentService(
       prisma,
@@ -73,6 +75,7 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
       quizzesService as unknown as QuizzesService,
       studentsService as unknown as StudentsService,
       enrollmentsService as unknown as EnrollmentsService,
+      examSessionOwnershipService as unknown as ExamSessionOwnershipService,
     );
   });
 
@@ -83,6 +86,14 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
       examSessionsService.findById.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED });
 
       await expect(service.assignStudents('s1', admin)).rejects.toThrow(ConflictException);
+      expect(prisma.examSessionQuiz.findMany).not.toHaveBeenCalled();
+    });
+
+    it('404s a faculty who owns/co-instructs none of the session\'s attached quizzes — faculty-lifecycle-ownership gate', async () => {
+      examSessionsService.findById.mockResolvedValue(draftSession);
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(service.assignStudents('s1', admin)).rejects.toThrow(NotFoundException);
       expect(prisma.examSessionQuiz.findMany).not.toHaveBeenCalled();
     });
 
@@ -178,7 +189,14 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
       quizzesService.getBatchIds.mockResolvedValue(['batch-A']);
       enrollmentsService.findEligibleStudentIds.mockResolvedValue(['student-1', 'student-2']);
       conflictEngine.checkSessionAssembly.mockResolvedValue({
-        hard: [{ type: 'STUDENT_OVERLAP', studentId: 'student-1', conflictingExamSessionId: 'other-session', message: 'overlap' }],
+        hard: [
+          {
+            type: 'STUDENT_OVERLAP',
+            studentId: 'student-1',
+            conflictingExamSessionId: 'other-session',
+            message: 'Test Student (100001) already has an active assignment in "Other Exam", whose time window overlaps this session (BR-019).',
+          },
+        ],
         warnings: [],
       });
       prisma.__tx.quizStudentAssignment.upsert.mockResolvedValue({ id: 'quiz-1:student-2' });
@@ -243,6 +261,16 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
       await expect(
         service.addRosterEntry('s1', 'student-1', { quiz_id: 'quiz-1' }, admin),
       ).rejects.toThrow(ConflictException);
+      expect(prisma.examSessionQuiz.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('404s a faculty who owns/co-instructs none of the session\'s attached quizzes — faculty-lifecycle-ownership gate', async () => {
+      examSessionsService.findById.mockResolvedValue(activeSession);
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(
+        service.addRosterEntry('s1', 'student-1', { quiz_id: 'quiz-1' }, admin),
+      ).rejects.toThrow(NotFoundException);
       expect(prisma.examSessionQuiz.findFirst).not.toHaveBeenCalled();
     });
 
@@ -316,7 +344,7 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
       expect(prisma.quizStudentAssignment.upsert).toHaveBeenCalledWith({
         where: { quizId_studentId: { quizId: 'quiz-1', studentId: 'student-1' } },
         create: { quizId: 'quiz-1', examSessionId: 's1', studentId: 'student-1', status: QuizStudentAssignmentStatus.ASSIGNED },
-        update: { status: QuizStudentAssignmentStatus.ASSIGNED, assignedAt: expect.any(Date), cancelledAt: null },
+        update: { examSessionId: 's1', status: QuizStudentAssignmentStatus.ASSIGNED, assignedAt: expect.any(Date), cancelledAt: null },
       });
       expect(auditHook.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'REACTIVATE' }),
@@ -385,6 +413,16 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
   });
 
   describe('removeRosterEntry — cancellation (EC-016), status change only, never a delete', () => {
+    it('404s a faculty who owns/co-instructs none of the session\'s attached quizzes — faculty-lifecycle-ownership gate', async () => {
+      examSessionsService.findById.mockResolvedValue({ id: 's1', status: ExamSessionStatus.ASSIGNING_STUDENTS });
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(
+        service.removeRosterEntry('s1', 'student-1', { quiz_id: 'quiz-1', reason: 'Withdrew' }, admin),
+      ).rejects.toThrow(NotFoundException);
+      expect(prisma.quizStudentAssignment.findUnique).not.toHaveBeenCalled();
+    });
+
     it('404s when no assignment exists for (quiz, student) in this session', async () => {
       examSessionsService.findById.mockResolvedValue({ id: 's1', status: ExamSessionStatus.ASSIGNING_STUDENTS });
       prisma.quizStudentAssignment.findUnique.mockResolvedValue(null);
@@ -448,12 +486,24 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
     it('returns a paginated page of roster rows for the session', async () => {
       examSessionsService.findByIdScoped.mockResolvedValue({ id: 's1' });
       prisma.quizStudentAssignment.findMany.mockResolvedValue([
-        { id: 'a1', quizId: 'quiz-1', studentId: 'student-1', status: QuizStudentAssignmentStatus.ASSIGNED },
+        {
+          id: 'a1',
+          quizId: 'quiz-1',
+          studentId: 'student-1',
+          status: QuizStudentAssignmentStatus.ASSIGNED,
+          quiz: { title: 'DBMS Quiz' },
+          student: { name: 'Test Student', rollNumber: '100001' },
+        },
       ]);
 
       const result = await service.getRoster('s1', admin, {});
 
       expect(result.items).toHaveLength(1);
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({ quizTitle: 'DBMS Quiz', studentName: 'Test Student', studentRollNumber: '100001' }),
+      );
+      expect(result.items[0]).not.toHaveProperty('quiz');
+      expect(result.items[0]).not.toHaveProperty('student');
       expect(result.next_cursor).toBeNull();
     });
 
@@ -468,6 +518,24 @@ describe('StudentAssignmentService — eligibility-derived assignment, roster ad
           where: { examSessionId: 's1', status: QuizStudentAssignmentStatus.CANCELLED },
         }),
       );
+    });
+
+    it("resolves the quiz's title off this row's own quiz relation — stays correct even after cancellation detaches the quiz from the session's active-attachment list", async () => {
+      examSessionsService.findByIdScoped.mockResolvedValue({ id: 's1', status: 'CANCELLED', quizzes: [] });
+      prisma.quizStudentAssignment.findMany.mockResolvedValue([
+        {
+          id: 'a1',
+          quizId: 'quiz-1',
+          studentId: 'student-1',
+          status: QuizStudentAssignmentStatus.ASSIGNED,
+          quiz: { title: 'DBMS Quiz' },
+          student: { name: 'Test Student', rollNumber: '100001' },
+        },
+      ]);
+
+      const result = await service.getRoster('s1', admin, {});
+
+      expect(result.items[0].quizTitle).toBe('DBMS Quiz');
     });
   });
 });

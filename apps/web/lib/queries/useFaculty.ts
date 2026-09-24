@@ -14,7 +14,7 @@ export interface UseFacultyParams {
   limit?: number;
 }
 
-/** GET /faculty — ADMIN-only. Supports search (faculty.controller.ts). */
+/** GET /faculty — ADMIN or FACULTY (used by InvigilatorPanel's "Assign Invigilator" picker). Supports search (faculty.controller.ts). */
 export function useFaculty(params: UseFacultyParams = {}) {
   const query: Record<string, string | undefined> = {
     status: params.status,
@@ -29,5 +29,22 @@ export function useFaculty(params: UseFacultyParams = {}) {
     queryFn: () => apiFetch<PaginatedResult<Faculty>>('/faculty', { query }),
     enabled: hasStoredSession(),
     staleTime: 30_000,
+  });
+}
+
+/**
+ * GET /faculty/me — resolves the calling FACULTY's own Faculty row.
+ * `GET /users/me` has a fixed, documented shape with no `facultyId`, so
+ * this is the only way pages like "My Invigilation Duties"/"My
+ * Assignments" can learn their own faculty id to call their own
+ * faculty-scoped GETs. 404s for a non-faculty actor.
+ */
+export function useMyFaculty() {
+  return useQuery({
+    queryKey: ['faculty', 'me'] as const,
+    queryFn: () => apiFetch<Faculty>('/faculty/me'),
+    enabled: hasStoredSession(),
+    staleTime: 5 * 60_000,
+    retry: false,
   });
 }

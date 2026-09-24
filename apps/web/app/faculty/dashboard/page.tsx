@@ -8,7 +8,10 @@ import { StatusBreakdown } from '@/components/dashboard/StatusBreakdown';
 import { NotificationsPanel } from '@/components/dashboard/NotificationsPanel';
 import { useQuizzes } from '@/lib/queries/useQuizzes';
 import { useIncidents } from '@/lib/queries/useIncidents';
+import { useMyFaculty } from '@/lib/queries/useFaculty';
+import { useInvigilationDuties } from '@/lib/queries/useInvigilationDuties';
 import { mapError } from '@/lib/error-mapping';
+import { formatTime } from '@/lib/format-time';
 import type { QuizStatus } from '@/lib/queries/types';
 
 const QUIZ_STATUS_ORDER: QuizStatus[] = ['DRAFT', 'SUBMITTED', 'APPROVED', 'REJECTED'];
@@ -20,16 +23,17 @@ const QUIZ_STATUS_ORDER: QuizStatus[] = ['DRAFT', 'SUBMITTED', 'APPROVED', 'REJE
  * needed). Fetched unfiltered and bucketed client-side rather than one
  * call per status, since a faculty member's own quiz count is small.
  *
- * Deliberately OMITTED vs. the architecture doc: "My Assignments," "My
- * Invigilation Duties," and "Exam Sessions" sections. Those need either a
- * faculty-domain-entity id (GET /users/me only returns the User row id,
- * not the Faculty row id that GET /faculty/{id}/assignments etc. require)
- * or a GET /exam-sessions list endpoint — neither exists on the real
- * backend today. See the milestone report for the full gap writeup.
+ * "Invigilation Duties" resolves the caller's own Faculty row via
+ * `GET /faculty/me` (added specifically to unblock this and "My
+ * Invigilation Duties"), then fetches the duty list itself. "My
+ * Assignments" and "Exam Sessions" sections remain deliberately omitted —
+ * see this app's other faculty pages for those.
  */
 export default function FacultyDashboardPage() {
   const myQuizzes = useQuizzes({ limit: 200 });
   const myIncidents = useIncidents({ limit: 200 });
+  const myFaculty = useMyFaculty();
+  const myDuties = useInvigilationDuties(myFaculty.data?.id, { limit: 5 });
 
   const quizStatusCounts = (myQuizzes.data?.items ?? []).reduce<Record<string, number>>((acc, q) => {
     acc[q.status] = (acc[q.status] ?? 0) + 1;
@@ -102,11 +106,36 @@ export default function FacultyDashboardPage() {
       </Card>
 
       <Card header={<h2 className="text-sm font-semibold text-text">Invigilation Duties</h2>}>
-        <EmptyState
-          icon={<ClipboardCheck size={28} />}
-          title="Coming soon"
-          description="Invigilation duties aren't available yet — the backend doesn't currently expose a way to resolve your faculty profile from your login, which this feature depends on."
-        />
+        {myFaculty.isLoading || (myFaculty.data && myDuties.isLoading) ? (
+          <div className="flex gap-3">
+            <div className="h-6 w-40 animate-pulse rounded bg-neutral-200" />
+          </div>
+        ) : myFaculty.isError || myDuties.isError ? (
+          <ErrorState
+            description={myDuties.error ? mapError(myDuties.error).description : "Couldn't resolve your faculty record."}
+            onRetry={() => myDuties.refetch()}
+            retrying={myDuties.isFetching}
+          />
+        ) : (myDuties.data?.items.length ?? 0) === 0 ? (
+          <EmptyState
+            icon={<ClipboardCheck size={28} />}
+            title="No invigilation duties yet"
+            description="Rooms you've been assigned to invigilate will appear here."
+          />
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {myDuties.data!.items.map((d) => (
+              <li key={d.id} className="flex items-center justify-between rounded border border-border px-3 py-2 text-sm">
+                <span className="text-text">
+                  {d.examSession.name} — {d.room.building} · {d.room.roomNumber}
+                </span>
+                <span className="text-text-muted">
+                  {d.examSession.sessionDate.slice(0, 10)} · {formatTime(d.examSession.startTime)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
       </Card>
 
       <NotificationsPanel />

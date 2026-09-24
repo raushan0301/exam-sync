@@ -20,6 +20,7 @@ export function useAssignStudents(examSessionId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.examSession(examSessionId) });
       queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'roster', examSessionId] });
+      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'list'] });
     },
   });
 }

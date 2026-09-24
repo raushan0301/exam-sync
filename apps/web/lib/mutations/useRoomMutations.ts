@@ -3,6 +3,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
 import { queryKeys } from '../queries/queryKeys';
+import { downloadBulkImportTemplate, uploadBulkImportFile } from './bulk-import-helpers';
 import type { AvailabilityBlock, Room, RoomSeat, RoomStatus } from '../queries/types';
 
 export interface CreateRoomInput {
@@ -82,4 +83,20 @@ export function useCreateAvailabilityBlock(roomId: string) {
       queryClient.invalidateQueries({ queryKey: ['rooms', 'availability-blocks', roomId] });
     },
   });
+}
+
+/** POST /rooms/bulk-import — multipart/form-data, field name `file`. */
+export function useBulkImportRooms() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (file: File) => uploadBulkImportFile('rooms', file),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['rooms', 'list'] });
+    },
+  });
+}
+
+/** GET /rooms/bulk-import/template — downloads the .xlsx template via the browser. */
+export function downloadRoomTemplate() {
+  return downloadBulkImportTemplate('rooms', 'room-bulk-import-template.xlsx');
 }

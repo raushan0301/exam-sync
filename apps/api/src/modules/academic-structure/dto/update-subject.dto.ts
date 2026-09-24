@@ -1,4 +1,4 @@
-import { IsBoolean, IsInt, IsOptional, IsString, IsUUID, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsNumber, IsOptional, IsString, IsUUID, Min, MinLength } from 'class-validator';
 
 export class UpdateSubjectDto {
   @IsOptional()
@@ -20,7 +20,7 @@ export class UpdateSubjectDto {
   name?: string;
 
   @IsOptional()
-  @IsInt()
+  @IsNumber()
   @Min(0)
   credits?: number;
 

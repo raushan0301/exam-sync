@@ -13,11 +13,15 @@ import { LoadingState } from '@/components/ui/LoadingState';
  * - While identity is still loading: shows a loading state (no flash of
  *   protected content, no premature redirect).
  * - Unauthenticated: redirects to /login?redirect=<encoded current path>.
+ * - Authenticated but `mustChangePassword`: redirects to /change-password —
+ *   this is UX-layer only; the real enforcement is server-side
+ *   (JwtAuthGuard blocks every other endpoint with a 403), so skipping this
+ *   redirect (e.g. by navigating directly) still can't reach anything.
  * - Authenticated but wrong role: handled by RoleGate (renders Forbidden),
  *   not here — AuthGuard only checks "is anyone logged in at all."
  */
 export function AuthGuard({ children }: { children: ReactNode }) {
-  const { isLoading, isAuthenticated } = useIdentity();
+  const { isLoading, isAuthenticated, user } = useIdentity();
   const router = useRouter();
   const pathname = usePathname();
 
@@ -28,12 +32,24 @@ export function AuthGuard({ children }: { children: ReactNode }) {
     }
   }, [isLoading, isAuthenticated, pathname, router]);
 
+  useEffect(() => {
+    if (!isLoading && isAuthenticated && user?.mustChangePassword && pathname !== '/change-password') {
+      router.replace('/change-password');
+    }
+  }, [isLoading, isAuthenticated, user, pathname, router]);
+
   if (isLoading) {
     return <LoadingState className="flex min-h-screen items-center justify-center" />;
   }
 
   if (!isAuthenticated) {
     // Redirect effect above is in flight; render nothing to avoid a flash.
+    return <LoadingState className="flex min-h-screen items-center justify-center" />;
+  }
+
+  if (user?.mustChangePassword && pathname !== '/change-password') {
+    // Redirect effect above is in flight; render nothing to avoid a flash
+    // of protected content before it fires.
     return <LoadingState className="flex min-h-screen items-center justify-center" />;
   }
 

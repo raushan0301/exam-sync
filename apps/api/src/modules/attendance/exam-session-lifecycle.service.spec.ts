@@ -1,7 +1,7 @@
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ExamSessionStatus, SeatingPlanStatus } from '@exam-sync/db';
 import { ExamSessionLifecycleService } from './exam-session-lifecycle.service';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 
@@ -19,22 +19,25 @@ function buildPrismaMock() {
   } as any;
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: [ROLE.ADMIN] };
+const faculty: AuthenticatedUser = { id: 'fac-1', email: 'faculty@example.com', roles: [ROLE.FACULTY], mustChangePassword: false };
 
 describe('ExamSessionLifecycleService', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
   let examSessionsService: { findById: jest.Mock };
+  let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let service: ExamSessionLifecycleService;
 
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
     examSessionsService = { findById: jest.fn() };
+    examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
     service = new ExamSessionLifecycleService(
       prisma,
       auditHook as unknown as AuditHookService,
       examSessionsService as unknown as ExamSessionsService,
+      examSessionOwnershipService as unknown as ExamSessionOwnershipService,
     );
   });
 
@@ -42,7 +45,7 @@ describe('ExamSessionLifecycleService', () => {
     it('rejects starting from a non-READY_FOR_FINALIZATION status', async () => {
       examSessionsService.findById.mockResolvedValue({ id: 's1', status: ExamSessionStatus.DRAFT });
 
-      await expect(service.start('s1', admin)).rejects.toThrow(ConflictException);
+      await expect(service.start('s1', faculty)).rejects.toThrow(ConflictException);
     });
 
     it('rejects when a session has zero allocated rooms', async () => {
@@ -50,7 +53,7 @@ describe('ExamSessionLifecycleService', () => {
       prisma.examSessionRoom.findMany.mockResolvedValue([]);
       prisma.seatingPlan.findMany.mockResolvedValue([]);
 
-      await expect(service.start('s1', admin)).rejects.toThrow(ConflictException);
+      await expect(service.start('s1', faculty)).rejects.toThrow(ConflictException);
     });
 
     it('rejects when a room\'s seating plan is not FINALIZED', async () => {
@@ -61,7 +64,7 @@ describe('ExamSessionLifecycleService', () => {
         { roomId: 'room-2', status: SeatingPlanStatus.VALIDATED },
       ]);
 
-      await expect(service.start('s1', admin)).rejects.toThrow(ConflictException);
+      await expect(service.start('s1', faculty)).rejects.toThrow(ConflictException);
       expect(prisma.examSession.update).not.toHaveBeenCalled();
     });
 
@@ -71,7 +74,7 @@ describe('ExamSessionLifecycleService', () => {
       prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1', status: SeatingPlanStatus.FINALIZED }]);
       prisma.__tx.examSession.update.mockResolvedValue({ id: 's1', status: ExamSessionStatus.IN_PROGRESS, version: 2 });
 
-      const result = await service.start('s1', admin);
+      const result = await service.start('s1', faculty);
 
       expect(result.status).toBe(ExamSessionStatus.IN_PROGRESS);
       expect(prisma.__tx.examSession.update).toHaveBeenCalledWith({
@@ -83,20 +86,28 @@ describe('ExamSessionLifecycleService', () => {
         expect.anything(),
       );
     });
+
+    it('propagates the 404 a non-owning faculty member would get (IDOR-safe — faculty-lifecycle-ownership fix)', async () => {
+      examSessionsService.findById.mockResolvedValue({ id: 's1', status: ExamSessionStatus.READY_FOR_FINALIZATION });
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(service.start('s1', faculty)).rejects.toThrow(NotFoundException);
+      expect(prisma.examSession.update).not.toHaveBeenCalled();
+    });
   });
 
   describe('complete', () => {
     it('rejects completing a non-IN_PROGRESS session', async () => {
       examSessionsService.findById.mockResolvedValue({ id: 's1', status: ExamSessionStatus.NOTIFIED });
 
-      await expect(service.complete('s1', admin)).rejects.toThrow(ConflictException);
+      await expect(service.complete('s1', faculty)).rejects.toThrow(ConflictException);
     });
 
     it('transitions to COMPLETED and locks every attendance row for the session in the same transaction (BR-034)', async () => {
       examSessionsService.findById.mockResolvedValue({ id: 's1', status: ExamSessionStatus.IN_PROGRESS });
       prisma.__tx.examSession.update.mockResolvedValue({ id: 's1', status: ExamSessionStatus.COMPLETED, version: 3 });
 
-      const result = await service.complete('s1', admin);
+      const result = await service.complete('s1', faculty);
 
       expect(result.status).toBe(ExamSessionStatus.COMPLETED);
       expect(prisma.__tx.attendance.updateMany).toHaveBeenCalledWith({
@@ -107,6 +118,14 @@ describe('ExamSessionLifecycleService', () => {
         expect.objectContaining({ action: 'UPDATE', entityType: 'ExamSession' }),
         expect.anything(),
       );
+    });
+
+    it('propagates the 404 a non-owning faculty member would get (IDOR-safe — faculty-lifecycle-ownership fix)', async () => {
+      examSessionsService.findById.mockResolvedValue({ id: 's1', status: ExamSessionStatus.IN_PROGRESS });
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+      await expect(service.complete('s1', faculty)).rejects.toThrow(NotFoundException);
+      expect(prisma.examSession.update).not.toHaveBeenCalled();
     });
   });
 });

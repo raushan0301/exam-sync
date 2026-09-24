@@ -83,7 +83,56 @@ async function main() {
   }
 
   console.log('─'.repeat(55));
+
+  // ── 6. Domain profile rows for roles that need one ──────────────────────
+  // Faculty/Student are separate profile tables (added by later
+  // academic-structure phases, after this seed script already existed), and
+  // most of the app requires them — e.g. GET /quizzes 403s a FACULTY user
+  // with no Faculty row via `requireActingFaculty`. INVIGILATOR is folded
+  // into the Faculty table too (ExamInvigilator.facultyId). Best-effort:
+  // this script must still run standalone against a bare, freshly-migrated
+  // database (no departments/programs/batches yet), so each block skips
+  // with a warning instead of failing when its prerequisite data is absent.
+  await seedFacultyProfile('faculty@dev.local', 'Dev Faculty', 'DEVFAC');
+  await seedFacultyProfile('invigilator@dev.local', 'Dev Invigilator', 'DEVINV');
+  await seedStudentProfile('student@dev.local', 'Dev Student', 'DEVSTU001');
+
   console.log('\n✅ All dev users seeded successfully!\n');
+}
+
+async function seedFacultyProfile(email: string, name: string, employeeCode: string) {
+  const user = await prisma.user.findUniqueOrThrow({ where: { email } });
+  const existing = await prisma.faculty.findUnique({ where: { userId: user.id } });
+  if (existing) return;
+
+  const department = await prisma.department.findFirst();
+  if (!department) {
+    console.log(`  ⚠️  No department found — skipping Faculty profile for ${email} (seed academic structure first, then re-run).`);
+    return;
+  }
+
+  await prisma.faculty.create({
+    data: { userId: user.id, name, departmentId: department.id, employeeCode, status: 'ACTIVE' },
+  });
+  console.log(`  ✅ Faculty profile created for ${email}`);
+}
+
+async function seedStudentProfile(email: string, name: string, rollNumber: string) {
+  const user = await prisma.user.findUniqueOrThrow({ where: { email } });
+  const existing = await prisma.student.findUnique({ where: { userId: user.id } });
+  if (existing) return;
+
+  const program = await prisma.program.findFirst();
+  const batch = program ? await prisma.batch.findFirst({ where: { programId: program.id } }) : null;
+  if (!program || !batch) {
+    console.log(`  ⚠️  No program/batch found — skipping Student profile for ${email} (seed academic structure first, then re-run).`);
+    return;
+  }
+
+  await prisma.student.create({
+    data: { userId: user.id, name, programId: program.id, batchId: batch.id, rollNumber, status: 'ACTIVE' },
+  });
+  console.log(`  ✅ Student profile created for ${email}`);
 }
 
 main()

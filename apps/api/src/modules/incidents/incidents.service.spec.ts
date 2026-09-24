@@ -26,8 +26,8 @@ function buildPrismaMock() {
   } as any;
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: [ROLE.ADMIN] };
-const facultyActor: AuthenticatedUser = { id: 'user-fac-1', email: 'f@example.com', roles: [ROLE.FACULTY] };
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: [ROLE.ADMIN], mustChangePassword: false };
+const facultyActor: AuthenticatedUser = { id: 'user-fac-1', email: 'f@example.com', roles: [ROLE.FACULTY], mustChangePassword: false };
 
 const baseIncident = {
   id: 'inc-1',
@@ -386,6 +386,66 @@ describe('IncidentsService', () => {
       expect(prisma.incident.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({ status: IncidentStatus.OPEN, severity: IncidentSeverity.HIGH, examSessionId: 's1' }),
+        }),
+      );
+    });
+
+    it('resolves human-readable labels instead of leaving raw FK UUIDs for the UI to render', async () => {
+      prisma.incident.findMany.mockResolvedValue([
+        {
+          id: 'inc-1',
+          examSessionId: 'session-1',
+          roomId: 'room-1',
+          studentId: 'student-1',
+          quizId: 'quiz-1',
+          examSession: { name: 'Mid-Sem Slot A' },
+          room: { building: 'B', roomNumber: '209' },
+          student: { name: 'Test Student', rollNumber: '100001' },
+          quiz: { title: 'DBMS Quiz' },
+        },
+      ]);
+
+      const result = await service.list(admin, {});
+
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({
+          examSessionName: 'Mid-Sem Slot A',
+          roomLabel: 'B · Room 209',
+          studentLabel: 'Test Student (100001)',
+          quizTitle: 'DBMS Quiz',
+        }),
+      );
+      // The joined relation objects themselves must not leak onto the row —
+      // only the resolved label fields should be added.
+      expect(result.items[0]).not.toHaveProperty('examSession');
+      expect(result.items[0]).not.toHaveProperty('room');
+      expect(result.items[0]).not.toHaveProperty('student');
+      expect(result.items[0]).not.toHaveProperty('quiz');
+    });
+
+    it('resolves null labels for optional FKs that are absent (roomId/studentId/quizId all null)', async () => {
+      prisma.incident.findMany.mockResolvedValue([
+        {
+          id: 'inc-1',
+          examSessionId: 'session-1',
+          roomId: null,
+          studentId: null,
+          quizId: null,
+          examSession: { name: 'Mid-Sem Slot A' },
+          room: null,
+          student: null,
+          quiz: null,
+        },
+      ]);
+
+      const result = await service.list(admin, {});
+
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({
+          examSessionName: 'Mid-Sem Slot A',
+          roomLabel: null,
+          studentLabel: null,
+          quizTitle: null,
         }),
       );
     });

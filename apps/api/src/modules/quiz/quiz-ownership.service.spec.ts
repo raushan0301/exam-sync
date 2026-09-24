@@ -13,7 +13,7 @@ describe('QuizOwnershipService (ARCHITECTURE.md §AF)', () => {
   let facultyAssignmentsService: { hasActiveCoInstructorAssignment: jest.Mock };
   let service: QuizOwnershipService;
 
-  const actor: AuthenticatedUser = { id: 'user-1', email: 'f@example.com', roles: ['FACULTY'] };
+  const actor: AuthenticatedUser = { id: 'user-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
 
   beforeEach(() => {
     prisma = buildPrismaMock();

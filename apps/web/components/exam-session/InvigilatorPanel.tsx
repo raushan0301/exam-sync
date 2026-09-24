@@ -1,9 +1,10 @@
 'use client';
 
 import { useState } from 'react';
-import { Alert, Button, EmptyState, Modal, Select } from '@/components/ui';
+import { Alert, Button, ConfirmationDialog, EmptyState, ErrorState, Modal, Select, SkeletonText } from '@/components/ui';
 import { useFaculty } from '@/lib/queries/useFaculty';
-import { useAssignInvigilator } from '@/lib/mutations/useInvigilationMutations';
+import { useSessionInvigilators } from '@/lib/queries/useInvigilationDuties';
+import { useAssignInvigilator, useRemoveInvigilator } from '@/lib/mutations/useInvigilationMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { ExamSessionDetail, Invigilator, InvigilatorRole } from '@/lib/queries/types';
 
@@ -14,39 +15,43 @@ const ROLE_OPTIONS: { value: InvigilatorRole; label: string }[] = [
 
 export interface InvigilatorPanelProps {
   session: ExamSessionDetail;
+  /** Faculty-lifecycle-ownership change: ADMIN is now read-only for scheduling data — pass `true` to hide the Assign Invigilator action entirely. */
+  readOnly?: boolean;
 }
 
 /**
- * ADMIN "Invigilators" panel — assigns a faculty member to a room+role via
- * `POST /exam-sessions/{id}/invigilators`. There is deliberately NO
- * `GET /exam-sessions/{id}/invigilators` (or any session-scoped list)
- * endpoint on the real backend — `InvigilationController` exposes exactly
- * `assign` and `GET /faculty/{id}/invigilation-duties` (faculty-scoped,
- * not session-scoped) — so, same posture as `SeatingPanel`'s per-room
- * planId tracking, "current assignments" here is a session-local list
- * built from this panel's own successful `assign` calls, not fetched from
- * a persisted list. A page reload loses this local list (nothing is lost
- * server-side — the assignment still exists — it just can't be
- * re-displayed here without a list endpoint); this is disclosed in the
- * empty state's copy rather than silently presented as complete data.
+ * "Invigilators" panel — assigns a faculty member to a room+role via
+ * `POST /exam-sessions/{id}/invigilators`, and lists current assignments
+ * via `GET /exam-sessions/{id}/invigilators` (ADMIN unscoped / owning
+ * FACULTY scoped) — a persisted, reload-safe list, not local component
+ * state.
  */
-export function InvigilatorPanel({ session }: InvigilatorPanelProps) {
+export function InvigilatorPanel({ session, readOnly = false }: InvigilatorPanelProps) {
   const [open, setOpen] = useState(false);
   const [roomId, setRoomId] = useState('');
   const [facultyId, setFacultyId] = useState('');
   const [role, setRole] = useState<InvigilatorRole>('LEAD_INVIGILATOR');
-  const [assigned, setAssigned] = useState<Invigilator[]>([]);
+  const [removing, setRemoving] = useState<Invigilator | null>(null);
 
   const facultyQuery = useFaculty({ limit: 200, status: 'ACTIVE' });
+  const invigilatorsQuery = useSessionInvigilators(session.id, { limit: 200 });
   const assignMutation = useAssignInvigilator(session.id);
+  const removeMutation = useRemoveInvigilator(session.id);
 
   const facultyById = new Map((facultyQuery.data?.items ?? []).map((f) => [f.id, f]));
   const roomById = new Map(session.rooms.map((r) => [r.id, r]));
 
+  // A faculty member can't invigilate two rooms in the same session
+  // (BR-031, faculty double-booking) — hide anyone already assigned here
+  // from the picker instead of letting the admin/faculty pick them and
+  // hit a 409; removing their assignment (below) makes them selectable
+  // again automatically, since this just re-derives from the live list.
+  const alreadyAssignedFacultyIds = new Set((invigilatorsQuery.data?.items ?? []).map((inv) => inv.facultyId));
+  const assignableFaculty = (facultyQuery.data?.items ?? []).filter((f) => !alreadyAssignedFacultyIds.has(f.id));
+
   async function onAssign() {
     try {
-      const result = await assignMutation.mutateAsync({ room_id: roomId, faculty_id: facultyId, role });
-      setAssigned((prev) => [...prev, result]);
+      await assignMutation.mutateAsync({ room_id: roomId, faculty_id: facultyId, role });
       setOpen(false);
       setRoomId('');
       setFacultyId('');
@@ -56,30 +61,63 @@ export function InvigilatorPanel({ session }: InvigilatorPanelProps) {
     }
   }
 
+  async function onConfirmRemove() {
+    if (!removing) return;
+    try {
+      await removeMutation.mutateAsync(removing.id);
+      setRemoving(null);
+    } catch {
+      // surfaced below via removeMutation.error, keep the dialog open
+    }
+  }
+
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex justify-end">
-        <Button size="sm" onClick={() => setOpen(true)} disabled={session.rooms.length === 0}>
-          Assign Invigilator
-        </Button>
-      </div>
+      {!readOnly && (
+        <div className="flex justify-end">
+          <Button size="sm" onClick={() => setOpen(true)} disabled={session.rooms.length === 0}>
+            Assign Invigilator
+          </Button>
+        </div>
+      )}
 
-      {assigned.length === 0 ? (
+      {invigilatorsQuery.isLoading ? (
+        <SkeletonText lines={3} />
+      ) : invigilatorsQuery.isError ? (
+        <ErrorState
+          title="Couldn't load invigilators"
+          description={mapError(invigilatorsQuery.error).description}
+          onRetry={() => invigilatorsQuery.refetch()}
+        />
+      ) : (invigilatorsQuery.data?.items.length ?? 0) === 0 ? (
         <EmptyState
           title="No invigilators assigned yet"
-          description="Assignments made in this session appear here. (There is no server-side list endpoint for this yet — reloading the page will clear this local list, though the assignments themselves remain saved.)"
+          description="Assignments made for this session appear here."
         />
       ) : (
         <ul className="flex flex-col gap-2">
-          {assigned.map((inv) => (
-            <li key={inv.id} className="flex items-center justify-between rounded border border-border px-3 py-2 text-sm">
+          {invigilatorsQuery.data!.items.map((inv) => (
+            <li key={inv.id} className="flex items-center justify-between gap-3 rounded border border-border px-3 py-2 text-sm">
               <span className="text-text">
                 {facultyById.get(inv.facultyId)?.name ?? inv.facultyId} — {roomById.get(inv.roomId)?.roomNumber ?? inv.roomId}
               </span>
-              <span className="text-text-muted">{ROLE_OPTIONS.find((r) => r.value === inv.role)?.label}</span>
+              <div className="flex items-center gap-3">
+                <span className="text-text-muted">{ROLE_OPTIONS.find((r) => r.value === inv.role)?.label}</span>
+                {!readOnly && (
+                  <Button size="sm" variant="tertiary" onClick={() => setRemoving(inv)}>
+                    Remove
+                  </Button>
+                )}
+              </div>
             </li>
           ))}
         </ul>
+      )}
+
+      {removeMutation.isError && (
+        <Alert color="danger" title="Couldn't remove invigilator">
+          {mapError(removeMutation.error).description}
+        </Alert>
       )}
 
       <Modal
@@ -125,7 +163,7 @@ export function InvigilatorPanel({ session }: InvigilatorPanelProps) {
             onChange={(e) => setFacultyId(e.target.value)}
             options={[
               { value: '', label: 'Select a faculty member…' },
-              ...(facultyQuery.data?.items ?? []).map((f) => ({ value: f.id, label: f.name })),
+              ...assignableFaculty.map((f) => ({ value: f.id, label: f.name })),
             ]}
           />
           <Select
@@ -136,6 +174,25 @@ export function InvigilatorPanel({ session }: InvigilatorPanelProps) {
           />
         </div>
       </Modal>
+
+      <ConfirmationDialog
+        open={!!removing}
+        onOpenChange={(next) => {
+          if (!next) {
+            setRemoving(null);
+            removeMutation.reset();
+          }
+        }}
+        title="Remove invigilator?"
+        description={
+          removing
+            ? `"${facultyById.get(removing.facultyId)?.name ?? removing.facultyId}" will no longer be assigned to invigilate ${roomById.get(removing.roomId)?.roomNumber ?? 'this room'}. You can assign a different faculty member afterward.`
+            : ''
+        }
+        confirmLabel="Remove"
+        loading={removeMutation.isPending}
+        onConfirm={onConfirmRemove}
+      />
     </div>
   );
 }

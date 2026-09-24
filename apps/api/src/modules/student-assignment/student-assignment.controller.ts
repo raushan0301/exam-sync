@@ -19,7 +19,8 @@ export class StudentAssignmentController {
   constructor(private readonly studentAssignmentService: StudentAssignmentService) {}
 
   /** `202 {job_id}` per API_CONTRACT.md — see this service's own header comment on why generation is synchronous-but-chunked rather than a real queued job in Phase 9. */
-  @Roles(ROLE.ADMIN)
+  /** FACULTY only, ownership-gated inside the service. */
+  @Roles(ROLE.FACULTY)
   @Post(':id/assign-students')
   @HttpCode(202)
   async assignStudents(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {
@@ -50,7 +51,8 @@ export class StudentAssignmentController {
     });
   }
 
-  @Roles(ROLE.ADMIN)
+  /** FACULTY only, ownership-gated inside the service. */
+  @Roles(ROLE.FACULTY)
   @Post(':id/roster/:studentId')
   addRosterEntry(
     @Param('id') id: string,
@@ -61,7 +63,8 @@ export class StudentAssignmentController {
     return this.studentAssignmentService.addRosterEntry(id, studentId, dto, actor);
   }
 
-  @Roles(ROLE.ADMIN)
+  /** FACULTY only, ownership-gated inside the service. */
+  @Roles(ROLE.FACULTY)
   @Delete(':id/roster/:studentId')
   removeRosterEntry(
     @Param('id') id: string,

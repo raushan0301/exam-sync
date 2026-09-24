@@ -3,10 +3,45 @@ import { ExamSession, ExamSessionStatus, Prisma, QuizStudentAssignmentStatus } f
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService, ConflictDetail } from '../conflict-engine';
 import { RoomsService } from '../rooms';
+import { QuizzesService, QuizOwnershipService } from '../quiz';
 import { AllocateRoomsDto } from './dto/allocate-rooms.dto';
+import { RequestRoomsDto, RejectRoomRequestDto } from './dto/request-rooms.dto';
+
+/** Never a real exam_session id — see room-suggestion.service.ts's own copy of this constant for why. */
+const NIL_EXAM_SESSION_ID = '00000000-0000-0000-0000-000000000000';
+
+function addMinutes(time: Date, minutes: number): Date {
+  return new Date(time.getTime() + minutes * 60_000);
+}
+
+export interface RoomAvailabilityRow {
+  roomId: string;
+  building: string;
+  floor: number;
+  roomNumber: string;
+  capacity: number;
+  available: boolean;
+  reason?: string;
+  /** Only populated when `available` is false — same-or-greater-capacity ACTIVE rooms with no conflict, for the admin to swap in. */
+  alternatives?: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[];
+}
+
+export interface StudentScheduleConflict {
+  studentId: string;
+  conflictingExamSessionId: string;
+  message: string;
+}
+
+export interface RoomAvailabilityPreview {
+  requestedRooms: RoomAvailabilityRow[];
+  backupRoom: RoomAvailabilityRow | null;
+  strategy: string | null;
+  /** Quiz-stage only — eligible students (by enrollment) already ASSIGNED elsewhere at an overlapping time (BR-019), checked against the quiz's preferred_date/preferred_time so this surfaces BEFORE approval, not only later when actually attaching to a real exam session. Always [] for the exam-session-stage preview (real ASSIGNED students are what's being checked there in the first place). */
+  studentConflicts: StudentScheduleConflict[];
+}
 
 interface StudentGroup {
   quizId: string;
@@ -50,23 +85,354 @@ export class RoomAllocationService {
     private readonly examSessionsService: ExamSessionsService,
     private readonly conflictEngine: ConflictEngineService,
     private readonly roomsService: RoomsService,
+    private readonly examSessionOwnershipService: ExamSessionOwnershipService,
+    private readonly quizzesService: QuizzesService,
+    private readonly quizOwnershipService: QuizOwnershipService,
   ) {}
 
   /**
-   * `POST /exam-sessions/{id}/rooms/allocate` (ADMIN). Candidate rooms
-   * come from `dto.room_ids` (manual) or an auto-search via
-   * `RoomsService.findAvailable` optionally narrowed by
-   * `dto.candidate_room_ids` (algorithmic). Every candidate room is then
-   * row-locked (`SELECT ... FOR UPDATE`, ADR-003 mechanism (a): "row lock
-   * on candidate room rows during allocation") inside one transaction,
-   * re-checked for real conflicts (BR-018/BR-022, via the Conflict
-   * Engine), capacity-checked in aggregate (BR-021, EC-011 — all-or-
-   * nothing on shortfall), then packed with Best-Fit Decreasing
-   * (ARCHITECTURE.md §S) and persisted. The `EXCLUDE` constraint on
-   * `exam_session_rooms` (BR-018) is the final backstop underneath all of
-   * this, per ADR-003's tiered strategy — reachable only if the lock
-   * itself is somehow bypassed, defended against here too (see
-   * `mapExclusionViolation`).
+   * `POST /exam-sessions/{id}/rooms/request` (FACULTY, ownership-gated).
+   * Records the faculty's candidate room set (built from
+   * `RoomSuggestionService`, or hand-picked) and moves the session
+   * ASSIGNING_STUDENTS -> ROOM_ALLOCATION — this does NOT allocate
+   * anything; `allocate` (now ADMIN-only) is the actual approval step,
+   * restoring the two-transition FSM ARCHITECTURE.md originally
+   * documented (see this class's own header comment on why they were
+   * previously collapsed into one).
+   */
+  async request(examSessionId: string, dto: RequestRoomsDto, actor: AuthenticatedUser): Promise<ExamSession> {
+    const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException();
+    }
+    if (session.status !== ExamSessionStatus.ASSIGNING_STUDENTS) {
+      throw new ConflictException(
+        `Exam session is in status "${session.status}" and a room request can only be submitted while ASSIGNING_STUDENTS.`,
+      );
+    }
+    if (dto.backup_room_id && dto.room_ids.includes(dto.backup_room_id)) {
+      throw new BadRequestException('backup_room_id cannot also appear in room_ids.');
+    }
+
+    const idsToVerify = dto.backup_room_id ? [...dto.room_ids, dto.backup_room_id] : dto.room_ids;
+    const existingRooms = await this.prisma.room.findMany({ where: { id: { in: idsToVerify } }, select: { id: true } });
+    if (existingRooms.length !== new Set(idsToVerify).size) {
+      throw new NotFoundException('One or more requested rooms do not exist.');
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.examSession.update({
+        where: { id: examSessionId },
+        data: {
+          status: ExamSessionStatus.ROOM_ALLOCATION,
+          requestedRoomIds: dto.room_ids,
+          backupRoomId: dto.backup_room_id ?? null,
+          roomAllocationStrategy: dto.strategy ?? null,
+          roomRejectionReason: null,
+          version: { increment: 1 },
+        },
+      });
+
+      await this.auditHook.record(
+        {
+          actor,
+          action: 'UPDATE',
+          entityType: 'ExamSession',
+          entityId: examSessionId,
+          oldValue: { status: session.status },
+          newValue: { status: result.status, requestedRoomIds: dto.room_ids, backupRoomId: dto.backup_room_id ?? null },
+        },
+        tx,
+      );
+
+      return result;
+    });
+
+    return updated;
+  }
+
+  /**
+   * `GET /exam-sessions/{id}/rooms/preview` (ADMIN unscoped, FACULTY
+   * owner/co-instructor). Live-checks every requested room + the backup
+   * room against the SAME Conflict Engine check `allocate` itself runs
+   * (BR-018/BR-022 — room status, availability blocks, real
+   * `exam_session_rooms` overlaps) so the admin sees exactly what would
+   * happen if they approved as-is, and gets a same-or-greater-capacity
+   * available alternative for anything that would fail.
+   */
+  async getAvailabilityPreview(examSessionId: string, actor: AuthenticatedUser): Promise<RoomAvailabilityPreview> {
+    const session = await this.examSessionsService.findById(examSessionId);
+    const isAdmin = actor.roles.includes('ADMIN');
+    if (!isAdmin && !(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException();
+    }
+    if (session.status !== ExamSessionStatus.ROOM_ALLOCATION) {
+      throw new ConflictException(
+        `This session has no pending room request to preview (current status "${session.status}").`,
+      );
+    }
+
+    return this.buildAvailabilityPreview(
+      examSessionId,
+      session.requestedRoomIds,
+      session.backupRoomId,
+      session.roomAllocationStrategy,
+      session.sessionDate,
+      session.startTime,
+      session.endTime,
+    );
+  }
+
+  /**
+   * `GET /quizzes/{id}/rooms/conflicts` (ADMIN unscoped, FACULTY owner) —
+   * same live availability/alternatives preview as
+   * `getAvailabilityPreview`, but for a quiz's own `requestedRoomIds`
+   * (RoomSuggestionService.suggestForQuiz's output, submitted via
+   * `requestForQuiz`) BEFORE any exam session exists — shown on the
+   * admin approval queue alongside approve/reject, per this feature's own
+   * request that room conflicts be visible at quiz-approval time, not
+   * only later at the exam-session stage.
+   */
+  async getQuizRoomConflicts(quizId: string, actor: AuthenticatedUser): Promise<RoomAvailabilityPreview> {
+    const quiz = await this.quizzesService.findById(quizId);
+    const isAdmin = actor.roles.includes('ADMIN');
+    if (!isAdmin && !(await this.quizOwnershipService.isOwnerOrCoInstructor(quiz, actor))) {
+      throw new NotFoundException();
+    }
+    if (!quiz.preferredDate || !quiz.preferredTime) {
+      if (quiz.requestedRoomIds.length === 0) {
+        return { requestedRooms: [], backupRoom: null, strategy: null, studentConflicts: [] };
+      }
+      throw new ConflictException('This quiz has no preferred_date/preferred_time set.');
+    }
+
+    const sessionDate = quiz.preferredDate;
+    const startTime = quiz.preferredTime;
+    const endTime = addMinutes(quiz.preferredTime, quiz.durationMinutes ?? 120);
+
+    // Once this quiz has a real, actively-attached exam session (created
+    // after approval, auto-filled with this same preferred date/time —
+    // see ExamSessionsService's quiz-approval auto-fill), the students
+    // ASSIGNED there are THIS quiz's own booking, not a rival one — they
+    // must be excluded the same way a real exam session excludes itself.
+    // Before that attachment exists, NIL_EXAM_SESSION_ID (matches no real
+    // session) correctly excludes nothing, so every other booking is
+    // still compared against.
+    const activeAttachment = await this.prisma.examSessionQuiz.findFirst({
+      where: { quizId, isActiveAttachment: true },
+      select: { examSessionId: true },
+    });
+    const excludeExamSessionId = activeAttachment?.examSessionId ?? NIL_EXAM_SESSION_ID;
+
+    // BR-019 (student overlap), checked against the quiz's OWN preferred
+    // slot rather than a real exam session — so this surfaces at
+    // quiz-approval time, before the same check would otherwise only run
+    // later when actually attaching to an exam session (see
+    // ExamSessionsService.attachAndDetachQuizzes).
+    const scheduleResult = await this.conflictEngine.checkSessionAssembly({
+      examSessionId: excludeExamSessionId,
+      quizIds: [quizId],
+      sessionDate,
+      startTime,
+      endTime,
+    });
+    const studentConflicts: StudentScheduleConflict[] = scheduleResult.hard
+      .filter((d) => d.type === 'STUDENT_OVERLAP' && d.studentId && d.conflictingExamSessionId)
+      .map((d) => ({ studentId: d.studentId!, conflictingExamSessionId: d.conflictingExamSessionId!, message: d.message }));
+
+    if (quiz.requestedRoomIds.length === 0) {
+      return { requestedRooms: [], backupRoom: null, strategy: null, studentConflicts };
+    }
+
+    const roomPreview = await this.buildAvailabilityPreview(
+      excludeExamSessionId,
+      quiz.requestedRoomIds,
+      quiz.backupRoomId,
+      quiz.roomAllocationStrategy,
+      sessionDate,
+      startTime,
+      endTime,
+    );
+    return { ...roomPreview, studentConflicts };
+  }
+
+  private async buildAvailabilityPreview(
+    excludeExamSessionId: string,
+    requestedRoomIds: string[],
+    backupRoomId: string | null,
+    strategy: string | null,
+    sessionDate: Date,
+    startTime: Date,
+    endTime: Date,
+  ): Promise<RoomAvailabilityPreview> {
+    const allIds = backupRoomId ? [...requestedRoomIds, backupRoomId] : requestedRoomIds;
+    const rooms = await this.prisma.room.findMany({ where: { id: { in: allIds } } });
+    const roomsById = new Map(rooms.map((r) => [r.id, r]));
+
+    const conflictResult = await this.conflictEngine.checkRoomAllocation({
+      examSessionId: excludeExamSessionId,
+      roomIds: allIds,
+      sessionDate,
+      startTime,
+      endTime,
+    });
+    const conflictByRoom = new Map(conflictResult.hard.filter((d) => d.roomId).map((d) => [d.roomId as string, d.message]));
+
+    const availableAlternativesPool = await this.roomsService.findAvailable({
+      date: sessionDate.toISOString().slice(0, 10),
+      start_time: startTime.toISOString().slice(11, 16),
+      end_time: endTime.toISOString().slice(11, 16),
+    });
+    const altConflicts = await this.conflictEngine.checkRoomAllocation({
+      examSessionId: excludeExamSessionId,
+      roomIds: availableAlternativesPool.map((r) => r.id),
+      sessionDate,
+      startTime,
+      endTime,
+    });
+    const conflictingAltIds = new Set(altConflicts.hard.map((d) => d.roomId).filter(Boolean));
+    const trulyAvailable = availableAlternativesPool.filter(
+      (r) => !conflictingAltIds.has(r.id) && !allIds.includes(r.id),
+    );
+
+    const toRow = (roomId: string): RoomAvailabilityRow => {
+      const room = roomsById.get(roomId);
+      if (!room) {
+        return { roomId, building: '—', floor: 0, roomNumber: '—', capacity: 0, available: false, reason: 'Room no longer exists.' };
+      }
+      const conflictMessage = conflictByRoom.get(roomId);
+      const row: RoomAvailabilityRow = {
+        roomId: room.id,
+        building: room.building,
+        floor: room.floor,
+        roomNumber: room.roomNumber,
+        capacity: room.capacity,
+        available: !conflictMessage,
+        reason: conflictMessage,
+      };
+      if (conflictMessage) {
+        row.alternatives = trulyAvailable
+          .filter((r) => r.capacity >= room.capacity)
+          .sort((a, b) => a.capacity - b.capacity)
+          .slice(0, 3)
+          .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity }));
+      }
+      return row;
+    };
+
+    return {
+      requestedRooms: requestedRoomIds.map(toRow),
+      backupRoom: backupRoomId ? toRow(backupRoomId) : null,
+      strategy,
+      studentConflicts: [],
+    };
+  }
+
+  /**
+   * `POST /quizzes/{id}/rooms/request` (FACULTY, ownership-gated). Saves
+   * the faculty's chosen room set (from `RoomSuggestionService.suggestForQuiz`,
+   * or hand-picked) onto the quiz itself — DRAFT/REJECTED only, no status
+   * change. Purely informational until the admin reviews it via
+   * `getQuizRoomConflicts` and approves/rejects the quiz as normal.
+   */
+  async requestForQuiz(quizId: string, dto: RequestRoomsDto, actor: AuthenticatedUser) {
+    const quiz = await this.quizzesService.findById(quizId);
+    const isAdmin = actor.roles.includes('ADMIN');
+    if (!isAdmin && !(await this.quizOwnershipService.isOwnerOrCoInstructor(quiz, actor))) {
+      throw new NotFoundException();
+    }
+    // ADMIN may also swap a room while reviewing (quiz.status SUBMITTED) —
+    // the faculty-owned DRAFT/REJECTED case stays their own to edit.
+    const validStatus = isAdmin
+      ? quiz.status === 'DRAFT' || quiz.status === 'REJECTED' || quiz.status === 'SUBMITTED'
+      : quiz.status === 'DRAFT' || quiz.status === 'REJECTED';
+    if (!validStatus) {
+      throw new ConflictException(
+        `A room request can only be submitted/changed while the quiz is DRAFT, REJECTED${isAdmin ? ', or SUBMITTED' : ''} (current status "${quiz.status}").`,
+      );
+    }
+    if (dto.backup_room_id && dto.room_ids.includes(dto.backup_room_id)) {
+      throw new BadRequestException('backup_room_id cannot also appear in room_ids.');
+    }
+
+    const idsToVerify = dto.backup_room_id ? [...dto.room_ids, dto.backup_room_id] : dto.room_ids;
+    const existingRooms = await this.prisma.room.findMany({ where: { id: { in: idsToVerify } }, select: { id: true } });
+    if (existingRooms.length !== new Set(idsToVerify).size) {
+      throw new NotFoundException('One or more requested rooms do not exist.');
+    }
+
+    return this.prisma.quiz.update({
+      where: { id: quizId },
+      data: {
+        requestedRoomIds: dto.room_ids,
+        backupRoomId: dto.backup_room_id ?? null,
+        roomAllocationStrategy: dto.strategy ?? null,
+        // A FACULTY resubmission supersedes whatever the admin last said
+        // about the OLD request — only an ADMIN's own edit sets a note.
+        roomAdjustmentNote: isAdmin ? (dto.admin_note ?? null) : null,
+      },
+    });
+  }
+
+  /**
+   * `POST /exam-sessions/{id}/rooms/reject` (ADMIN). Sends a pending room
+   * request back to the faculty — ROOM_ALLOCATION -> ASSIGNING_STUDENTS,
+   * clearing the request so a fresh `request()` is required, with the
+   * reason stored on the session for the faculty to see.
+   */
+  async reject(examSessionId: string, dto: RejectRoomRequestDto, actor: AuthenticatedUser): Promise<ExamSession> {
+    const session = await this.examSessionsService.findById(examSessionId);
+    if (session.status !== ExamSessionStatus.ROOM_ALLOCATION) {
+      throw new ConflictException(
+        `This session has no pending room request to reject (current status "${session.status}").`,
+      );
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.examSession.update({
+        where: { id: examSessionId },
+        data: {
+          status: ExamSessionStatus.ASSIGNING_STUDENTS,
+          requestedRoomIds: [],
+          backupRoomId: null,
+          roomRejectionReason: dto.reason,
+          version: { increment: 1 },
+        },
+      });
+
+      await this.auditHook.record(
+        {
+          actor,
+          action: 'UPDATE',
+          entityType: 'ExamSession',
+          entityId: examSessionId,
+          oldValue: { status: session.status },
+          newValue: { status: result.status, roomRejectionReason: dto.reason },
+        },
+        tx,
+      );
+
+      return result;
+    });
+
+    return updated;
+  }
+
+  /**
+   * `POST /exam-sessions/{id}/rooms/allocate` (ADMIN — the approval
+   * step). Candidate rooms default to the faculty's `requestedRoomIds`
+   * (approve-as-is) but the admin may override with `dto.room_ids`
+   * (swap) or `dto.auto`/`dto.candidate_room_ids` (algorithmic). Every
+   * candidate room is then row-locked (`SELECT ... FOR UPDATE`, ADR-003
+   * mechanism (a): "row lock on candidate room rows during allocation")
+   * inside one transaction, re-checked for real conflicts (BR-018/
+   * BR-022, via the Conflict Engine), capacity-checked in aggregate
+   * (BR-021, EC-011 — all-or-nothing on shortfall), then packed with
+   * Best-Fit Decreasing (ARCHITECTURE.md §S) and persisted. The
+   * `EXCLUDE` constraint on `exam_session_rooms` (BR-018) is the final
+   * backstop underneath all of this, per ADR-003's tiered strategy —
+   * reachable only if the lock itself is somehow bypassed, defended
+   * against here too (see `mapExclusionViolation`).
    */
   async allocate(
     examSessionId: string,
@@ -74,9 +440,9 @@ export class RoomAllocationService {
     actor: AuthenticatedUser,
   ): Promise<ExamSession> {
     const session = await this.examSessionsService.findById(examSessionId);
-    if (session.status !== ExamSessionStatus.ASSIGNING_STUDENTS) {
+    if (session.status !== ExamSessionStatus.ROOM_ALLOCATION) {
       throw new ConflictException(
-        `Exam session is in status "${session.status}" and rooms can only be allocated while ASSIGNING_STUDENTS.`,
+        `Exam session is in status "${session.status}" and rooms can only be allocated while ROOM_ALLOCATION (pending a faculty room request).`,
       );
     }
 
@@ -91,6 +457,65 @@ export class RoomAllocationService {
       throw new BadRequestException('At least one candidate room is required.');
     }
 
+    return this.performAllocation(examSessionId, session, groups, totalStudents, candidateRoomIds, actor);
+  }
+
+  /**
+   * `POST /exam-sessions/{id}/rooms/allocate-preapproved` (FACULTY,
+   * ownership-gated) — this feature's own extension, self-service for the
+   * common case where an ADMIN already reviewed and approved these exact
+   * rooms once, at quiz-approval time (`Quiz.requestedRoomIds`/
+   * `backupRoomId`, via `QuizRoomConflictPanel`'s admin review). Re-running
+   * a SECOND full request → admin-review → approve cycle for rooms a human
+   * already signed off on is pure friction, so this skips straight from
+   * ASSIGNING_STUDENTS to the real allocation — but ONLY when every
+   * actively-attached quiz's own approved room set is used verbatim (no
+   * swap, no new room); anything else still needs the full `request`/
+   * `allocate` admin-reviewed path, since that's genuinely unvetted.
+   */
+  async allocatePreApproved(examSessionId: string, actor: AuthenticatedUser): Promise<ExamSession> {
+    const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException();
+    }
+    if (session.status !== ExamSessionStatus.ASSIGNING_STUDENTS) {
+      throw new ConflictException(
+        `Rooms can only be allocated while ASSIGNING_STUDENTS (current status "${session.status}").`,
+      );
+    }
+
+    const attachments = await this.prisma.examSessionQuiz.findMany({
+      where: { examSessionId, isActiveAttachment: true },
+      include: { quiz: true },
+    });
+    if (attachments.length === 0) {
+      throw new ConflictException('This session has no attached quiz to pull an approved room from.');
+    }
+    if (attachments.some((a) => a.quiz.requestedRoomIds.length === 0)) {
+      throw new ConflictException(
+        'One or more attached quizzes has no admin-approved room request — use the manual room request instead.',
+      );
+    }
+
+    const candidateRoomIds = [...new Set(attachments.flatMap((a) => a.quiz.requestedRoomIds))];
+
+    const groups = await this.getStudentGroupsByQuiz(examSessionId);
+    const totalStudents = groups.reduce((sum, g) => sum + g.count, 0);
+    if (totalStudents === 0) {
+      throw new ConflictException('This session has no ASSIGNED students to allocate rooms for.');
+    }
+
+    return this.performAllocation(examSessionId, session, groups, totalStudents, candidateRoomIds, actor);
+  }
+
+  private async performAllocation(
+    examSessionId: string,
+    session: ExamSession,
+    groups: StudentGroup[],
+    totalStudents: number,
+    candidateRoomIds: string[],
+    actor: AuthenticatedUser,
+  ): Promise<ExamSession> {
     const updatedSession = await this.prisma
       .$transaction(async (tx) => {
         // ADR-003 mechanism (a): row-lock every candidate room BEFORE any
@@ -181,7 +606,13 @@ export class RoomAllocationService {
 
         const updated = await tx.examSession.update({
           where: { id: examSessionId },
-          data: { status: ExamSessionStatus.SEATING_GENERATION, version: { increment: 1 } },
+          data: {
+            status: ExamSessionStatus.SEATING_GENERATION,
+            requestedRoomIds: [],
+            backupRoomId: null,
+            roomRejectionReason: null,
+            version: { increment: 1 },
+          },
         });
 
         await this.auditHook.record(
@@ -208,10 +639,14 @@ export class RoomAllocationService {
     session: ExamSession,
   ): Promise<string[]> {
     if (!dto.auto) {
-      if (!dto.room_ids || dto.room_ids.length === 0) {
-        throw new BadRequestException('room_ids is required when not using auto allocation.');
+      if (dto.room_ids && dto.room_ids.length > 0) {
+        return dto.room_ids;
       }
-      return dto.room_ids;
+      // Admin approving the faculty's request as-is, with no swap.
+      if (session.requestedRoomIds.length > 0) {
+        return session.requestedRoomIds;
+      }
+      throw new BadRequestException('room_ids is required when not using auto allocation.');
     }
 
     if (dto.candidate_room_ids && dto.candidate_room_ids.length > 0) {

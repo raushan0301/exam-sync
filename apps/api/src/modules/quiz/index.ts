@@ -5,3 +5,7 @@ export * from './quiz.module';
 // Approval) and Phase 8 (Exam Sessions) will inject QuizzesService via
 // this barrel.
 export { QuizzesService } from './quizzes.service';
+// Faculty-lifecycle-ownership change: ExamSessionOwnershipService (in the
+// exam-session module) reuses this directly rather than re-implementing
+// the owner-or-co-instructor rule.
+export { QuizOwnershipService } from './quiz-ownership.service';

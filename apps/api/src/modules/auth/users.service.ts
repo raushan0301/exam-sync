@@ -6,6 +6,7 @@ export interface PublicUser {
   email: string;
   isActive: boolean;
   roles: string[];
+  mustChangePassword: boolean;
   createdAt: Date;
 }
 
@@ -79,6 +80,7 @@ export class UsersService {
     id: string;
     email: string;
     isActive: boolean;
+    mustChangePassword: boolean;
     createdAt: Date;
     roles: { role: { name: string } }[];
   }): PublicUser {
@@ -87,6 +89,7 @@ export class UsersService {
       email: user.email,
       isActive: user.isActive,
       roles: user.roles.map((r) => r.role.name),
+      mustChangePassword: user.mustChangePassword,
       createdAt: user.createdAt,
     };
   }

@@ -1,4 +1,4 @@
-import { IsEnum, IsInt, IsOptional, IsString, IsUUID, Min, MinLength } from 'class-validator';
+import { IsEnum, IsOptional, IsString, IsUUID, MinLength } from 'class-validator';
 import { AcademicStatus } from '@exam-sync/db';
 
 /** PATCH /batches/{id} — extrapolated from the documented department shape (see programs' DTO note). */
@@ -8,14 +8,19 @@ export class UpdateBatchDto {
   program_id?: string;
 
   @IsOptional()
-  @IsInt()
-  @Min(1900)
-  year?: number;
+  @IsString()
+  @MinLength(1)
+  year?: string;
 
   @IsOptional()
   @IsString()
   @MinLength(1)
   section?: string;
+
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  subsection?: string;
 
   @IsOptional()
   @IsEnum(AcademicStatus)

@@ -4,10 +4,11 @@ import { useEffect, useState, useRef } from 'react';
 import type { ReactNode } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Menu, ChevronDown, ChevronRight, LogOut, PanelLeftClose, PanelLeftOpen, Bell } from 'lucide-react';
+import { Menu, ChevronDown, ChevronRight, LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { cn } from '@/components/ui/utils';
 import { Drawer } from '@/components/ui/Drawer';
 import { IconButton } from '@/components/ui/IconButton';
+import { NotificationsBell } from '@/components/shell/NotificationsBell';
 import { useIdentity } from '@/lib/identity/IdentityProvider';
 import { useLogout } from '@/lib/mutations/useLogout';
 import { isNavGroup, type NavEntry } from '@/lib/navigation';
@@ -69,6 +70,21 @@ function NavGroupItem({ entry, onNavigate }: { entry: { label: string; items: { 
   const pathname = usePathname();
   const containsActive = entry.items.some((i) => i.href && pathname?.startsWith(i.href));
   const [open, setOpen] = useState(containsActive);
+  // `containsActive` is recomputed every render from `pathname`, but the
+  // `useState` initializer above only seeds `open` once, at mount — a
+  // client-side navigation straight to a page inside this group (not via
+  // clicking this toggle) would otherwise leave the group visually
+  // collapsed while its own page is the active one. Re-sync whenever the
+  // active-state crosses into this group; never force it closed once the
+  // user has expanded/collapsed it by hand while already inside the group
+  // (this only fires on the true/false transition, not every render).
+  const wasActiveRef = useRef(containsActive);
+  useEffect(() => {
+    if (containsActive && !wasActiveRef.current) {
+      setOpen(true);
+    }
+    wasActiveRef.current = containsActive;
+  }, [containsActive]);
 
   return (
     <div>
@@ -141,7 +157,7 @@ function TopBar({
       </div>
 
       <div className="flex items-center gap-2">
-        <IconButton icon={<Bell size={18} />} aria-label="Notifications" />
+        <NotificationsBell primaryRole={primaryRole} />
         <div className="relative" ref={menuRef}>
           <button
             type="button"

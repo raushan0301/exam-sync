@@ -18,7 +18,8 @@ import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 export class SeatingEngineController {
   constructor(private readonly seatingEngineService: SeatingEngineService) {}
 
-  @Roles(ROLE.ADMIN)
+  /** FACULTY only, ownership-gated inside the service. */
+  @Roles(ROLE.FACULTY)
   @Post('exam-sessions/:id/seating/generate')
   @HttpCode(202)
   generate(
@@ -29,10 +30,22 @@ export class SeatingEngineController {
     return this.seatingEngineService.generate(id, dto, actor);
   }
 
-  @Roles(ROLE.ADMIN)
+  /** FACULTY only, ownership-gated inside the service. Lets the owning faculty pick a different strategy for a room before finalizing — blocked once that room's plan is already FINALIZED. */
+  @Roles(ROLE.FACULTY)
+  @Post('exam-sessions/:id/seating/regenerate')
+  @HttpCode(202)
+  regenerate(
+    @Param('id') id: string,
+    @Body() dto: GenerateSeatingDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.seatingEngineService.regenerate(id, dto, actor);
+  }
+
+  @Roles(ROLE.ADMIN, ROLE.FACULTY)
   @Get('seating-jobs/:id')
-  getJob(@Param('id') id: string) {
-    return this.seatingEngineService.getJob(id);
+  getJob(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {
+    return this.seatingEngineService.getJob(id, actor);
   }
 
   @Roles(ROLE.ADMIN, ROLE.FACULTY)
@@ -41,7 +54,8 @@ export class SeatingEngineController {
     return this.seatingEngineService.findByIdScoped(id, actor);
   }
 
-  @Roles(ROLE.ADMIN)
+  /** FACULTY only, ownership resolved from the plan's own exam session, then gated inside the service. */
+  @Roles(ROLE.FACULTY)
   @Post('seating-plans/:id/finalize')
   finalize(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {
     return this.seatingEngineService.finalize(id, actor);

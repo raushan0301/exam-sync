@@ -1,9 +1,9 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { ExamSession, ExamSessionStatus, SeatingPlanStatus } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 
 /**
  * DISCLOSED SCOPE NOTE (Phase 17): this class exists ONLY because BR-032
@@ -17,18 +17,27 @@ import { ExamSessionsService } from '../exam-session';
  * Phase 15's own report explicitly flagged `NOTIFIED` as consequently
  * unreachable; nothing built `IN_PROGRESS`/`COMPLETED` at all. None of
  * `finalize`/`start`/`complete` below is a documented API_CONTRACT.md
- * endpoint — they are undocumented, narrowly-scoped, ADMIN-only
- * administrative plumbing added here as the minimum necessary to make
- * Phase 17's own documented deliverable (attendance marking, gated by
- * exactly this state) actually exercisable, not a reinvention of Phases
- * 8/13/15's own business logic. `FINALIZED` and `NOTIFIED` are
- * intentionally collapsed into a single `start()` call rather than three
- * separate endpoints: neither value is read or branched on anywhere else
- * in this codebase (confirmed by inspection before writing this), their
- * respective documented "side effects" already happened per-room in
- * Phases 13/15 before this call's own precondition can even be
- * satisfied, and inventing three near-empty endpoints for states nothing
- * else observes would be complexity with no behavioral payoff.
+ * endpoint — they are undocumented, narrowly-scoped administrative
+ * plumbing added here as the minimum necessary to make Phase 17's own
+ * documented deliverable (attendance marking, gated by exactly this
+ * state) actually exercisable, not a reinvention of Phases 8/13/15's own
+ * business logic. `FINALIZED` and `NOTIFIED` are intentionally collapsed
+ * into a single `start()` call rather than three separate endpoints:
+ * neither value is read or branched on anywhere else in this codebase
+ * (confirmed by inspection before writing this), their respective
+ * documented "side effects" already happened per-room in Phases 13/15
+ * before this call's own precondition can even be satisfied, and
+ * inventing three near-empty endpoints for states nothing else observes
+ * would be complexity with no behavioral payoff.
+ *
+ * FACULTY-LIFECYCLE-OWNERSHIP FIX: `start`/`complete` were originally
+ * ADMIN-only (written before that later change moved every other
+ * exam-session lifecycle action to FACULTY). Left as ADMIN-only, they
+ * became a dead end: ADMIN lost write access to session lifecycle
+ * actions everywhere else, but FACULTY was never granted these two — so
+ * a session could reach READY_FOR_FINALIZATION and then get stuck there
+ * forever, for everyone. Fixed to FACULTY-only + ownership-scoped here,
+ * matching every other action in this feature.
  */
 @Injectable()
 export class ExamSessionLifecycleService {
@@ -36,11 +45,12 @@ export class ExamSessionLifecycleService {
     private readonly prisma: PrismaService,
     private readonly auditHook: AuditHookService,
     private readonly examSessionsService: ExamSessionsService,
+    private readonly examSessionOwnershipService: ExamSessionOwnershipService,
   ) {}
 
   /**
-   * `POST /exam-sessions/{id}/start` (ADMIN, undocumented plumbing — see
-   * class header). Precondition: session is `READY_FOR_FINALIZATION` AND
+   * `POST /exam-sessions/{id}/start` (FACULTY, ownership-gated —
+   * see class header). Precondition: session is `READY_FOR_FINALIZATION` AND
    * every room allocated to it already has a `FINALIZED` seating plan
    * (the real "all seating plans -> FINALIZED" completeness check the
    * documented `READY_FOR_FINALIZATION -> FINALIZED` transition
@@ -49,6 +59,9 @@ export class ExamSessionLifecycleService {
    */
   async start(examSessionId: string, actor: AuthenticatedUser): Promise<ExamSession> {
     const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (session.status !== ExamSessionStatus.READY_FOR_FINALIZATION) {
       throw new ConflictException(
         `Exam session is in status "${session.status}" and can only be started from READY_FOR_FINALIZATION.`,
@@ -99,7 +112,7 @@ export class ExamSessionLifecycleService {
   }
 
   /**
-   * `POST /exam-sessions/{id}/complete` (ADMIN, undocumented plumbing —
+   * `POST /exam-sessions/{id}/complete` (FACULTY, ownership-gated —
    * see class header). Side effect (BR-034, ARCHITECTURE.md §Y step 3):
    * every `attendance` row belonging to this session is locked in the
    * SAME transaction as the status flip — the documented "batch job"
@@ -109,6 +122,9 @@ export class ExamSessionLifecycleService {
    */
   async complete(examSessionId: string, actor: AuthenticatedUser): Promise<ExamSession> {
     const session = await this.examSessionsService.findById(examSessionId);
+    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
+      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
+    }
     if (session.status !== ExamSessionStatus.IN_PROGRESS) {
       throw new ConflictException(
         `Exam session is in status "${session.status}" and can only be completed from IN_PROGRESS.`,

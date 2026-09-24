@@ -3,6 +3,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiFetch, API_BASE_URL, ApiError, NetworkError } from '../api-client';
 import { getAccessToken } from '../token-storage';
+import { downloadBulkImportTemplate } from './bulk-import-helpers';
 import type { AcademicStatus, ImportJob, Student } from '../queries/types';
 
 export interface CreateStudentInput {
@@ -86,4 +87,9 @@ export function useBulkImportStudents() {
 /** GET /import-jobs/{id} — one-shot fetch (not a hook) used to show the result of a bulk-import job on demand. */
 export function fetchImportJob(id: string): Promise<ImportJob> {
   return apiFetch<ImportJob>(`/import-jobs/${id}`);
+}
+
+/** GET /students/bulk-import/template — downloads the .xlsx template via the browser. */
+export function downloadStudentTemplate() {
+  return downloadBulkImportTemplate('students', 'student-bulk-import-template.xlsx');
 }

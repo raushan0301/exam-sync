@@ -1,4 +1,5 @@
 import { IsDateString, Matches } from 'class-validator';
+import { IsTimeAfter } from '../../../common/validation/is-time-after.decorator';
 
 /** API_CONTRACT.md: `POST /exam-sessions/{id}/reschedule` body `{session_date, start_time, end_time}`. */
 export class RescheduleExamSessionDto {
@@ -9,5 +10,6 @@ export class RescheduleExamSessionDto {
   start_time!: string;
 
   @Matches(/^\d{2}:\d{2}(:\d{2})?$/, { message: 'end_time must be in HH:MM or HH:MM:SS format' })
+  @IsTimeAfter('start_time')
   end_time!: string;
 }

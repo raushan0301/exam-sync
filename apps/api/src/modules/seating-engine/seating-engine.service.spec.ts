@@ -1,7 +1,7 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ExamSessionStatus, Prisma, SeatingPlanStatus } from '@exam-sync/db';
 import { SeatingEngineService } from './seating-engine.service';
-import { ExamSessionsService } from '../exam-session';
+import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { QuizzesService } from '../quiz';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
@@ -16,7 +16,7 @@ function p2002(): Prisma.PrismaClientKnownRequestError {
 
 function buildPrismaMock() {
   const tx = {
-    seatingPlan: { create: jest.fn(), update: jest.fn() },
+    seatingPlan: { create: jest.fn(), update: jest.fn(), updateMany: jest.fn(), findUniqueOrThrow: jest.fn() },
     seatingAssignment: { createMany: jest.fn(), findMany: jest.fn() },
   };
   return {
@@ -34,14 +34,15 @@ function buildPrismaMock() {
   } as any;
 }
 
-const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'] };
+const admin: AuthenticatedUser = { id: 'admin-1', email: 'admin@example.com', roles: ['ADMIN'], mustChangePassword: false };
 
 describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
   let auditHook: { record: jest.Mock };
-  let examSessionsService: { findById: jest.Mock; findByIdScoped: jest.Mock };
+  let examSessionsService: { findById: jest.Mock; findByIdScoped: jest.Mock; maybeAdvanceToReadyForFinalization: jest.Mock };
   let quizzesService: { findById: jest.Mock };
   let notificationsOutbox: { queue: jest.Mock };
+  let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let service: SeatingEngineService;
 
   const sessionInProgress = { id: 's1', status: ExamSessionStatus.SEATING_GENERATION };
@@ -49,9 +50,14 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
   beforeEach(() => {
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
-    examSessionsService = { findById: jest.fn(), findByIdScoped: jest.fn() };
+    examSessionsService = {
+      findById: jest.fn(),
+      findByIdScoped: jest.fn(),
+      maybeAdvanceToReadyForFinalization: jest.fn(),
+    };
     quizzesService = { findById: jest.fn() };
     notificationsOutbox = { queue: jest.fn() };
+    examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
 
     service = new SeatingEngineService(
       prisma,
@@ -59,7 +65,30 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
       examSessionsService as unknown as ExamSessionsService,
       quizzesService as unknown as QuizzesService,
       notificationsOutbox as unknown as NotificationsOutboxService,
+      examSessionOwnershipService as unknown as ExamSessionOwnershipService,
     );
+  });
+
+  it('generate: 404s a faculty who owns/co-instructs none of the session\'s attached quizzes — faculty-lifecycle-ownership gate', async () => {
+    examSessionsService.findById.mockResolvedValue(sessionInProgress);
+    prisma.seatingPlan.findFirst.mockResolvedValue(null);
+    examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+    await expect(
+      service.generate('s1', { room_id: 'room-1', strategy: 'RANDOM' } as any, admin),
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it('finalize: 404s a faculty who owns/co-instructs none of the plan\'s exam session', async () => {
+    prisma.seatingPlan.findUnique.mockResolvedValue({
+      id: 'plan-1',
+      examSessionId: 's1',
+      status: SeatingPlanStatus.VALIDATED,
+    });
+    examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+
+    await expect(service.finalize('plan-1', admin)).rejects.toThrow(NotFoundException);
+    expect(examSessionOwnershipService.isOwnerOrCoInstructor).toHaveBeenCalledWith('s1', admin);
   });
 
   /** A single room, single quiz, 2 students, 2 seats — the minimal happy-path cohort. */
@@ -223,7 +252,7 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
       expect(result.fallback_reason).toBeUndefined();
     });
 
-    it('advances the exam session to READY_FOR_FINALIZATION once ALL its rooms have a VALIDATED plan', async () => {
+    it("asks ExamSessionsService to check whether the session is now ready to finalize — that service owns the actual ALL-rooms/invigilator readiness decision (see its own maybeAdvanceToReadyForFinalization spec)", async () => {
       mockSimpleCohort();
       examSessionsService.findById.mockResolvedValue(sessionInProgress);
       prisma.__tx.seatingPlan.create.mockResolvedValue({ id: 'plan-1', status: SeatingPlanStatus.DRAFT });
@@ -232,32 +261,10 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
         { seatId: 'seat-2', studentId: 'stu-2', quizId: 'quiz-1' },
       ]);
       prisma.__tx.seatingPlan.update.mockResolvedValue({ id: 'plan-1', status: SeatingPlanStatus.VALIDATED });
-      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }]); // only one room, now done
-      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
 
       await service.generate('s1', { room_id: 'room-1', strategy: 'SEQUENTIAL' }, admin);
 
-      expect(prisma.examSession.updateMany).toHaveBeenCalledWith({
-        where: { id: 's1', status: ExamSessionStatus.SEATING_GENERATION },
-        data: { status: ExamSessionStatus.READY_FOR_FINALIZATION, version: { increment: 1 } },
-      });
-    });
-
-    it('does NOT advance the session when another allocated room still has no VALIDATED plan', async () => {
-      mockSimpleCohort();
-      examSessionsService.findById.mockResolvedValue(sessionInProgress);
-      prisma.__tx.seatingPlan.create.mockResolvedValue({ id: 'plan-1', status: SeatingPlanStatus.DRAFT });
-      prisma.__tx.seatingAssignment.findMany.mockResolvedValue([
-        { seatId: 'seat-1', studentId: 'stu-1', quizId: 'quiz-1' },
-        { seatId: 'seat-2', studentId: 'stu-2', quizId: 'quiz-1' },
-      ]);
-      prisma.__tx.seatingPlan.update.mockResolvedValue({ id: 'plan-1', status: SeatingPlanStatus.VALIDATED });
-      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }, { roomId: 'room-2' }]); // TWO rooms
-      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }]); // room-2 has no plan yet
-
-      await service.generate('s1', { room_id: 'room-1', strategy: 'SEQUENTIAL' }, admin);
-
-      expect(prisma.examSession.updateMany).not.toHaveBeenCalled();
+      expect(examSessionsService.maybeAdvanceToReadyForFinalization).toHaveBeenCalledWith('s1');
     });
   });
 
@@ -304,6 +311,65 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
     });
   });
 
+  describe('regenerate — change strategy before finalizing', () => {
+    it('marks the current plan SUPERSEDED and creates a fresh plan with the new strategy', async () => {
+      mockSimpleCohort();
+      examSessionsService.findById.mockResolvedValue(sessionInProgress);
+      prisma.seatingPlan.findFirst.mockResolvedValue({
+        id: 'plan-old', status: SeatingPlanStatus.VALIDATED, strategy: 'SEQUENTIAL',
+      });
+      prisma.__tx.seatingPlan.update
+        .mockResolvedValueOnce({ id: 'plan-old', status: SeatingPlanStatus.SUPERSEDED })
+        .mockResolvedValueOnce({ id: 'plan-new', status: SeatingPlanStatus.VALIDATED, strategy: 'RANDOMIZED', softConstraintScore: 1 });
+      prisma.__tx.seatingPlan.create.mockResolvedValue({ id: 'plan-new', status: SeatingPlanStatus.DRAFT });
+      prisma.__tx.seatingAssignment.findMany.mockResolvedValue([
+        { seatId: 'seat-1', studentId: 'stu-1', quizId: 'quiz-1' },
+        { seatId: 'seat-2', studentId: 'stu-2', quizId: 'quiz-1' },
+      ]);
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+
+      const result = await service.regenerate('s1', { room_id: 'room-1', strategy: 'RANDOMIZED' }, admin);
+
+      expect(prisma.__tx.seatingPlan.update).toHaveBeenNthCalledWith(1, {
+        where: { id: 'plan-old' },
+        data: { status: SeatingPlanStatus.SUPERSEDED, version: { increment: 1 } },
+      });
+      expect(result.seating_plan_id).toBe('plan-new');
+      expect(result.status).toBe(SeatingPlanStatus.VALIDATED);
+    });
+
+    it('409s if the room\'s plan is already FINALIZED', async () => {
+      examSessionsService.findById.mockResolvedValue(sessionInProgress);
+      prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1', roomId: 'room-1', examSessionId: 's1' });
+      prisma.seatingPlan.findFirst.mockResolvedValue({ id: 'plan-old', status: SeatingPlanStatus.FINALIZED });
+
+      await expect(
+        service.regenerate('s1', { room_id: 'room-1', strategy: 'RANDOMIZED' }, admin),
+      ).rejects.toThrow(ConflictException);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('409s if no seating plan exists yet for this room', async () => {
+      examSessionsService.findById.mockResolvedValue(sessionInProgress);
+      prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1', roomId: 'room-1', examSessionId: 's1' });
+      prisma.seatingPlan.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.regenerate('s1', { room_id: 'room-1', strategy: 'RANDOMIZED' }, admin),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('propagates the 404 a non-owning faculty member would get (IDOR-safe)', async () => {
+      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
+      examSessionsService.findById.mockResolvedValue(sessionInProgress);
+
+      await expect(
+        service.regenerate('s1', { room_id: 'room-1', strategy: 'RANDOMIZED' }, admin),
+      ).rejects.toThrow(NotFoundException);
+    });
+  });
+
   describe('finalize', () => {
     it('404s for a non-existent plan', async () => {
       prisma.seatingPlan.findUnique.mockResolvedValue(null);
@@ -333,7 +399,8 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
       prisma.roomSeat.findMany.mockResolvedValue([{ id: 'seat-1', rowIndex: 0, colIndex: 0, isActive: true, isAccessible: false }]);
       prisma.seatingAssignment.findMany.mockResolvedValue([{ seatId: 'seat-1', studentId: 'stu-1', quizId: 'quiz-1' }]);
       const finalized = { id: 'plan-1', status: SeatingPlanStatus.FINALIZED, examSessionId: 's1', finalizedAt: new Date() };
-      prisma.__tx.seatingPlan.update = jest.fn().mockResolvedValue(finalized);
+      prisma.__tx.seatingPlan.updateMany = jest.fn().mockResolvedValue({ count: 1 });
+      prisma.__tx.seatingPlan.findUniqueOrThrow = jest.fn().mockResolvedValue(finalized);
       prisma.roomSeat.findMany.mockResolvedValueOnce([{ id: 'seat-1', rowIndex: 0, colIndex: 0, isActive: true, isAccessible: false }]);
       prisma.roomSeat.findMany.mockResolvedValueOnce([{ id: 'seat-1', seatLabel: 'R1C1' }]);
       prisma.student.findMany.mockResolvedValueOnce([{ id: 'stu-1', batchId: 'A' }]);
@@ -370,10 +437,35 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
       // Seat got disabled since generation (EC-048-style drift) — now INACTIVE_SEAT.
       prisma.roomSeat.findMany.mockResolvedValue([{ id: 'seat-1', rowIndex: 0, colIndex: 0, isActive: false, isAccessible: false }]);
       prisma.seatingAssignment.findMany.mockResolvedValue([{ seatId: 'seat-1', studentId: 'stu-1', quizId: 'quiz-1' }]);
-      prisma.__tx.seatingPlan.update = jest.fn();
+      prisma.__tx.seatingPlan.updateMany = jest.fn();
 
       await expect(service.finalize('plan-1', admin)).rejects.toThrow(ConflictException);
-      expect(prisma.__tx.seatingPlan.update).not.toHaveBeenCalled();
+      expect(prisma.__tx.seatingPlan.updateMany).not.toHaveBeenCalled();
+      expect(notificationsOutbox.queue).not.toHaveBeenCalled();
+    });
+
+    it('409s cleanly instead of double-finalizing when a concurrent finalize already flipped the plan out of VALIDATED (race guard)', async () => {
+      prisma.seatingPlan.findUnique.mockResolvedValue({
+        id: 'plan-1', status: SeatingPlanStatus.VALIDATED, examSessionId: 's1', roomId: 'room-1',
+      });
+      prisma.examSessionRoom.findUniqueOrThrow.mockResolvedValue({ id: 'esr-1' });
+      prisma.examSessionRoomQuiz.findMany.mockImplementation(({ where }: any) =>
+        Promise.resolve(
+          where.examSessionRoomId === 'esr-1'
+            ? [{ examSessionRoomId: 'esr-1', quizId: 'quiz-1', studentCount: 1 }]
+            : [{ examSessionRoomId: 'esr-1', quizId: 'quiz-1', studentCount: 1, examSessionRoom: { id: 'esr-1', createdAt: new Date() } }],
+        ),
+      );
+      prisma.quizStudentAssignment.findMany.mockResolvedValue([{ studentId: 'stu-1' }]);
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', subjectId: 'subj-1' });
+      prisma.student.findMany.mockResolvedValue([{ id: 'stu-1', batchId: 'A' }]);
+      prisma.roomSeat.findMany.mockResolvedValue([{ id: 'seat-1', rowIndex: 0, colIndex: 0, isActive: true, isAccessible: false }]);
+      prisma.seatingAssignment.findMany.mockResolvedValue([{ seatId: 'seat-1', studentId: 'stu-1', quizId: 'quiz-1' }]);
+      // Another transaction already won the race and flipped the row to
+      // FINALIZED — this transaction's conditional updateMany matches 0 rows.
+      prisma.__tx.seatingPlan.updateMany = jest.fn().mockResolvedValue({ count: 0 });
+
+      await expect(service.finalize('plan-1', admin)).rejects.toThrow(ConflictException);
       expect(notificationsOutbox.queue).not.toHaveBeenCalled();
     });
   });
@@ -407,10 +499,11 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
   describe('getJob', () => {
     it('returns the plan\'s status as a job-shaped summary (job_id === plan_id)', async () => {
       prisma.seatingPlan.findUnique.mockResolvedValue({
-        id: 'plan-1', status: SeatingPlanStatus.VALIDATED, softConstraintScore: 0.75, violationReport: [{ type: 'SUBJECT_ADJACENCY' }],
+        id: 'plan-1', examSessionId: 's1', status: SeatingPlanStatus.VALIDATED, softConstraintScore: 0.75, violationReport: [{ type: 'SUBJECT_ADJACENCY' }],
       });
+      examSessionsService.findByIdScoped.mockResolvedValue(sessionInProgress);
 
-      const result = await service.getJob('plan-1');
+      const result = await service.getJob('plan-1', admin);
 
       expect(result.job_id).toBe('plan-1');
       expect(result.status).toBe(SeatingPlanStatus.VALIDATED);
@@ -421,6 +514,7 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
     it('re-derives the disclaimer and fallback_reason from a PERSISTED ANTI_CHEATING plan (not just the immediate generate() response)', async () => {
       prisma.seatingPlan.findUnique.mockResolvedValue({
         id: 'plan-1',
+        examSessionId: 's1',
         status: SeatingPlanStatus.VALIDATED,
         strategy: 'ANTI_CHEATING',
         softConstraintScore: 1,
@@ -428,13 +522,37 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
           { type: 'SINGLE_SUBJECT_FALLBACK', fallback_reason: 'SINGLE_SUBJECT_RANDOMIZED', message: 'x', seatIdA: '', seatIdB: '' },
         ],
       });
+      examSessionsService.findByIdScoped.mockResolvedValue(sessionInProgress);
 
-      const result = await service.getJob('plan-1');
+      const result = await service.getJob('plan-1', admin);
 
       expect(result.disclaimer).toContain('reduce opportunistic copying risk');
       expect(result.fallback_reason).toBe('SINGLE_SUBJECT_RANDOMIZED');
       // The synthetic marker itself is not double-counted as a real soft violation.
       expect(result.soft_violations).toEqual([]);
+    });
+
+    it('is reachable by the owning/co-instructing FACULTY, not just ADMIN — SeatingPanel.tsx polls this right after that faculty generates seating', async () => {
+      const facultyActor: AuthenticatedUser = { id: 'fac-1', email: 'f@example.com', roles: ['FACULTY'], mustChangePassword: false };
+      prisma.seatingPlan.findUnique.mockResolvedValue({
+        id: 'plan-1', examSessionId: 's1', status: SeatingPlanStatus.VALIDATED, softConstraintScore: 0.5, violationReport: [],
+      });
+      examSessionsService.findByIdScoped.mockResolvedValue(sessionInProgress);
+
+      const result = await service.getJob('plan-1', facultyActor);
+
+      expect(examSessionsService.findByIdScoped).toHaveBeenCalledWith('s1', facultyActor);
+      expect(result.job_id).toBe('plan-1');
+    });
+
+    it('propagates the 404 a non-owning faculty member would get from findByIdScoped (IDOR-safe)', async () => {
+      const otherFaculty: AuthenticatedUser = { id: 'fac-2', email: 'f2@example.com', roles: ['FACULTY'], mustChangePassword: false };
+      prisma.seatingPlan.findUnique.mockResolvedValue({
+        id: 'plan-1', examSessionId: 's1', status: SeatingPlanStatus.VALIDATED, softConstraintScore: 0.5, violationReport: [],
+      });
+      examSessionsService.findByIdScoped.mockRejectedValue(new NotFoundException());
+
+      await expect(service.getJob('plan-1', otherFaculty)).rejects.toThrow(NotFoundException);
     });
   });
 });

@@ -30,6 +30,26 @@ function messageOf(err: ApiError): string {
   return err.message || 'Something went wrong.';
 }
 
+/**
+ * Opt-in escape hatch from `mapError`'s deliberately generic 403 message.
+ * The generic message exists to avoid leaking permission-boundary details
+ * for *sensitive* authorization checks (role/resource-ownership) — but a
+ * few specific 403s are the backend explaining a self-correctable mistake
+ * (e.g. quiz creation's "you're not assigned to teach this batch/term"),
+ * where showing the real reason helps the user fix their own input rather
+ * than guess. Call this ONLY at call sites where every possible 403 from
+ * that specific endpoint is known to be one of these non-sensitive,
+ * actionable cases — never as a blanket replacement for `mapError`.
+ * Returns null (caller should fall back to `mapError(err).description`)
+ * for anything that isn't a plain 403 ApiError.
+ */
+export function specificForbiddenMessage(err: unknown): string | null {
+  if (err instanceof ApiError && err.status === 403) {
+    return messageOf(err);
+  }
+  return null;
+}
+
 export function mapError(err: unknown): MappedError {
   if (err instanceof NetworkError) {
     return {

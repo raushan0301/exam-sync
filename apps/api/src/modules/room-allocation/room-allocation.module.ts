@@ -1,9 +1,12 @@
 import { Module } from '@nestjs/common';
 import { RoomAllocationController } from './room-allocation.controller';
+import { QuizRoomRequestController } from './quiz-room-request.controller';
 import { RoomAllocationService } from './room-allocation.service';
+import { RoomSuggestionService } from './room-suggestion.service';
 import { ExamSessionModule } from '../exam-session';
 import { ConflictEngineModule } from '../conflict-engine';
 import { RoomsModule } from '../rooms';
+import { QuizModule } from '../quiz';
 
 /**
  * RoomAllocationModule — Phase 12 (replaces the Phase 0 empty skeleton).
@@ -13,9 +16,9 @@ import { RoomsModule } from '../rooms';
  * candidate search).
  */
 @Module({
-  imports: [ExamSessionModule, ConflictEngineModule, RoomsModule],
-  controllers: [RoomAllocationController],
-  providers: [RoomAllocationService],
-  exports: [RoomAllocationService],
+  imports: [ExamSessionModule, ConflictEngineModule, RoomsModule, QuizModule],
+  controllers: [RoomAllocationController, QuizRoomRequestController],
+  providers: [RoomAllocationService, RoomSuggestionService],
+  exports: [RoomAllocationService, RoomSuggestionService],
 })
 export class RoomAllocationModule {}

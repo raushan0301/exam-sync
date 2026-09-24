@@ -142,29 +142,54 @@ function setUpBaseFixtures(sessionOverrides: Partial<MockExamSession> = {}) {
   setMockAttendance([]);
 }
 
-async function loadSeatMap() {
-  await userEvent.type(screen.getByLabelText(/seating plan id/i), 'plan-1');
-  await userEvent.click(screen.getByRole('button', { name: /load seat map/i }));
-}
-
 describe('Faculty attendance marking', () => {
-  it('marks attendance via the seat map and updates the seat color / progress', async () => {
+  it('toggles attendance directly on seat click (Present on first click, no separate panel) and updates the seat color / progress', async () => {
     setUpBaseFixtures();
     renderWithProviders(<FacultyAttendanceMarkingPage />);
 
     await screen.findByText(/midterm session — attendance/i);
-    await loadSeatMap();
 
     expect(await screen.findByText('0 of 1 marked')).toBeInTheDocument();
 
-    const seatButton = await screen.findByLabelText(/seat a1, jane doe, attendance not yet marked/i);
+    const seatButton = await screen.findByLabelText(/seat a1, jane doe \(r001\), attendance not yet marked/i);
     await userEvent.click(seatButton);
 
-    const panel = await screen.findByRole('dialog', { name: /mark attendance for jane doe/i });
-    await userEvent.click(within(panel).getByRole('button', { name: /^present$/i }));
-
     await waitFor(() => expect(screen.getByText('1 of 1 marked')).toBeInTheDocument());
-    expect(await screen.findByLabelText(/seat a1, jane doe, attendance present/i)).toBeInTheDocument();
+    expect(await screen.findByLabelText(/seat a1, jane doe \(r001\), attendance present/i)).toBeInTheDocument();
+    // No quick-mark panel/dialog for the unlocked case — the click itself is the mark.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('updates the seat color/tooltip the instant it is clicked, before the mark request resolves (optimistic, no visible lag)', async () => {
+    setUpBaseFixtures();
+    renderWithProviders(<FacultyAttendanceMarkingPage />);
+
+    await screen.findByText(/midterm session — attendance/i);
+    const seatButton = await screen.findByLabelText(/seat a1, jane doe \(r001\), attendance not yet marked/i);
+
+    await userEvent.click(seatButton);
+
+    // Synchronous query (no waitFor/findBy) — the optimistic update must
+    // already be reflected by the time the click's synchronous state
+    // update has flushed, independent of whether the network request
+    // backing it has completed yet.
+    expect(screen.getByLabelText(/seat a1, jane doe \(r001\), attendance present/i)).toBeInTheDocument();
+  });
+
+  it('toggles Present -> Absent on a second click of an already-marked, unlocked seat', async () => {
+    setUpBaseFixtures();
+    setMockAttendance([
+      { id: 'att-1', quizStudentAssignmentId: 'roster-1', seatId: 'seat-0-0', status: 'PRESENT', method: 'SEAT_BASED', markedByFacultyId: 'fac-1', markedAt: NOW, locked: false, createdAt: NOW, updatedAt: NOW },
+    ]);
+    renderWithProviders(<FacultyAttendanceMarkingPage />);
+
+    await screen.findByText(/midterm session — attendance/i);
+
+    const seatButton = await screen.findByLabelText(/seat a1, jane doe \(r001\), attendance present/i);
+    await userEvent.click(seatButton);
+
+    expect(await screen.findByLabelText(/seat a1, jane doe \(r001\), attendance absent/i)).toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
   it('is blocked with a clear message when the session is not IN_PROGRESS', async () => {
@@ -175,7 +200,6 @@ describe('Faculty attendance marking', () => {
     expect(
       await screen.findByText(/attendance marking will be available once the session starts/i),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText(/seating plan id/i)).not.toBeInTheDocument();
   });
 
   it('re-marking a locked record without a reason shows the 423 and requires one', async () => {
@@ -186,9 +210,8 @@ describe('Faculty attendance marking', () => {
     renderWithProviders(<FacultyAttendanceMarkingPage />);
 
     await screen.findByText(/midterm session — attendance/i);
-    await loadSeatMap();
 
-    const seatButton = await screen.findByLabelText(/seat a1, jane doe, attendance present/i);
+    const seatButton = await screen.findByLabelText(/seat a1, jane doe \(r001\), attendance present/i);
     await userEvent.click(seatButton);
 
     const panel = await screen.findByRole('dialog', { name: /mark attendance for jane doe/i });

@@ -25,10 +25,25 @@ vi.mock('next/navigation', () => ({
   useParams: () => ({ id: currentSessionId }),
 }));
 
-import NewExamSessionPage from '@/app/admin/exam-sessions/new/page';
+// Faculty-lifecycle-ownership change: session CREATION is now exclusively
+// faculty-driven — the admin equivalent of this page is now a plain
+// redirect stub (apps/web/app/admin/exam-sessions/new/page.tsx), so this
+// suite's "New Exam Session" describe block below now exercises the
+// faculty page instead. `ExamSessionDetailView` itself is unaffected here:
+// it defaults to `role="FACULTY"` (fully actionable), which is exactly
+// what every "Exam Session detail" test below already assumed.
+import NewExamSessionPage from '@/app/faculty/exam-sessions/new/page';
 import { ExamSessionDetailView } from '@/components/exam-session/ExamSessionDetailView';
 
 const SUBJECT_ID = '11111111-1111-4111-8111-111111111111';
+
+/** TimeInput renders three <select>s (Hour/Minute/AM-PM) inside a role="group" named by the field's label, instead of a single typeable text field. */
+async function setTimeField(groupName: RegExp, hour12: string, minute: string, period: 'AM' | 'PM') {
+  const group = screen.getByRole('group', { name: groupName });
+  await userEvent.selectOptions(within(group).getByLabelText('Hour'), hour12);
+  await userEvent.selectOptions(within(group).getByLabelText('Minute'), minute);
+  await userEvent.selectOptions(within(group).getByLabelText('AM or PM'), period);
+}
 const NOW = '2026-01-01T00:00:00.000Z';
 
 function signInAsAdmin() {
@@ -60,8 +75,7 @@ function makeQuiz(overrides: Partial<MockQuiz> = {}): MockQuiz {
     subjectId: SUBJECT_ID,
     createdByFacultyId: 'u-faculty',
     durationMinutes: 60,
-    totalMarks: 100,
-    questionCount: 20,
+    studentCount: 60,
     instructions: null,
     quizType: 'QUIZ',
     preferredDate: '2026-02-01',
@@ -84,34 +98,66 @@ function beforeEachReset() {
 }
 
 describe('New Exam Session', () => {
-  it('creates a session and redirects to its detail page', async () => {
+  it('picks an approved quiz first, then creates a session and attaches it', async () => {
     signInAsAdmin();
     setMockExamSessions([]);
+    setMockQuizzes([makeQuiz()]);
     push.mockClear();
 
     renderWithProviders(<NewExamSessionPage />);
 
-    await userEvent.type(screen.getByLabelText(/name/i), 'Final Session');
-    const dateInputs = screen.getAllByDisplayValue('');
-    await userEvent.type(screen.getByLabelText(/date/i), '2026-04-01');
-    await userEvent.type(screen.getByLabelText(/start time/i), '09:00');
-    await userEvent.type(screen.getByLabelText(/end time/i), '11:00');
-    void dateInputs;
+    await userEvent.click(await screen.findByRole("radio"));
 
-    await userEvent.click(screen.getByRole('button', { name: /create exam session/i }));
+    await userEvent.clear(screen.getByLabelText(/^name/i));
+    await userEvent.type(screen.getByLabelText(/^name/i), 'Final Session');
+    await userEvent.clear(screen.getByLabelText(/date/i));
+    await userEvent.type(screen.getByLabelText(/date/i), '2026-04-01');
+    await setTimeField(/start time/i, '9', '00', 'AM');
+    await setTimeField(/end time/i, '11', '00', 'AM');
+
+    await userEvent.click(screen.getByRole('button', { name: /create.*attach quiz/i }));
 
     await waitFor(() => expect(push).toHaveBeenCalled());
     const [destination] = push.mock.calls[0] as [string];
-    expect(destination).toMatch(/^\/admin\/exam-sessions\/.+/);
+    expect(destination).toMatch(/^\/faculty\/exam-sessions\/.+/);
   });
 
-  it('shows a validation error when required fields are missing', async () => {
+  it('excludes an already-scheduled quiz from the picker and lists it under "Already scheduled" instead', async () => {
     signInAsAdmin();
-    setMockExamSessions([]);
+    setMockExamSessions([makeSession({ id: 'session-existing', quizIds: ['quiz-1'], status: 'IN_PROGRESS' })]);
+    setMockQuizzes([makeQuiz({ id: 'quiz-1', title: 'Already Scheduled Quiz' }), makeQuiz({ id: 'quiz-2', title: 'Fresh Quiz' })]);
 
     renderWithProviders(<NewExamSessionPage />);
 
-    await userEvent.click(screen.getByRole('button', { name: /create exam session/i }));
+    await screen.findByText('Already Scheduled Quiz');
+    expect(screen.getByText(/fresh quiz/i)).toBeInTheDocument();
+    // Only the unscheduled quiz is pickable — exactly one radio input.
+    expect(screen.getAllByRole('radio')).toHaveLength(1);
+    expect(screen.getByRole('radio', { name: /fresh quiz/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /open session/i })).toBeInTheDocument();
+  });
+
+  it('shows an empty state when there are no approved quizzes to schedule', async () => {
+    signInAsAdmin();
+    setMockExamSessions([]);
+    setMockQuizzes([]);
+
+    renderWithProviders(<NewExamSessionPage />);
+
+    expect(await screen.findByText(/no approved quizzes/i)).toBeInTheDocument();
+  });
+
+  it('shows a validation error when required fields are missing after picking a quiz', async () => {
+    signInAsAdmin();
+    setMockExamSessions([]);
+    setMockQuizzes([makeQuiz()]);
+
+    renderWithProviders(<NewExamSessionPage />);
+
+    await userEvent.click(await screen.findByRole("radio"));
+    await userEvent.clear(screen.getByLabelText(/^name/i));
+
+    await userEvent.click(screen.getByRole('button', { name: /create.*attach quiz/i }));
 
     expect(await screen.findAllByRole('alert')).not.toHaveLength(0);
   });

@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Plus } from 'lucide-react';
+import { Plus, Upload } from 'lucide-react';
 import {
   Button,
   Input,
@@ -21,8 +21,10 @@ import {
 } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { useRooms } from '@/lib/queries/useRooms';
-import { useCreateRoom, useUpdateRoom } from '@/lib/mutations/useRoomMutations';
+import { useCreateRoom, useUpdateRoom, useBulkImportRooms, downloadRoomTemplate } from '@/lib/mutations/useRoomMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { Room, RoomStatus } from '@/lib/queries/types';
 
@@ -62,6 +64,7 @@ export default function RoomsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Room | null>(null);
   const [deactivating, setDeactivating] = useState<Room | null>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = useRooms({
     search,
@@ -74,6 +77,7 @@ export default function RoomsPage() {
   const createMutation = useCreateRoom();
   const updateMutation = useUpdateRoom(editing?.id ?? '');
   const deactivateMutation = useUpdateRoom(deactivating?.id ?? '');
+  const bulkImportMutation = useBulkImportRooms();
 
   const createForm = useForm<CreateRoomFormValues>({
     resolver: zodResolver(createRoomSchema),
@@ -145,9 +149,18 @@ export default function RoomsPage() {
           <h1 className="text-xl font-semibold text-text">Rooms</h1>
           <p className="text-sm text-text-muted">Manage exam rooms, seat layouts, and availability blocks.</p>
         </div>
-        <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
-          New Room
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            leadingIcon={<Upload size={16} aria-hidden="true" />}
+            onClick={() => setBulkImportOpen(true)}
+          >
+            Bulk Import
+          </Button>
+          <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
+            New Room
+          </Button>
+        </div>
       </div>
 
       <FilterBar>
@@ -253,6 +266,15 @@ export default function RoomsPage() {
         destructive={deactivating?.status === 'ACTIVE'}
         loading={deactivateMutation.isPending}
         onConfirm={confirmDeactivate}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Room"
+        onDownloadTemplate={downloadRoomTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

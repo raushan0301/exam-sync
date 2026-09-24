@@ -21,7 +21,7 @@ function seedProgramAndBatch() {
     { id: '11111111-1111-4111-8111-111111111111', departmentId: 'd1', name: 'B.Tech CSE', code: 'BTCSE', status: 'ACTIVE', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' },
   ]);
   setMockBatches([
-    { id: '22222222-2222-4222-8222-222222222222', programId: '11111111-1111-4111-8111-111111111111', year: 2026, section: 'A', status: 'ACTIVE', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' },
+    { id: '22222222-2222-4222-8222-222222222222', programId: '11111111-1111-4111-8111-111111111111', year: '2026', section: 'A', subsection: 'A1', status: 'ACTIVE', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' },
   ]);
 }
 
@@ -84,7 +84,7 @@ describe('Admin > People > Students', () => {
     expect(await within(dialog).findByText(/already exists/i)).toBeInTheDocument();
   });
 
-  it('submits a CSV bulk-import and shows an honest "submitted" confirmation with the job id', async () => {
+  it('submits an .xlsx bulk-import and shows the per-row results once the job completes', async () => {
     signInAsAdmin();
     seedProgramAndBatch();
     setMockStudents([]);
@@ -93,13 +93,20 @@ describe('Admin > People > Students', () => {
     renderWithProviders(<StudentsPage />);
     await screen.findByText('No students found');
 
-    const file = new File(['name,email,program_id,batch_id,roll_number\nA,a@x.com,11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222,R1'], 'students.csv', {
-      type: 'text/csv',
+    await user.click(screen.getByRole('button', { name: 'Bulk Import' }));
+    const dialog = await screen.findByRole('dialog');
+
+    const file = new File(['dummy xlsx content'], 'students.xlsx', {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     });
-    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    // The file input has no accessible name/role in BulkImportModal — query
+    // by its type attribute directly, matching the component's own markup
+    // (a bare <input type="file">).
+    const fileInput = dialog.querySelector('input[type="file"]') as HTMLInputElement;
     await user.upload(fileInput, file);
 
-    expect(await screen.findByText('Import submitted')).toBeInTheDocument();
-    expect(screen.getByText(/job ID/i)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: 'Upload' }));
+
+    expect(await within(dialog).findByText(/1 of 1 row\(s\) imported successfully/i)).toBeInTheDocument();
   });
 });

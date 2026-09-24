@@ -35,6 +35,14 @@ export interface ListIncidentsParams {
   examSessionId?: string;
 }
 
+/** `Incident` plus resolved display labels for its FK ids — see `list()`'s own comment for why. */
+export interface IncidentWithLabels extends Incident {
+  examSessionName: string;
+  roomLabel: string | null;
+  studentLabel: string | null;
+  quizTitle: string | null;
+}
+
 /** Valid `(action, fromStatuses)` pairs — the exact graph from ARCHITECTURE.md §AD-2 #6: `OPEN -> UNDER_REVIEW -> {RESOLVED, DISMISSED, ESCALATED}`; `ESCALATED -> UNDER_REVIEW` (re-review). RESOLVED/DISMISSED are terminal — no action moves out of them ("no reopen path exists by design", EC-031). */
 const VALID_FROM_STATUSES: Record<IncidentAction, IncidentStatus[]> = {
   [IncidentAction.CREATE]: [], // not a client-invokable action — see UpdateIncidentStatusDto's own comment
@@ -258,7 +266,7 @@ export class IncidentsService {
    * has no access at all (no `@Roles` combination that includes STUDENT
    * is ever wired to this method's controller route — BR-041).
    */
-  async list(actor: AuthenticatedUser, params: ListIncidentsParams): Promise<PaginatedResult<Incident>> {
+  async list(actor: AuthenticatedUser, params: ListIncidentsParams): Promise<PaginatedResult<IncidentWithLabels>> {
     const isAdmin = actor.roles.includes(ROLE.ADMIN);
     let reportedByFacultyId: string | undefined;
     if (!isAdmin) {
@@ -278,9 +286,28 @@ export class IncidentsService {
         ...(params.examSessionId ? { examSessionId: params.examSessionId } : {}),
       },
       orderBy: { createdAt: 'desc' },
+      // Joined purely for human-readable labels below — the detail drawer
+      // used to render raw examSessionId/roomId/studentId/quizId UUIDs
+      // directly, which told an admin/faculty nothing actionable.
+      include: {
+        examSession: { select: { name: true } },
+        room: { select: { building: true, roomNumber: true } },
+        student: { select: { name: true, rollNumber: true } },
+        quiz: { select: { title: true } },
+      },
       ...cursorFindManyArgs(params.cursor, limit),
     });
-    return toPaginatedResult(rows, limit);
+    const withLabels: IncidentWithLabels[] = rows.map((row) => {
+      const { examSession, room, student, quiz, ...incident } = row;
+      return {
+        ...incident,
+        examSessionName: examSession.name,
+        roomLabel: room ? `${room.building} · Room ${room.roomNumber}` : null,
+        studentLabel: student ? `${student.name} (${student.rollNumber})` : null,
+        quizTitle: quiz?.title ?? null,
+      };
+    });
+    return toPaginatedResult(withLabels, limit);
   }
 
   /** `GET /incidents/{id}/history` (ADMIN only, per API_CONTRACT.md). */

@@ -10,6 +10,8 @@ function buildPrismaMock() {
   return {
     user: {
       findUnique: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
+      update: jest.fn(),
     },
     refreshToken: {
       create: jest.fn(),
@@ -17,6 +19,9 @@ function buildPrismaMock() {
       update: jest.fn(),
       updateMany: jest.fn(),
     },
+    // changePassword uses the array form of $transaction — the ops are
+    // already-invoked (mocked) promises by the time they're passed in.
+    $transaction: jest.fn((ops: unknown[]) => Promise.all(ops)),
   } as any;
 }
 
@@ -41,6 +46,7 @@ describe('AuthService', () => {
 
     const passwordService = {
       verify: jest.fn(),
+      hash: jest.fn(),
     } as unknown as PasswordService;
 
     service = new AuthService(
@@ -197,6 +203,46 @@ describe('AuthService', () => {
       expect(authAudit.record).toHaveBeenCalledWith('LOGOUT', expect.objectContaining({
         userId: 'user-1',
       }));
+    });
+  });
+
+  describe('changePassword', () => {
+    it('rejects an incorrect current password and audits PASSWORD_CHANGE_FAILURE', async () => {
+      prisma.user.findUniqueOrThrow.mockResolvedValue(activeUser);
+      (service as any).passwordService.verify.mockResolvedValue(false);
+
+      await expect(
+        service.changePassword('user-1', 'wrong-current', 'newpassword1'),
+      ).rejects.toThrow(UnauthorizedException);
+      expect(prisma.user.update).not.toHaveBeenCalled();
+      expect(authAudit.record).toHaveBeenCalledWith(
+        'PASSWORD_CHANGE_FAILURE',
+        expect.objectContaining({ userId: 'user-1' }),
+      );
+    });
+
+    it('hashes the new password, clears mustChangePassword, revokes every refresh token, and audits success', async () => {
+      prisma.user.findUniqueOrThrow.mockResolvedValue(activeUser);
+      (service as any).passwordService.verify.mockResolvedValue(true);
+      (service as any).passwordService.hash.mockResolvedValue('hashed-new-password');
+      prisma.user.update.mockResolvedValue({ ...activeUser, passwordHash: 'hashed-new-password' });
+      prisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.changePassword('user-1', 'correct-current', 'newpassword1');
+
+      expect((service as any).passwordService.hash).toHaveBeenCalledWith('newpassword1');
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        data: { passwordHash: 'hashed-new-password', mustChangePassword: false },
+      });
+      expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({
+        where: { userId: 'user-1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(authAudit.record).toHaveBeenCalledWith(
+        'PASSWORD_CHANGE_SUCCESS',
+        expect.objectContaining({ userId: 'user-1' }),
+      );
     });
   });
 });

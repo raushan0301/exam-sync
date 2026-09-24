@@ -26,7 +26,7 @@ class FakeNoteRepository extends ScopedRepository<FakeNote> {
 }
 
 function actor(id: string, roles: string[] = []): AuthenticatedUser {
-  return { id, email: `${id}@example.com`, roles };
+  return { id, email: `${id}@example.com`, roles, mustChangePassword: false };
 }
 
 /**

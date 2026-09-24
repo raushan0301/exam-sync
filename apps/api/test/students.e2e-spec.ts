@@ -74,10 +74,10 @@ describe('Students (e2e) — Phase 3', () => {
       data: { departmentId, name: 'B.Tech ECE', code: otherProgCode },
     });
     otherProgramId = otherProg.id;
-    const batch = await prisma.batch.create({ data: { programId, year: 2026, section: 'A' } });
+    const batch = await prisma.batch.create({ data: { programId, year: '2026', section: 'A', subsection: 'A' } });
     batchId = batch.id;
     const otherBatch = await prisma.batch.create({
-      data: { programId: otherProgramId, year: 2026, section: 'A' },
+      data: { programId: otherProgramId, year: '2026', section: 'A', subsection: 'A' },
     });
     otherProgramBatchId = otherBatch.id;
   });

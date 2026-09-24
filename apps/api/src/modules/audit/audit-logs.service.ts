@@ -8,6 +8,11 @@ import {
   toPaginatedResult,
 } from '../../common/pagination/paginate';
 
+/** An AuditLog row with the acting user's email joined in — display-only,
+ * doesn't change what's stored (the raw actorId remains the source of
+ * truth); resolves the "who is this UUID" readability gap in the admin UI. */
+export type AuditLogWithActor = AuditLog & { actorEmail: string };
+
 export interface ListAuditLogsParams {
   cursor?: string;
   limit?: number;
@@ -36,7 +41,7 @@ export interface ListAuditLogsParams {
 export class AuditLogsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async list(params: ListAuditLogsParams): Promise<PaginatedResult<AuditLog>> {
+  async list(params: ListAuditLogsParams): Promise<PaginatedResult<AuditLogWithActor>> {
     const limit = resolveLimit(params.limit);
 
     const where: Record<string, unknown> = {};
@@ -53,9 +58,12 @@ export class AuditLogsService {
     const rows = await this.prisma.auditLog.findMany({
       where,
       orderBy: { createdAt: 'desc' },
+      include: { actor: { select: { email: true } } },
       ...cursorFindManyArgs(params.cursor, limit),
     });
 
-    return toPaginatedResult(rows, limit);
+    const flattened = rows.map(({ actor, ...row }) => ({ ...row, actorEmail: actor.email }));
+
+    return toPaginatedResult(flattened, limit);
   }
 }

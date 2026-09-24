@@ -1,4 +1,4 @@
-import { IsInt, IsOptional, IsString, IsUUID, Min, MinLength } from 'class-validator';
+import { IsNumber, IsOptional, IsString, IsUUID, Min, MinLength } from 'class-validator';
 
 /**
  * API_CONTRACT.md only says `POST/GET/PATCH /subjects` without spelling out
@@ -21,8 +21,9 @@ export class CreateSubjectDto {
   @MinLength(1)
   name!: string;
 
+  // Float, not int — some programs award half-credit subjects (e.g. 4.5).
   @IsOptional()
-  @IsInt()
+  @IsNumber()
   @Min(0)
   credits?: number;
 }

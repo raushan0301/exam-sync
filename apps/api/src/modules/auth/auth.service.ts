@@ -163,6 +163,46 @@ export class AuthService {
     await this.auditService.record('LOGOUT', { userId, ...ctx });
   }
 
+  /**
+   * `POST /auth/change-password` — the only way to clear `mustChangePassword`
+   * (see JwtAuthGuard's enforcement). Requires the current password (proves
+   * the caller actually has it, not just a still-valid access token) and
+   * revokes every other refresh token this user holds, the same
+   * "assume compromise, force re-auth everywhere" response used for
+   * detected refresh-token reuse above — a password change is exactly the
+   * moment a session on a device that shouldn't have access anymore should
+   * be cut off.
+   */
+  async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+    ctx: RequestContext = {},
+  ): Promise<void> {
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+
+    const currentValid = await this.passwordService.verify(user.passwordHash, currentPassword);
+    if (!currentValid) {
+      await this.auditService.record('PASSWORD_CHANGE_FAILURE', { userId, ...ctx });
+      throw new UnauthorizedException('Current password is incorrect.');
+    }
+
+    const newPasswordHash = await this.passwordService.hash(newPassword);
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash: newPasswordHash, mustChangePassword: false },
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+
+    await this.auditService.record('PASSWORD_CHANGE_SUCCESS', { userId, ...ctx });
+  }
+
   private async issueTokenPair(userId: string): Promise<TokenPair> {
     const payload: JwtAccessPayload = { sub: userId };
     const accessToken = await this.jwtService.signAsync(payload, {

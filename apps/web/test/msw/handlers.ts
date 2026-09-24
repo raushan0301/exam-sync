@@ -7,6 +7,7 @@ export interface MockUser {
   email: string;
   isActive: boolean;
   roles: string[];
+  mustChangePassword: boolean;
   createdAt: string;
 }
 
@@ -15,6 +16,7 @@ export const ADMIN_USER: MockUser = {
   email: 'admin@exam-sync.test',
   isActive: true,
   roles: ['ADMIN'],
+  mustChangePassword: false,
   createdAt: '2024-01-01T00:00:00.000Z',
 };
 
@@ -23,6 +25,7 @@ export const FACULTY_USER: MockUser = {
   email: 'faculty@exam-sync.test',
   isActive: true,
   roles: ['FACULTY'],
+  mustChangePassword: false,
   createdAt: '2024-01-01T00:00:00.000Z',
 };
 
@@ -31,6 +34,7 @@ export const STUDENT_USER: MockUser = {
   email: 'student@exam-sync.test',
   isActive: true,
   roles: ['STUDENT'],
+  mustChangePassword: false,
   createdAt: '2024-01-01T00:00:00.000Z',
 };
 
@@ -90,14 +94,17 @@ export interface MockQuiz {
   subjectId: string;
   createdByFacultyId: string;
   durationMinutes?: number | null;
-  totalMarks?: number | null;
-  questionCount?: number | null;
+  studentCount?: number | null;
   instructions?: string | null;
   quizType?: string | null;
   preferredDate?: string | null;
   preferredTime?: string | null;
   academicYear: string;
   semester: number;
+  requestedRoomIds?: string[];
+  backupRoomId?: string | null;
+  roomAllocationStrategy?: string | null;
+  roomAdjustmentNote?: string | null;
   version?: number;
   createdAt: string;
   updatedAt: string;
@@ -202,6 +209,7 @@ export interface MockReportJob {
 export interface MockAuditLogEntry {
   id: string;
   actorId: string;
+  actorEmail: string;
   action: 'CREATE' | 'UPDATE' | 'DEACTIVATE' | 'REACTIVATE';
   entityType: string;
   entityId: string;
@@ -254,8 +262,9 @@ export interface MockProgram {
 export interface MockBatch {
   id: string;
   programId: string;
-  year: number;
+  year: string;
   section: string;
+  subsection: string;
   status: 'ACTIVE' | 'INACTIVE';
   createdAt: string;
   updatedAt: string;
@@ -367,6 +376,10 @@ export interface MockExamSession {
   version: number;
   /** Mock-only convenience: ids of currently-attached quizzes, resolved against QUIZZES for the detail response. */
   quizIds: string[];
+  requestedRoomIds?: string[];
+  backupRoomId?: string | null;
+  roomAllocationStrategy?: string | null;
+  roomRejectionReason?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -469,6 +482,11 @@ export let ROSTER: MockRosterEntry[] = [];
 export let FACULTY_ASSIGNMENTS: MockFacultyAssignment[] = [];
 export let ROOM_ALLOCATION_CONFLICT = false;
 export let ASSIGN_STUDENTS_RESULT = { total: 0, success: 0, failure: 0 };
+export let ELIGIBLE_STUDENT_COUNT = 0;
+
+export function setMockEligibleStudentCount(count: number) {
+  ELIGIBLE_STUDENT_COUNT = count;
+}
 
 export function setMockRooms(items: MockRoom[]) {
   ROOMS = items;
@@ -610,14 +628,30 @@ function bodyToRoomPatch(body: Record<string, unknown>): Partial<MockRoom> {
 function toExamSessionResponse(session: MockExamSession) {
   const { quizIds: _quizIds, ...rest } = session;
   void _quizIds;
-  return rest;
+  return {
+    ...rest,
+    requestedRoomIds: session.requestedRoomIds ?? [],
+    backupRoomId: session.backupRoomId ?? null,
+    roomAllocationStrategy: session.roomAllocationStrategy ?? null,
+    roomRejectionReason: session.roomRejectionReason ?? null,
+  };
 }
 
 function toExamSessionDetailResponse(session: MockExamSession) {
+  const backupRoom = session.backupRoomId ? ROOMS.find((r) => r.id === session.backupRoomId) : undefined;
   return {
     ...toExamSessionResponse(session),
     quizzes: QUIZZES.filter((q) => session.quizIds.includes(q.id)),
     rooms: EXAM_SESSION_ROOMS,
+    backupRoom: backupRoom
+      ? { ...backupRoom, allocatedCapacity: 0 }
+      : null,
+    // No mock SeatingPlan model to derive this from — tests covering the
+    // "seating done, waiting on invigilator" stepper state pass it via a
+    // more targeted fixture if/when they need it; every other test just
+    // gets the safe default (matches the real backend's answer whenever
+    // no room has a validated/finalized plan yet).
+    seatingReady: false,
   };
 }
 
@@ -645,6 +679,29 @@ export const handlers = [
     return new HttpResponse(null, { status: 204 });
   }),
 
+  // POST /auth/change-password — mock convention: any current_password other
+  // than the literal 'wrong-current-password' is treated as correct, so
+  // tests can exercise both the success and failure paths simply. On
+  // success, flips `mustChangePassword` false on the SAME MockUser object
+  // referenced by SESSION_TOKENS, so a subsequent GET /users/me reflects it.
+  http.post(`${API_BASE_URL}/auth/change-password`, async ({ request }) => {
+    const auth = request.headers.get('Authorization');
+    const token = auth?.replace('Bearer ', '');
+    const user = token ? SESSION_TOKENS[token] : undefined;
+    if (!user) {
+      return HttpResponse.json({ message: 'Unauthorized' }, { status: 401 });
+    }
+    const body = (await request.json()) as { current_password?: string; new_password?: string };
+    if (body.current_password === 'wrong-current-password') {
+      return HttpResponse.json({ message: 'Current password is incorrect.' }, { status: 401 });
+    }
+    if (!body.new_password || body.new_password.length < 8 || !/\d/.test(body.new_password)) {
+      return HttpResponse.json({ message: 'Password must be at least 8 characters and contain a number.' }, { status: 400 });
+    }
+    user.mustChangePassword = false;
+    return new HttpResponse(null, { status: 204 });
+  }),
+
   http.get(`${API_BASE_URL}/users/me`, ({ request }) => {
     const auth = request.headers.get('Authorization');
     const token = auth?.replace('Bearer ', '');
@@ -653,6 +710,10 @@ export const handlers = [
       return HttpResponse.json({ message: 'Unauthorized' }, { status: 401 });
     }
     return HttpResponse.json(user);
+  }),
+
+  http.get(`${API_BASE_URL}/quizzes/eligible-student-count`, () => {
+    return HttpResponse.json({ count: ELIGIBLE_STUDENT_COUNT });
   }),
 
   // GET /quizzes — self-scopes: FACULTY sees only quizzes it "created"
@@ -677,14 +738,28 @@ export const handlers = [
     if (subjectId) {
       items = items.filter((q) => q.subjectId === subjectId);
     }
-    return HttpResponse.json({ items, next_cursor: null });
+    const enriched = items.map((q) => {
+      const session = EXAM_SESSIONS.find((s) => s.quizIds.includes(q.id));
+      return { ...q, examSession: session ? { id: session.id, status: session.status } : null };
+    });
+    return HttpResponse.json({ items: enriched, next_cursor: null });
   }),
 
   http.post(`${API_BASE_URL}/quizzes`, async ({ request }) => {
     const user = userFromAuthHeader(request);
     if (!user) return HttpResponse.json({ message: 'Unauthorized' }, { status: 401 });
     const body = (await request.json()) as Record<string, unknown>;
-    if (!body.title || !body.subject_id || !Array.isArray(body.batch_ids) || (body.batch_ids as unknown[]).length === 0 || !body.academic_year || !body.semester) {
+    if (
+      !body.title ||
+      !body.subject_id ||
+      !Array.isArray(body.batch_ids) ||
+      (body.batch_ids as unknown[]).length === 0 ||
+      !body.academic_year ||
+      !body.semester ||
+      !body.student_count ||
+      !body.preferred_date ||
+      !body.preferred_time
+    ) {
       return HttpResponse.json({ message: 'Validation failed' }, { status: 400 });
     }
     const created: MockQuiz = {
@@ -694,14 +769,16 @@ export const handlers = [
       subjectId: body.subject_id as string,
       createdByFacultyId: user.id,
       durationMinutes: (body.duration_minutes as number | undefined) ?? null,
-      totalMarks: (body.total_marks as number | undefined) ?? null,
-      questionCount: (body.question_count as number | undefined) ?? null,
+      studentCount: (body.student_count as number | undefined) ?? null,
       instructions: (body.instructions as string | undefined) ?? null,
       quizType: (body.quiz_type as string | undefined) ?? null,
       preferredDate: (body.preferred_date as string | undefined) ?? null,
       preferredTime: (body.preferred_time as string | undefined) ?? null,
       academicYear: body.academic_year as string,
       semester: body.semester as number,
+      requestedRoomIds: [],
+      backupRoomId: null,
+      roomAllocationStrategy: null,
       version: 1,
       createdAt: NOW(),
       updatedAt: NOW(),
@@ -713,7 +790,22 @@ export const handlers = [
   http.get(`${API_BASE_URL}/quizzes/:id`, ({ params }) => {
     const quiz = QUIZZES.find((q) => q.id === params.id);
     if (!quiz) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
-    return HttpResponse.json(quiz);
+    const session = EXAM_SESSIONS.find((s) => s.quizIds.includes(quiz.id));
+    const examSession = session
+      ? {
+          id: session.id,
+          status: session.status,
+          rooms: EXAM_SESSION_ROOMS.map((r) => ({
+            id: r.id,
+            building: r.building,
+            floor: r.floor,
+            roomNumber: r.roomNumber,
+            capacity: r.capacity,
+            allocatedCapacity: r.allocatedCapacity,
+          })),
+        }
+      : null;
+    return HttpResponse.json({ ...quiz, examSession });
   }),
 
   http.patch(`${API_BASE_URL}/quizzes/:id`, async ({ request, params }) => {
@@ -734,8 +826,7 @@ export const handlers = [
       ...(body.academic_year !== undefined ? { academicYear: body.academic_year as string } : {}),
       ...(body.semester !== undefined ? { semester: body.semester as number } : {}),
       ...(body.duration_minutes !== undefined ? { durationMinutes: body.duration_minutes as number } : {}),
-      ...(body.total_marks !== undefined ? { totalMarks: body.total_marks as number } : {}),
-      ...(body.question_count !== undefined ? { questionCount: body.question_count as number } : {}),
+      ...(body.student_count !== undefined ? { studentCount: body.student_count as number } : {}),
       ...(body.instructions !== undefined ? { instructions: body.instructions as string } : {}),
       ...(body.quiz_type !== undefined ? { quizType: body.quiz_type as string } : {}),
       ...(body.preferred_date !== undefined ? { preferredDate: body.preferred_date as string } : {}),
@@ -755,8 +846,7 @@ export const handlers = [
     }
     const missing: string[] = [];
     if (quiz.durationMinutes == null) missing.push('duration_minutes');
-    if (quiz.totalMarks == null) missing.push('total_marks');
-    if (quiz.questionCount == null) missing.push('question_count');
+    if (quiz.studentCount == null) missing.push('student_count');
     if (quiz.quizType == null) missing.push('quiz_type');
     if (quiz.preferredDate == null) missing.push('preferred_date');
     if (quiz.preferredTime == null) missing.push('preferred_time');
@@ -1106,21 +1196,38 @@ export const handlers = [
     return HttpResponse.json({ items, next_cursor: null });
   }),
   http.post(`${API_BASE_URL}/batches`, async ({ request }) => {
-    const body = (await request.json()) as { program_id: string; year: number; section: string };
-    if (!body.program_id || !body.year || !body.section) {
+    const body = (await request.json()) as {
+      program_id: string;
+      year: string;
+      section: string;
+      subsection: string;
+    };
+    if (!body.program_id || !body.year || !body.section || !body.subsection) {
       return HttpResponse.json({ message: 'Validation failed' }, { status: 400 });
     }
     if (!PROGRAMS.some((p) => p.id === body.program_id)) {
       return HttpResponse.json({ message: 'Program not found' }, { status: 404 });
     }
-    if (BATCHES.some((b) => b.programId === body.program_id && b.year === body.year && b.section === body.section)) {
-      return HttpResponse.json({ message: 'Batch with this program/year/section already exists.' }, { status: 409 });
+    if (
+      BATCHES.some(
+        (b) =>
+          b.programId === body.program_id &&
+          b.year === body.year &&
+          b.section === body.section &&
+          b.subsection === body.subsection,
+      )
+    ) {
+      return HttpResponse.json(
+        { message: 'Batch with this program/year/section/subsection already exists.' },
+        { status: 409 },
+      );
     }
     const created: MockBatch = {
       id: nextId('batch'),
       programId: body.program_id,
       year: body.year,
       section: body.section,
+      subsection: body.subsection,
       status: 'ACTIVE',
       createdAt: NOW(),
       updatedAt: NOW(),
@@ -1189,8 +1296,10 @@ export const handlers = [
     const url = new URL(request.url);
     const status = url.searchParams.get('status');
     const search = url.searchParams.get('search');
+    const batchId = url.searchParams.get('batch_id');
     let items = STUDENTS;
     if (status) items = items.filter((s) => s.status === status);
+    if (batchId) items = items.filter((s) => s.batchId === batchId);
     if (search) {
       const s = search.toLowerCase();
       items = items.filter((it) => it.name.toLowerCase().includes(s) || it.rollNumber.toLowerCase().includes(s));
@@ -1257,6 +1366,13 @@ export const handlers = [
       items = items.filter((it) => it.name.toLowerCase().includes(s) || it.employeeCode.toLowerCase().includes(s));
     }
     return HttpResponse.json({ items, next_cursor: null });
+  }),
+  http.get(`${API_BASE_URL}/faculty/me`, ({ request }) => {
+    const user = userFromAuthHeader(request);
+    if (!user) return HttpResponse.json({ message: 'Unauthorized' }, { status: 401 });
+    const faculty = FACULTY.find((f) => f.userId === user.id);
+    if (!faculty) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    return HttpResponse.json(faculty);
   }),
   http.post(`${API_BASE_URL}/faculty`, async ({ request }) => {
     const body = (await request.json()) as { name: string; email: string; department_id: string; employee_code: string };
@@ -1462,6 +1578,18 @@ export const handlers = [
     return HttpResponse.json(items);
   }),
 
+  http.get(`${API_BASE_URL}/rooms/availability`, ({ request }) => {
+    const url = new URL(request.url);
+    const roomId = url.searchParams.get('room_id');
+    const items = (roomId ? ROOMS.filter((r) => r.id === roomId) : ROOMS).map((room) => ({
+      room,
+      bookedRanges: ROOM_ALLOCATION_CONFLICT
+        ? [{ start_time: '09:00:00', end_time: '11:00:00', source: 'EXAM_SESSION' as const, exam_session_name: 'Conflicting Session' }]
+        : [],
+    }));
+    return HttpResponse.json(items);
+  }),
+
   http.get(`${API_BASE_URL}/rooms`, ({ request }) => {
     const url = new URL(request.url);
     const search = url.searchParams.get('search');
@@ -1529,7 +1657,240 @@ export const handlers = [
     return HttpResponse.json({ items: AVAILABILITY_BLOCKS.filter((b) => b.roomId === params.id), next_cursor: null });
   }),
 
-  // -- Milestone 7: Room Allocation ------------------------------------
+  // -- Quiz-stage room suggestion + request (before any exam session exists) --
+  http.get(`${API_BASE_URL}/quizzes/:id/rooms/suggest`, ({ params }) => {
+    const quiz = QUIZZES.find((q) => q.id === params.id);
+    if (!quiz) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const totalStudents = quiz.studentCount ?? 0;
+    if (totalStudents === 0) {
+      return HttpResponse.json({ message: 'Set student_count on the quiz before requesting room suggestions.' }, { status: 409 });
+    }
+    const available = ROOMS.filter((r) => r.status === 'ACTIVE');
+    const sorted = [...available].sort((a, b) => b.capacity - a.capacity);
+    const rooms: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number; allocated: number }[] = [];
+    let remaining = totalStudents;
+    for (const r of sorted) {
+      if (remaining <= 0) break;
+      const allocated = Math.min(remaining, r.capacity);
+      rooms.push({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated });
+      remaining -= allocated;
+    }
+    const totalCapacity = rooms.reduce((sum, r) => sum + r.capacity, 0);
+    const strategy = (strategyKey: string, label: string, description: string) => ({
+      strategy: strategyKey,
+      label,
+      description,
+      roomCount: rooms.length,
+      totalCapacity,
+      utilizationPercent: totalCapacity === 0 ? 0 : Math.round((totalStudents / totalCapacity) * 100),
+      rooms,
+    });
+    const allRooms = [...available]
+      .sort((a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }))
+      .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity }));
+    return HttpResponse.json({
+      totalStudents,
+      shortfall: totalCapacity < totalStudents,
+      availableRoomCount: available.length,
+      strategies: [
+        strategy('FEWEST_ROOMS', 'Fewest Classes', 'Largest rooms first, filled to capacity.'),
+        strategy('SEQUENTIAL', 'Sequential (Adjacent Rooms)', 'Building/room-number order.'),
+        strategy('BALANCED_SPREAD', 'Balanced Spread', 'Same rooms, spread evenly.'),
+      ],
+      allRooms,
+    });
+  }),
+
+  http.post(`${API_BASE_URL}/quizzes/:id/rooms/request`, async ({ request, params }) => {
+    const idx = QUIZZES.findIndex((q) => q.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const user = userFromAuthHeader(request);
+    const isAdmin = user?.roles?.includes('ADMIN') ?? false;
+    const body = (await request.json()) as { room_ids: string[]; backup_room_id?: string; strategy?: string; admin_note?: string };
+    QUIZZES[idx] = {
+      ...QUIZZES[idx],
+      requestedRoomIds: body.room_ids,
+      backupRoomId: body.backup_room_id ?? null,
+      roomAllocationStrategy: body.strategy ?? null,
+      roomAdjustmentNote: isAdmin ? (body.admin_note ?? null) : null,
+    };
+    return HttpResponse.json(QUIZZES[idx]);
+  }),
+
+  http.get(`${API_BASE_URL}/quizzes/:id/rooms/conflicts`, ({ params }) => {
+    const quiz = QUIZZES.find((q) => q.id === params.id);
+    if (!quiz) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const toRow = (roomId: string) => {
+      const room = ROOMS.find((r) => r.id === roomId);
+      if (!room) return { roomId, building: '—', floor: 0, roomNumber: '—', capacity: 0, available: false, reason: 'Room no longer exists.' };
+      const available = !ROOM_ALLOCATION_CONFLICT;
+      return {
+        roomId: room.id,
+        building: room.building,
+        floor: room.floor,
+        roomNumber: room.roomNumber,
+        capacity: room.capacity,
+        available,
+        reason: available ? undefined : 'Room already booked for an overlapping session.',
+        alternatives: available
+          ? undefined
+          : ROOMS.filter((r) => r.status === 'ACTIVE' && r.id !== roomId && r.capacity >= room.capacity).map((r) => ({
+              roomId: r.id,
+              building: r.building,
+              floor: r.floor,
+              roomNumber: r.roomNumber,
+              capacity: r.capacity,
+            })),
+      };
+    };
+    return HttpResponse.json({
+      requestedRooms: (quiz.requestedRoomIds ?? []).map(toRow),
+      backupRoom: quiz.backupRoomId ? toRow(quiz.backupRoomId) : null,
+      strategy: quiz.roomAllocationStrategy ?? null,
+      studentConflicts: [],
+    });
+  }),
+
+  // -- Milestone 7 / room-request-approval: Room Allocation -------------
+  http.get(`${API_BASE_URL}/exam-sessions/:id/rooms/suggest`, ({ params }) => {
+    const session = EXAM_SESSIONS.find((s) => s.id === params.id);
+    if (!session) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const totalStudents = ROSTER.filter((r) => r.examSessionId === session.id && r.status === 'ASSIGNED').length;
+    if (totalStudents === 0) {
+      return HttpResponse.json({ message: 'This session has no ASSIGNED students to size room suggestions for.' }, { status: 409 });
+    }
+    const available = ROOMS.filter((r) => r.status === 'ACTIVE');
+    const sorted = [...available].sort((a, b) => b.capacity - a.capacity);
+    const rooms: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number; allocated: number }[] = [];
+    let remaining = totalStudents;
+    for (const r of sorted) {
+      if (remaining <= 0) break;
+      const allocated = Math.min(remaining, r.capacity);
+      rooms.push({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated });
+      remaining -= allocated;
+    }
+    const totalCapacity = rooms.reduce((sum, r) => sum + r.capacity, 0);
+    const strategy = (strategyKey: string, label: string, description: string) => ({
+      strategy: strategyKey,
+      label,
+      description,
+      roomCount: rooms.length,
+      totalCapacity,
+      utilizationPercent: totalCapacity === 0 ? 0 : Math.round((totalStudents / totalCapacity) * 100),
+      rooms,
+    });
+    const allRooms = [...available]
+      .sort((a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }))
+      .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity }));
+    return HttpResponse.json({
+      totalStudents,
+      shortfall: totalCapacity < totalStudents,
+      availableRoomCount: available.length,
+      strategies: [
+        strategy('FEWEST_ROOMS', 'Fewest Classes', 'Largest rooms first, filled to capacity.'),
+        strategy('SEQUENTIAL', 'Sequential (Adjacent Rooms)', 'Building/room-number order.'),
+        strategy('BALANCED_SPREAD', 'Balanced Spread', 'Same rooms, spread evenly.'),
+      ],
+      allRooms,
+    });
+  }),
+
+  http.post(`${API_BASE_URL}/exam-sessions/:id/rooms/request`, async ({ request, params }) => {
+    const idx = EXAM_SESSIONS.findIndex((s) => s.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const body = (await request.json()) as { room_ids: string[]; backup_room_id?: string; strategy?: string };
+    EXAM_SESSIONS[idx] = {
+      ...EXAM_SESSIONS[idx],
+      status: 'ROOM_ALLOCATION',
+      requestedRoomIds: body.room_ids,
+      backupRoomId: body.backup_room_id ?? null,
+      roomAllocationStrategy: body.strategy ?? null,
+      roomRejectionReason: null,
+      version: EXAM_SESSIONS[idx].version + 1,
+      updatedAt: NOW(),
+    };
+    return HttpResponse.json(toExamSessionResponse(EXAM_SESSIONS[idx]));
+  }),
+
+  http.get(`${API_BASE_URL}/exam-sessions/:id/rooms/preview`, ({ params }) => {
+    const session = EXAM_SESSIONS.find((s) => s.id === params.id);
+    if (!session) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const toRow = (roomId: string) => {
+      const room = ROOMS.find((r) => r.id === roomId);
+      if (!room) return { roomId, building: '—', floor: 0, roomNumber: '—', capacity: 0, available: false, reason: 'Room no longer exists.' };
+      const available = !ROOM_ALLOCATION_CONFLICT;
+      return {
+        roomId: room.id,
+        building: room.building,
+        floor: room.floor,
+        roomNumber: room.roomNumber,
+        capacity: room.capacity,
+        available,
+        reason: available ? undefined : 'Room already booked for an overlapping session.',
+        alternatives: available
+          ? undefined
+          : ROOMS.filter((r) => r.status === 'ACTIVE' && r.id !== roomId && r.capacity >= room.capacity).map((r) => ({
+              roomId: r.id,
+              building: r.building,
+              floor: r.floor,
+              roomNumber: r.roomNumber,
+              capacity: r.capacity,
+            })),
+      };
+    };
+    return HttpResponse.json({
+      requestedRooms: (session.requestedRoomIds ?? []).map(toRow),
+      backupRoom: session.backupRoomId ? toRow(session.backupRoomId) : null,
+      strategy: session.roomAllocationStrategy ?? null,
+      studentConflicts: [],
+    });
+  }),
+
+  http.post(`${API_BASE_URL}/exam-sessions/:id/rooms/reject`, async ({ request, params }) => {
+    const idx = EXAM_SESSIONS.findIndex((s) => s.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const body = (await request.json()) as { reason: string };
+    EXAM_SESSIONS[idx] = {
+      ...EXAM_SESSIONS[idx],
+      status: 'ASSIGNING_STUDENTS',
+      requestedRoomIds: [],
+      backupRoomId: null,
+      roomRejectionReason: body.reason,
+      version: EXAM_SESSIONS[idx].version + 1,
+      updatedAt: NOW(),
+    };
+    return HttpResponse.json(toExamSessionResponse(EXAM_SESSIONS[idx]));
+  }),
+
+  http.post(`${API_BASE_URL}/exam-sessions/:id/rooms/allocate-preapproved`, ({ params }) => {
+    const idx = EXAM_SESSIONS.findIndex((s) => s.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const session = EXAM_SESSIONS[idx];
+    const attachedQuizzes = QUIZZES.filter((q) => session.quizIds.includes(q.id));
+    if (attachedQuizzes.length === 0 || attachedQuizzes.some((q) => (q.requestedRoomIds ?? []).length === 0)) {
+      return HttpResponse.json({ message: 'One or more attached quizzes has no admin-approved room request.' }, { status: 409 });
+    }
+    if (ROOM_ALLOCATION_CONFLICT) {
+      return HttpResponse.json(
+        {
+          message: 'Insufficient room capacity for this session — allocation aborted (EC-011).',
+          details: [{ type: 'ROOM_UNAVAILABLE', message: 'Shortfall: 5 student(s), no additional capacity in the selected rooms.' }],
+        },
+        { status: 409 },
+      );
+    }
+    EXAM_SESSIONS[idx] = {
+      ...EXAM_SESSIONS[idx],
+      status: 'SEATING_GENERATION',
+      requestedRoomIds: [],
+      backupRoomId: null,
+      roomRejectionReason: null,
+      version: EXAM_SESSIONS[idx].version + 1,
+      updatedAt: NOW(),
+    };
+    return HttpResponse.json(toExamSessionResponse(EXAM_SESSIONS[idx]));
+  }),
+
   http.post(`${API_BASE_URL}/exam-sessions/:id/rooms/allocate`, async ({ params }) => {
     const idx = EXAM_SESSIONS.findIndex((s) => s.id === params.id);
     if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
@@ -1542,7 +1903,15 @@ export const handlers = [
         { status: 409 },
       );
     }
-    EXAM_SESSIONS[idx] = { ...EXAM_SESSIONS[idx], status: 'SEATING_GENERATION', version: EXAM_SESSIONS[idx].version + 1, updatedAt: NOW() };
+    EXAM_SESSIONS[idx] = {
+      ...EXAM_SESSIONS[idx],
+      status: 'SEATING_GENERATION',
+      requestedRoomIds: [],
+      backupRoomId: null,
+      roomRejectionReason: null,
+      version: EXAM_SESSIONS[idx].version + 1,
+      updatedAt: NOW(),
+    };
     return HttpResponse.json(toExamSessionResponse(EXAM_SESSIONS[idx]));
   }),
 
@@ -1569,7 +1938,22 @@ export const handlers = [
     const status = url.searchParams.get('status');
     let items = ROSTER.filter((r) => r.examSessionId === params.id);
     if (status) items = items.filter((r) => r.status === status);
-    return HttpResponse.json({ items, next_cursor: null });
+    // Mirrors the real backend's join (StudentAssignmentService.getRoster)
+    // so the roster response resolves human-readable labels the same way
+    // in tests — including for a detached quiz (e.g. after cancellation),
+    // where these labels must come from the row itself, not the session's
+    // current `quizzes` list.
+    const withLabels = items.map((r) => {
+      const quiz = QUIZZES.find((q) => q.id === r.quizId);
+      const student = STUDENTS.find((s) => s.id === r.studentId);
+      return {
+        ...r,
+        quizTitle: quiz?.title ?? r.quizId,
+        studentName: student?.name ?? r.studentId,
+        studentRollNumber: student?.rollNumber ?? '',
+      };
+    });
+    return HttpResponse.json({ items: withLabels, next_cursor: null });
   }),
 
   http.post(`${API_BASE_URL}/exam-sessions/:id/roster/:studentId`, async ({ request, params }) => {
@@ -1796,8 +2180,30 @@ export const handlers = [
     return HttpResponse.json(created, { status: 201 });
   }),
 
+  http.delete(`${API_BASE_URL}/exam-sessions/:id/invigilators/:invigilatorId`, ({ params }) => {
+    const existing = INVIGILATORS.find((i) => i.id === params.invigilatorId && i.examSessionId === params.id);
+    if (!existing) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    INVIGILATORS = INVIGILATORS.filter((i) => i.id !== params.invigilatorId);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
   http.get(`${API_BASE_URL}/faculty/:id/invigilation-duties`, ({ params }) => {
-    const items = INVIGILATORS.filter((i) => i.facultyId === params.id);
+    const items = INVIGILATORS.filter((i) => i.facultyId === params.id).map((i) => {
+      const session = EXAM_SESSIONS.find((s) => s.id === i.examSessionId);
+      const room = ROOMS.find((r) => r.id === i.roomId);
+      return {
+        ...i,
+        examSession: session
+          ? { name: session.name, sessionDate: session.sessionDate, startTime: session.startTime, endTime: session.endTime, status: session.status }
+          : { name: i.examSessionId, sessionDate: '', startTime: '', endTime: '', status: 'DRAFT' },
+        room: room ? { building: room.building, roomNumber: room.roomNumber } : { building: '', roomNumber: i.roomId },
+      };
+    });
+    return HttpResponse.json({ items, next_cursor: null });
+  }),
+
+  http.get(`${API_BASE_URL}/exam-sessions/:id/invigilators`, ({ params }) => {
+    const items = INVIGILATORS.filter((i) => i.examSessionId === params.id);
     return HttpResponse.json({ items, next_cursor: null });
   }),
 
@@ -1868,8 +2274,21 @@ export const handlers = [
   }),
 
   http.get(`${API_BASE_URL}/exam-sessions/:id/attendance`, ({ params }) => {
-    const assignmentIds = new Set(ROSTER.filter((r) => r.examSessionId === params.id).map((r) => r.id));
-    const items = ATTENDANCE.filter((a) => assignmentIds.has(a.quizStudentAssignmentId));
+    const rosterById = new Map(ROSTER.filter((r) => r.examSessionId === params.id).map((r) => [r.id, r]));
+    const items = ATTENDANCE.filter((a) => rosterById.has(a.quizStudentAssignmentId)).map((a) => {
+      const roster = rosterById.get(a.quizStudentAssignmentId)!;
+      const student = STUDENTS.find((s) => s.id === roster.studentId);
+      const quiz = QUIZZES.find((q) => q.id === roster.quizId);
+      const seat = ROOM_SEATS.find((s) => s.id === a.seatId);
+      return {
+        ...a,
+        quizStudentAssignment: {
+          student: { name: student?.name ?? roster.studentId, rollNumber: student?.rollNumber ?? '' },
+          quiz: { title: quiz?.title ?? roster.quizId },
+        },
+        seat: { seatLabel: seat?.seatLabel ?? a.seatId },
+      };
+    });
     return HttpResponse.json({ items, next_cursor: null });
   }),
 

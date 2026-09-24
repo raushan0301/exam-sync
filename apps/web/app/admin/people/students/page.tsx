@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -20,10 +20,17 @@ import {
 } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { useStudents } from '@/lib/queries/useStudents';
 import { usePrograms } from '@/lib/queries/usePrograms';
 import { useBatches } from '@/lib/queries/useBatches';
-import { useCreateStudent, useUpdateStudent, useBulkImportStudents } from '@/lib/mutations/useStudentMutations';
+import {
+  useCreateStudent,
+  useUpdateStudent,
+  useBulkImportStudents,
+  downloadStudentTemplate,
+  fetchImportJob,
+} from '@/lib/mutations/useStudentMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { Student } from '@/lib/queries/types';
 
@@ -46,8 +53,7 @@ export default function StudentsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Student | null>(null);
   const [deactivating, setDeactivating] = useState<Student | null>(null);
-  const [importResult, setImportResult] = useState<{ jobId: string } | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = useStudents({
     search,
@@ -58,7 +64,7 @@ export default function StudentsPage() {
   const { data: programsData } = usePrograms({ limit: 200, status: 'ACTIVE' });
   const { data: batchesData } = useBatches({ limit: 200, status: 'ACTIVE' });
   const programOptions = (programsData?.items ?? []).map((p) => ({ value: p.id, label: `${p.code} — ${p.name}` }));
-  const batchOptions = (batchesData?.items ?? []).map((b) => ({ value: b.id, label: `${b.section} (${b.year})` }));
+  const batchOptions = (batchesData?.items ?? []).map((b) => ({ value: b.id, label: `${b.section}/${b.subsection} (${b.year})` }));
   const programById = new Map((programsData?.items ?? []).map((p) => [p.id, p]));
   const batchById = new Map((batchesData?.items ?? []).map((b) => [b.id, b]));
 
@@ -120,23 +126,11 @@ export default function StudentsPage() {
     setDeactivating(null);
   }
 
-  async function onFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    try {
-      const res = await bulkImportMutation.mutateAsync(file);
-      setImportResult({ jobId: res.job_id });
-    } catch {
-      // Error surfaced via bulkImportMutation.error below.
-    }
-  }
-
   const columns: DataTableColumn<Student>[] = [
     { key: 'rollNumber', header: 'Roll No.', render: (s) => <span className="font-mono text-xs">{s.rollNumber}</span> },
     { key: 'name', header: 'Name', render: (s) => s.name },
     { key: 'program', header: 'Program', render: (s) => programById.get(s.programId)?.name ?? s.programId },
-    { key: 'batch', header: 'Batch', render: (s) => (batchById.get(s.batchId) ? `${batchById.get(s.batchId)!.section} (${batchById.get(s.batchId)!.year})` : s.batchId) },
+    { key: 'batch', header: 'Batch', render: (s) => (batchById.get(s.batchId) ? `${batchById.get(s.batchId)!.section}/${batchById.get(s.batchId)!.subsection} (${batchById.get(s.batchId)!.year})` : s.batchId) },
     { key: 'status', header: 'Status', render: (s) => <StatusBadge status={s.status} /> },
   ];
 
@@ -150,14 +144,12 @@ export default function StudentsPage() {
           <p className="text-sm text-text-muted">Manage student records and enrollment status.</p>
         </div>
         <div className="flex gap-2">
-          <input ref={fileInputRef} type="file" accept=".csv" className="hidden" onChange={onFileSelected} />
           <Button
             variant="secondary"
             leadingIcon={<Upload size={16} aria-hidden="true" />}
-            onClick={() => fileInputRef.current?.click()}
-            loading={bulkImportMutation.isPending}
+            onClick={() => setBulkImportOpen(true)}
           >
-            Bulk Import (CSV)
+            Bulk Import
           </Button>
           <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
             New Student
@@ -165,19 +157,13 @@ export default function StudentsPage() {
         </div>
       </div>
 
-      {importResult && (
-        <Alert color="success" title="Import submitted" dismissible>
-          The CSV was submitted for processing (job ID <span className="font-mono">{importResult.jobId}</span>).
-          Rows are validated individually — valid rows are created, invalid rows are skipped with a reason. There
-          is currently no status-tracking UI for import jobs; check with an administrator/backend team if you need
-          the detailed per-row results for this job.
-        </Alert>
-      )}
-      {bulkImportMutation.isError && (
-        <Alert color="danger" title="Import failed">
-          {mapError(bulkImportMutation.error).description}
-        </Alert>
-      )}
+      <Alert color="info">
+        <strong>Login credentials</strong> — Username is the student&apos;s email. The initial password is{' '}
+        <span className="font-mono text-xs">roll_number_name</span> (full name, lowercase, spaces removed) — e.g.
+        roll number <span className="font-mono text-xs">CSE2026001</span> + name &quot;Jane Doe&quot; →{' '}
+        <span className="font-mono text-xs">CSE2026001_janedoe</span>. They must set their own password on first
+        login.
+      </Alert>
 
       <FilterBar>
         <Search value={search} onChange={(v) => { setSearch(v); pager.reset(); }} debounceMs={300} label="Search students" placeholder="Search by name or roll number…" />
@@ -282,6 +268,15 @@ export default function StudentsPage() {
         destructive={deactivating?.status === 'ACTIVE'}
         loading={deactivateMutation.isPending}
         onConfirm={confirmDeactivate}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Student"
+        onDownloadTemplate={downloadStudentTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

@@ -41,6 +41,7 @@ function makeFaculty(overrides: Partial<MockFaculty> = {}): MockFaculty {
 const SUBJECT_ID = '44444444-4444-4444-8444-444444444444';
 const SUBJECT_ID_2 = '55555555-5555-4555-8555-555555555555';
 const BATCH_ID = '22222222-2222-4222-8222-222222222222';
+const BATCH_ID_2 = '33333333-3333-4333-8333-333333333333';
 
 function makeSubject(overrides: Partial<MockSubject> = {}): MockSubject {
   return {
@@ -61,8 +62,9 @@ function makeBatch(overrides: Partial<MockBatch> = {}): MockBatch {
   return {
     id: BATCH_ID,
     programId: '11111111-1111-4111-8111-111111111111',
-    year: 2025,
+    year: '2025',
     section: 'A',
+    subsection: 'A1',
     status: 'ACTIVE',
     createdAt: NOW,
     updatedAt: NOW,
@@ -123,7 +125,7 @@ describe('Faculty Assignments', () => {
     await userEvent.click(addButtons[0]);
 
     await userEvent.selectOptions(screen.getByLabelText(/^subject/i), SUBJECT_ID_2);
-    await userEvent.selectOptions(screen.getByLabelText(/^batch/i), BATCH_ID);
+    await userEvent.click(screen.getByLabelText('A/A1 (2025)'));
     await userEvent.type(screen.getByLabelText(/academic year/i), '2025-2026');
     await userEvent.clear(screen.getByLabelText(/^semester/i));
     await userEvent.type(screen.getByLabelText(/^semester/i), '2');
@@ -131,6 +133,76 @@ describe('Faculty Assignments', () => {
     await userEvent.click(screen.getByRole('button', { name: /^add$/i }));
 
     await waitFor(() => expect(screen.getByText('Data Structures')).toBeInTheDocument());
+  });
+
+  it('assigns the same faculty/subject to multiple batches in one submit', async () => {
+    signInAsAdmin();
+    setMockFaculty([makeFaculty()]);
+    setMockSubjects([makeSubject({ id: SUBJECT_ID_2, code: 'CS102', name: 'Data Structures' })]);
+    setMockBatches([makeBatch(), makeBatch({ id: BATCH_ID_2, section: 'B', subsection: 'B1' })]);
+    setMockFacultyAssignments([]);
+
+    renderWithProviders(<FacultyAssignmentsPage />);
+
+    const facultySelect = await screen.findByLabelText(/faculty member/i);
+    await screen.findByText('E001 — Dr. Smith');
+    await userEvent.selectOptions(facultySelect, 'fac-1');
+
+    await screen.findByText(/no teaching assignments/i);
+    await userEvent.click(screen.getAllByRole('button', { name: /add assignment/i })[0]);
+
+    await userEvent.selectOptions(screen.getByLabelText(/^subject/i), SUBJECT_ID_2);
+    await userEvent.click(screen.getByLabelText('A/A1 (2025)'));
+    await userEvent.click(screen.getByLabelText('B/B1 (2025)'));
+    await userEvent.type(screen.getByLabelText(/academic year/i), '2025-2026');
+    await userEvent.clear(screen.getByLabelText(/^semester/i));
+    await userEvent.type(screen.getByLabelText(/^semester/i), '2');
+
+    await userEvent.click(screen.getByRole('button', { name: /^add$/i }));
+
+    // Two independent assignment rows created — one per selected batch.
+    await waitFor(() => expect(screen.getAllByText('Data Structures')).toHaveLength(2));
+  });
+
+  it('reports which batch failed without losing the ones that succeeded', async () => {
+    signInAsAdmin();
+    setMockFaculty([makeFaculty()]);
+    setMockSubjects([makeSubject({ id: SUBJECT_ID_2, code: 'CS102', name: 'Data Structures' })]);
+    setMockBatches([makeBatch(), makeBatch({ id: BATCH_ID_2, section: 'B', subsection: 'B1' })]);
+    // Pre-seed an existing assignment for batch B so that one fails as a duplicate (BR-009).
+    setMockFacultyAssignments([
+      makeAssignment({
+        id: 'fa-existing',
+        subjectId: SUBJECT_ID_2,
+        batchId: BATCH_ID_2,
+        academicYear: '2025-2026',
+        semester: 2,
+      }),
+    ]);
+
+    renderWithProviders(<FacultyAssignmentsPage />);
+
+    const facultySelect = await screen.findByLabelText(/faculty member/i);
+    await screen.findByText('E001 — Dr. Smith');
+    await userEvent.selectOptions(facultySelect, 'fac-1');
+
+    await screen.findByText('Data Structures');
+    await userEvent.click(screen.getAllByRole('button', { name: /add assignment/i })[0]);
+
+    await userEvent.selectOptions(screen.getByLabelText(/^subject/i), SUBJECT_ID_2);
+    await userEvent.click(screen.getByLabelText('A/A1 (2025)'));
+    await userEvent.click(screen.getByLabelText('B/B1 (2025)'));
+    await userEvent.type(screen.getByLabelText(/academic year/i), '2025-2026');
+    await userEvent.clear(screen.getByLabelText(/^semester/i));
+    await userEvent.type(screen.getByLabelText(/^semester/i), '2');
+
+    await userEvent.click(screen.getByRole('button', { name: /^add$/i }));
+
+    // Batch A succeeded (now 2 rows total: the pre-seeded B + new A), and
+    // the modal stays open reporting exactly which batch failed and why.
+    await waitFor(() => expect(screen.getAllByText('Data Structures')).toHaveLength(2));
+    expect(await screen.findByText(/assigned 1 of 2 batch/i)).toBeInTheDocument();
+    expect(screen.getByText(/already exists/i)).toBeInTheDocument();
   });
 
   it('ends an assignment', async () => {

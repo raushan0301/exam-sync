@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { PaginatedResult, Quiz, QuizApprovalHistoryEntry, QuizStatus } from './types';
+import type { PaginatedResult, Quiz, QuizDetail, QuizApprovalHistoryEntry, QuizStatus } from './types';
 
 export interface UseQuizzesParams {
   status?: QuizStatus;
@@ -43,7 +43,7 @@ export function useQuizzes(params: UseQuizzesParams = {}) {
 export function useQuiz(id: string | undefined) {
   return useQuery({
     queryKey: queryKeys.quiz(id ?? ''),
-    queryFn: () => apiFetch<Quiz>(`/quizzes/${id}`),
+    queryFn: () => apiFetch<QuizDetail>(`/quizzes/${id}`),
     enabled: hasStoredSession() && !!id,
     staleTime: 10_000,
   });

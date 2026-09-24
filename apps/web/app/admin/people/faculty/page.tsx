@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Plus } from 'lucide-react';
+import { Plus, Upload } from 'lucide-react';
 import {
   Button,
   Input,
@@ -20,9 +20,16 @@ import {
 } from '@/components/ui';
 import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
 import { useCursorPager } from '@/components/data-table/useCursorPager';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { useFaculty } from '@/lib/queries/useFaculty';
 import { useDepartments } from '@/lib/queries/useDepartments';
-import { useCreateFaculty, useUpdateFaculty } from '@/lib/mutations/useFacultyMutations';
+import {
+  useCreateFaculty,
+  useUpdateFaculty,
+  useBulkImportFaculty,
+  downloadFacultyTemplate,
+} from '@/lib/mutations/useFacultyMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
 import { mapError } from '@/lib/error-mapping';
 import type { Faculty } from '@/lib/queries/types';
 
@@ -44,6 +51,7 @@ export default function FacultyPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Faculty | null>(null);
   const [deactivating, setDeactivating] = useState<Faculty | null>(null);
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
 
   const { data, isLoading, isError, refetch, isFetching } = useFaculty({
     search,
@@ -58,6 +66,7 @@ export default function FacultyPage() {
   const createMutation = useCreateFaculty();
   const updateMutation = useUpdateFaculty(editing?.id ?? '');
   const deactivateMutation = useUpdateFaculty(deactivating?.id ?? '');
+  const bulkImportMutation = useBulkImportFaculty();
 
   const createForm = useForm<FacultyFormValues>({
     resolver: zodResolver(facultySchema),
@@ -123,10 +132,27 @@ export default function FacultyPage() {
           <h1 className="text-xl font-semibold text-text">Faculty</h1>
           <p className="text-sm text-text-muted">Manage faculty records and department assignment.</p>
         </div>
-        <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
-          New Faculty
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            leadingIcon={<Upload size={16} aria-hidden="true" />}
+            onClick={() => setBulkImportOpen(true)}
+          >
+            Bulk Import
+          </Button>
+          <Button leadingIcon={<Plus size={16} aria-hidden="true" />} onClick={openCreate}>
+            New Faculty
+          </Button>
+        </div>
       </div>
+
+      <Alert color="info">
+        <strong>Login credentials</strong> — Username is the faculty member&apos;s email. The initial password is{' '}
+        <span className="font-mono text-xs">employee_code_name</span> (full name, lowercase, spaces removed) — e.g.
+        employee code <span className="font-mono text-xs">FAC001</span> + name &quot;John Smith&quot; →{' '}
+        <span className="font-mono text-xs">FAC001_johnsmith</span>. They must set their own password on first
+        login.
+      </Alert>
 
       <FilterBar>
         <Search value={search} onChange={(v) => { setSearch(v); pager.reset(); }} debounceMs={300} label="Search faculty" placeholder="Search by name or employee code…" />
@@ -220,6 +246,15 @@ export default function FacultyPage() {
         destructive={deactivating?.status === 'ACTIVE'}
         loading={deactivateMutation.isPending}
         onConfirm={confirmDeactivate}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Faculty"
+        onDownloadTemplate={downloadFacultyTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

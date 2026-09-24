@@ -112,24 +112,24 @@ export default function FacultyIncidentsPage() {
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Exam Session</p>
-                <p className="mt-1 font-mono text-xs text-text">{selected.examSessionId}</p>
+                <p className="mt-1 text-text">{selected.examSessionName}</p>
               </div>
-              {selected.roomId && (
+              {selected.roomLabel && (
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Room</p>
-                  <p className="mt-1 font-mono text-xs text-text">{selected.roomId}</p>
+                  <p className="mt-1 text-text">{selected.roomLabel}</p>
                 </div>
               )}
-              {selected.studentId && (
+              {selected.studentLabel && (
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Student</p>
-                  <p className="mt-1 font-mono text-xs text-text">{selected.studentId}</p>
+                  <p className="mt-1 text-text">{selected.studentLabel}</p>
                 </div>
               )}
-              {selected.quizId && (
+              {selected.quizTitle && (
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Quiz</p>
-                  <p className="mt-1 font-mono text-xs text-text">{selected.quizId}</p>
+                  <p className="mt-1 text-text">{selected.quizTitle}</p>
                 </div>
               )}
             </div>

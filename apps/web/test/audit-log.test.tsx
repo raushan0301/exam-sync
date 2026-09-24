@@ -8,6 +8,7 @@ import {
   ADMIN_USER,
   STUDENT_REFRESH_TOKEN,
   setMockAuditLogs,
+  setMockDepartments,
   type MockAuditLogEntry,
 } from './msw/handlers';
 
@@ -30,6 +31,7 @@ function makeAuditEntry(overrides: Partial<MockAuditLogEntry> = {}): MockAuditLo
   return {
     id: 'audit-1',
     actorId: 'u-admin',
+    actorEmail: 'admin@dev.local',
     action: 'UPDATE',
     entityType: 'Quiz',
     entityId: 'quiz-1',
@@ -75,7 +77,7 @@ describe('Admin: audit log', () => {
     });
   });
 
-  it('shows actor id, action, and a readable old->new diff in the detail drawer', async () => {
+  it('shows actor email (with raw id also available), action, and a readable old->new diff in the detail drawer', async () => {
     signInAsAdmin();
     setMockAuditLogs([makeAuditEntry({ id: 'a1' })]);
     renderWithProviders(<AdminAuditLogPage />);
@@ -88,10 +90,37 @@ describe('Admin: audit log', () => {
     await user.click(screen.getAllByRole('button', { name: /view/i })[0]);
 
     const drawer = await screen.findByRole('dialog');
+    expect(within(drawer).getByText('admin@dev.local')).toBeInTheDocument();
     expect(within(drawer).getByText('u-admin')).toBeInTheDocument();
     expect(within(drawer).getByText('status')).toBeInTheDocument();
     expect(within(drawer).getByText('DRAFT')).toBeInTheDocument();
     expect(within(drawer).getByText('SUBMITTED')).toBeInTheDocument();
     expect(within(drawer).getByText('req-123')).toBeInTheDocument();
+  });
+
+  it("resolves a known FK id (departmentId) in the diff to its human-readable label", async () => {
+    signInAsAdmin();
+    setMockDepartments([
+      { id: 'dept-1', name: 'Computer Science', code: 'CS', status: 'ACTIVE', metadata: null, createdAt: NOW, updatedAt: NOW },
+    ]);
+    setMockAuditLogs([
+      makeAuditEntry({
+        id: 'a1',
+        entityType: 'Program',
+        oldValue: null,
+        newValue: { departmentId: 'dept-1' },
+      }),
+    ]);
+    renderWithProviders(<AdminAuditLogPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByRole('button', { name: /view/i }).length).toBeGreaterThan(0);
+    });
+
+    const user = userEvent.setup();
+    await user.click(screen.getAllByRole('button', { name: /view/i })[0]);
+
+    const drawer = await screen.findByRole('dialog');
+    expect(within(drawer).getByText('CS — Computer Science (dept-1)')).toBeInTheDocument();
   });
 });

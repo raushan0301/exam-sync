@@ -64,9 +64,9 @@ describe('Student Assignment (e2e) — Phase 9', () => {
     departmentId = dept.id;
     const prog = await prisma.program.create({ data: { departmentId, name: 'B.Tech CSE', code: progCode } });
     programId = prog.id;
-    const batchA = await prisma.batch.create({ data: { programId, year: 2026, section: 'A' } });
+    const batchA = await prisma.batch.create({ data: { programId, year: '2026', section: 'A', subsection: 'A' } });
     batchAId = batchA.id;
-    const batchB = await prisma.batch.create({ data: { programId, year: 2026, section: 'B' } });
+    const batchB = await prisma.batch.create({ data: { programId, year: '2026', section: 'B', subsection: 'B' } });
     batchBId = batchB.id;
     const dbms = await prisma.subject.create({
       data: { departmentId, code: `DBMS-${suffix}`, name: 'Database Management Systems' },
@@ -171,7 +171,16 @@ describe('Student Assignment (e2e) — Phase 9', () => {
     const created = await request(app.getHttpServer())
       .post('/quizzes')
       .set('Authorization', `Bearer ${facultyAToken}`)
-      .send({ title: `P9 Quiz ${suffix}-${quizCounter}`, subject_id: dbmsSubjectId, batch_ids: batchIds, academic_year: '2026', semester: 1 })
+      .send({
+        title: `P9 Quiz ${suffix}-${quizCounter}`,
+        subject_id: dbmsSubjectId,
+        batch_ids: batchIds,
+        academic_year: '2026',
+        semester: 1,
+        student_count: 60,
+        preferred_date: '2026-05-01',
+        preferred_time: '10:00',
+      })
       .expect(201);
 
     await request(app.getHttpServer())
@@ -180,8 +189,7 @@ describe('Student Assignment (e2e) — Phase 9', () => {
       .set('If-Match', String(created.body.version))
       .send({
         duration_minutes: 60,
-        total_marks: 100,
-        question_count: 20,
+        student_count: 60,
         quiz_type: 'QUIZ',
         preferred_date: '2026-05-01',
         preferred_time: '10:00',
@@ -338,7 +346,7 @@ describe('Student Assignment (e2e) — Phase 9', () => {
       // same file — batchAId/dbmsSubjectId/academic_year/semester are
       // shared across the whole suite, so eligibility for a batchAId quiz
       // legitimately accumulates every eligible student created so far.
-      const isolatedBatch = await prisma.batch.create({ data: { programId, year: 2026, section: `R-${Date.now()}` } });
+      const isolatedBatch = await prisma.batch.create({ data: { programId, year: '2026', section: `R-${Date.now()}`, subsection: `R-${Date.now()}` } });
       await request(app.getHttpServer())
         .post('/faculty-assignments')
         .set('Authorization', `Bearer ${adminToken}`)

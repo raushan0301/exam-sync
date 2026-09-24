@@ -49,10 +49,10 @@ describe('nav config data shape', () => {
     expect((item as { href?: string }).href).toBe('/admin/notifications');
   });
 
-  it('FACULTY nav has 8 top-level entries including Dashboard and Notifications', () => {
+  it('FACULTY nav has 7 top-level entries including Dashboard and Notifications', () => {
     expect(FACULTY_NAV.some((e) => e.label === 'Dashboard')).toBe(true);
     expect(FACULTY_NAV.some((e) => e.label === 'Notifications')).toBe(true);
-    expect(FACULTY_NAV).toHaveLength(8);
+    expect(FACULTY_NAV).toHaveLength(7);
   });
 
   it('STUDENT nav has exactly 4 entries', () => {
@@ -77,8 +77,13 @@ describe('nav config data shape', () => {
     expect(faItem?.href).toBe('/admin/people/faculty-assignments');
   });
 
-  it('ADMIN nav Exam Sessions links to the create page (Milestone 6 — no list endpoint exists)', () => {
+  it('ADMIN nav Exam Sessions links to the read-only list page (faculty-lifecycle-ownership change: admin can no longer create sessions)', () => {
     const examSessions = ADMIN_NAV.find((e) => e.label === 'Exam Sessions');
-    expect(examSessions && !isNavGroup(examSessions) ? examSessions.href : undefined).toBe('/admin/exam-sessions/new');
+    expect(examSessions && !isNavGroup(examSessions) ? examSessions.href : undefined).toBe('/admin/exam-sessions');
+  });
+
+  it('FACULTY nav Exam Sessions links to the real "My Exam Sessions" list page (faculty-lifecycle-ownership change)', () => {
+    const examSessions = FACULTY_NAV.find((e) => e.label === 'Exam Sessions');
+    expect(examSessions && !isNavGroup(examSessions) ? examSessions.href : undefined).toBe('/faculty/exam-sessions');
   });
 });

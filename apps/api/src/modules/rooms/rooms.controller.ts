@@ -1,4 +1,19 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Res,
+  UploadedFile,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 import { RoomStatus } from '@exam-sync/db';
 import { RoomsService } from './rooms.service';
 import { CreateRoomDto } from './dto/create-room.dto';
@@ -8,6 +23,8 @@ import { CreateAvailabilityBlockDto } from './dto/create-availability-block.dto'
 import { Roles } from '../../common/auth/roles.decorator';
 import { CurrentUser } from '../../common/auth/current-user.decorator';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
+
+const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024;
 
 /**
  * Matches API_CONTRACT.md "Rooms" — `POST/GET/PATCH /rooms` incl. the
@@ -46,6 +63,19 @@ export class RoomsController {
       building,
       minCapacity: minCapacity ? parseInt(minCapacity, 10) : undefined,
     });
+  }
+
+  /**
+   * `GET /rooms/availability?date=YYYY-MM-DD[&room_id=...]` — new for the
+   * room-availability calendar (faculty picking a room/time BEFORE
+   * allocating, per-room booked time ranges; admin's read-only schedule
+   * view). Reachable by both ADMIN and FACULTY. Must be registered before
+   * `:id` for the same reason as `available` below.
+   */
+  @Roles(ROLE.ADMIN, ROLE.FACULTY)
+  @Get('availability')
+  getAvailability(@Query('date') date: string, @Query('room_id') roomId?: string) {
+    return this.roomsService.getAvailabilityCalendar(date, roomId);
   }
 
   /** Must be registered before `:id` — otherwise "available" would be parsed as a room id. */
@@ -111,5 +141,28 @@ export class RoomsController {
       cursor,
       limit: limit ? parseInt(limit, 10) : undefined,
     });
+  }
+
+  @Roles(ROLE.ADMIN)
+  @Get('bulk-import/template')
+  async downloadTemplate(@Res() res: Response) {
+    const buffer = await this.roomsService.generateBulkImportTemplate();
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': 'attachment; filename="room-bulk-import-template.xlsx"',
+    });
+    res.send(buffer);
+  }
+
+  @Roles(ROLE.ADMIN)
+  @HttpCode(HttpStatus.ACCEPTED)
+  @Post('bulk-import')
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_IMPORT_FILE_BYTES } }))
+  async bulkImport(
+    @UploadedFile() file: Express.Multer.File,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    const job = await this.roomsService.bulkImport(file.buffer, actor);
+    return { job_id: job.id };
   }
 }
