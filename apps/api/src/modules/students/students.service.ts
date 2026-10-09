@@ -39,7 +39,7 @@ export class StudentsService {
     private readonly passwordService: PasswordService,
     private readonly accessRepository: StudentsAccessRepository,
     private readonly importJobsService: ImportJobsService,
-  ) {}
+  ) { }
 
   async create(dto: CreateStudentDto, actor: AuthenticatedUser): Promise<Student> {
     await this.programsService.findById(dto.program_id);
@@ -148,11 +148,11 @@ export class StudentsService {
         batchId: params.batchId,
         ...(params.search
           ? {
-              OR: [
-                { name: { contains: params.search, mode: 'insensitive' } },
-                { rollNumber: { contains: params.search, mode: 'insensitive' } },
-              ],
-            }
+            OR: [
+              { name: { contains: params.search, mode: 'insensitive' } },
+              { rollNumber: { contains: params.search, mode: 'insensitive' } },
+            ],
+          }
           : {}),
       },
       orderBy: { createdAt: 'asc' },
@@ -228,22 +228,17 @@ export class StudentsService {
   /** `GET /students/bulk-import/template` (ADMIN). */
   /** Example row is a real existing student (+ their program's/batch's real codes) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
-    const sample = await this.prisma.student.findFirst({
-      where: { status: 'ACTIVE', program: { status: 'ACTIVE' }, batch: { status: 'ACTIVE' } },
-      orderBy: { createdAt: 'desc' },
-      include: { program: true, batch: true, user: true },
-    });
     return generateExcelTemplate({
       entityName: 'Student',
       uniqueFieldsNote: 'Unique key: roll_number (email must also be unique)',
       columns: [
-        { header: 'name', example: sample?.name ?? 'Jane Doe', note: 'Full name.' },
-        { header: 'email', example: sample?.user.email ?? 'jane.doe@example.com', note: 'Unique — used to provision the student login.' },
-        { header: 'program_code', example: sample?.program.code ?? 'BTECH-CSE', note: 'Must match an existing Program\'s code.' },
-        { header: 'batch_year', example: sample?.batch.year ?? '4', note: 'Cohort label of the batch — a single year ("2026") or a span ("2023-2027").' },
-        { header: 'batch_section', example: sample?.batch.section ?? '4C2', note: 'Coarse section of the batch.' },
-        { header: 'batch_subsection', example: sample?.batch.subsection ?? '4C24', note: 'Subsection of the batch — combined with program_code + batch_year + batch_section to identify the exact batch.' },
-        { header: 'roll_number', example: sample?.rollNumber ?? 'CSE2026001', note: 'Unique — cannot repeat an existing roll number.' },
+        { header: 'name', example: 'Raushan Raj', note: 'Full name.' },
+        { header: 'email', example: 'rraj_be23@thapar.edu', note: 'Unique — used to provision the student login.' },
+        { header: 'program_code', example: 'BE-COE', note: 'Must match an existing Program\'s code.' },
+        { header: 'batch_year', example: '2023-2027', note: 'Cohort label of the batch — a single year ("2026") or a span ("2023-2027").' },
+        { header: 'batch_section', example: '4C2', note: 'Coarse section of the batch.' },
+        { header: 'batch_subsection', example: '4C24', note: 'Subsection of the batch — combined with program_code + batch_year + batch_section to identify the exact batch.' },
+        { header: 'roll_number', example: '102303986', note: 'Unique — cannot repeat an existing roll number.' },
       ],
     });
   }

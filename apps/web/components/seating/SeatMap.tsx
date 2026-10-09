@@ -12,11 +12,16 @@ export interface SeatMapProps {
    * How to color occupied seats. `'subject'` (default) colors by quiz —
    * the M8 read-only mode. `'attendance'` (M9) colors by
    * `AttendanceStatus` instead and makes occupied seats CLICKABLE via
-   * `onAttendanceSeatClick` — this is the one interactive mode this
-   * component supports; `'subject'` stays strictly read-only-popover, same
-   * as M8 shipped it.
+   * `onAttendanceSeatClick`. `'incident'` also colors by subject (same
+   * palette as `'subject'`) but makes occupied seats clickable via
+   * `onIncidentSeatClick`, and highlights `selectedSeatId` distinctly —
+   * used by the incident-report form's "pick the seat/student" picker.
    */
-  coloring?: 'subject' | 'attendance';
+  coloring?: 'subject' | 'attendance' | 'incident';
+  /** `coloring="incident"` only: the currently-picked seat, highlighted distinctly from other occupied seats. */
+  selectedSeatId?: string;
+  /** `coloring="incident"` only: called when an occupied seat is clicked. Empty seats are not clickable. */
+  onIncidentSeatClick?: (assignment: SeatingAssignment) => void;
   /**
    * `coloring="attendance"` only: this quiz/session's attendance rows,
    * keyed by `seatId` (a seat holds at most one active occupant per plan,
@@ -80,6 +85,8 @@ const ATTENDANCE_STATUS_LABELS: Record<AttendanceStatus, string> = {
  * deliberate deferral); attendance status is a distinct field from seat
  * assignment and marking it never moves a student's seat.
  */
+const SELECTED_INCIDENT_COLOR = '#dc2626';
+
 export function SeatMap({
   seats,
   assignments,
@@ -87,6 +94,8 @@ export function SeatMap({
   attendanceBySeatId,
   onAttendanceSeatClick,
   attendanceOverrideBySeatId,
+  selectedSeatId,
+  onIncidentSeatClick,
 }: SeatMapProps) {
   const [openSeatId, setOpenSeatId] = useState<string | null>(null);
 
@@ -130,6 +139,7 @@ export function SeatMap({
   }
 
   const isAttendanceMode = coloring === 'attendance';
+  const isIncidentMode = coloring === 'incident';
 
   function effectiveStatus(seatId: string): AttendanceStatus | undefined {
     return attendanceOverrideBySeatId?.get(seatId) ?? attendanceBySeatId?.get(seatId)?.status;
@@ -137,6 +147,7 @@ export function SeatMap({
 
   function seatColor(assignment: SeatingAssignment | undefined, seatId: string): string | undefined {
     if (!assignment) return undefined;
+    if (isIncidentMode && seatId === selectedSeatId) return SELECTED_INCIDENT_COLOR;
     if (isAttendanceMode) {
       const status = effectiveStatus(seatId);
       return status ? ATTENDANCE_COLORS[status] : UNMARKED_COLOR;
@@ -146,6 +157,10 @@ export function SeatMap({
 
   function seatLabel(assignment: SeatingAssignment | undefined, seatId: string, seatLabelText: string): string {
     if (!assignment) return `Seat ${seatLabelText}, empty`;
+    if (isIncidentMode) {
+      const selectedText = seatId === selectedSeatId ? ', selected' : '';
+      return `Seat ${seatLabelText}, ${assignment.student.name} (${assignment.student.rollNumber})${selectedText}`;
+    }
     if (isAttendanceMode) {
       const status = effectiveStatus(seatId);
       const statusText = status ? ATTENDANCE_STATUS_LABELS[status] : 'not yet marked';
@@ -156,6 +171,10 @@ export function SeatMap({
 
   function onSeatClick(seatId: string, assignment: SeatingAssignment | undefined) {
     if (!assignment) return;
+    if (isIncidentMode) {
+      onIncidentSeatClick?.(assignment);
+      return;
+    }
     if (isAttendanceMode) {
       onAttendanceSeatClick?.(assignment, attendanceBySeatId?.get(seatId));
       return;
@@ -181,7 +200,7 @@ export function SeatMap({
                 // room per FRONTEND_UX_ARCHITECTURE.md §12) — bump from the
                 // M8 8x8 (32px) box to a ≥44px hit target; subject mode stays
                 // compact since it is desktop-review-only, never a touch flow.
-                const sizeClass = isAttendanceMode ? 'h-11 w-11 text-xs' : 'h-8 w-8 text-[10px]';
+                const sizeClass = isAttendanceMode || isIncidentMode ? 'h-11 w-11 text-xs' : 'h-8 w-8 text-[10px]';
                 return (
                   <button
                     key={seat.id}
@@ -223,6 +242,19 @@ export function SeatMap({
             Empty
           </span>
           <span className="text-text-subtle">Click a seat to toggle Present/Absent — hover for roll no. &amp; name.</span>
+        </div>
+      ) : isIncidentMode ? (
+        <div className="flex flex-wrap items-center gap-3 text-xs text-text-muted">
+          <span className="font-medium text-text">Legend:</span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block h-3 w-3 rounded-sm" style={{ backgroundColor: SELECTED_INCIDENT_COLOR }} aria-hidden="true" />
+            Selected
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block h-3 w-3 rounded-sm border border-border bg-surface" aria-hidden="true" />
+            Empty
+          </span>
+          <span className="text-text-subtle">Click an occupied seat to attach that student to this report.</span>
         </div>
       ) : (
         legendEntries.length > 0 && (

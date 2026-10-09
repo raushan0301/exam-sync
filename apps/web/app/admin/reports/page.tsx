@@ -2,10 +2,11 @@
 
 import { useState } from 'react';
 import { FileDown, RefreshCw } from 'lucide-react';
-import { Card, Select, Input, Button, Alert, LoadingState } from '@/components/ui';
+import { Card, Select, Button, Alert, LoadingState } from '@/components/ui';
 import { useCreateReport } from '@/lib/mutations/useReportMutations';
 import { useDownloadReportJob } from '@/lib/mutations/useReportMutations';
 import { useReportJob } from '@/lib/queries/useReportJob';
+import { useExamSessions } from '@/lib/queries/useExamSessions';
 import { mapError } from '@/lib/error-mapping';
 import type { ReportFormat, ReportType } from '@/lib/queries/types';
 
@@ -26,9 +27,11 @@ const FORMAT_OPTIONS: { value: ReportFormat; label: string }[] = [
  * share the identical `{exam_session_id, format}` body, so `useCreateReport`
  * is a single parameterized mutation switched by the selected type.
  *
- * There is deliberately NO exam-session picker here: the real backend has
- * no `GET /exam-sessions` list endpoint (confirmed gap, same class as M6's),
- * so the exam session is entered as a plain UUID text field.
+ * The exam session is picked from `GET /exam-sessions` (`useExamSessions`,
+ * ADMIN-unscoped — every session, not just ones the admin created) rather
+ * than typed as a raw UUID: that list endpoint already existed and is used
+ * elsewhere (`app/admin/exam-sessions/page.tsx`), this page just never
+ * called it.
  *
  * There is also deliberately NO report-job history/list below the form:
  * `GET /report-jobs/{id}` is the only report-job read endpoint that exists
@@ -47,18 +50,17 @@ export default function AdminReportsPage() {
   const createReport = useCreateReport(reportType);
   const download = useDownloadReportJob();
   const job = useReportJob(activeJobId);
-
-  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const examSessionsQuery = useExamSessions({ limit: 200 });
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setValidationError(null);
-    if (!UUID_RE.test(examSessionId.trim())) {
-      setValidationError('Enter a valid exam session ID (UUID).');
+    if (!examSessionId) {
+      setValidationError('Select an exam session.');
       return;
     }
     try {
-      const result = await createReport.mutateAsync({ exam_session_id: examSessionId.trim(), format });
+      const result = await createReport.mutateAsync({ exam_session_id: examSessionId, format });
       setActiveJobId(result.job_id);
     } catch {
       // surfaced via createReport.isError below
@@ -89,12 +91,17 @@ export default function AdminReportsPage() {
             onChange={(e) => setReportType(e.target.value as ReportType)}
             options={REPORT_TYPE_OPTIONS}
           />
-          <Input
-            label="Exam session ID"
+          <Select
+            label="Exam session"
             id="exam-session-id"
-            placeholder="e.g. 11111111-1111-4111-8111-111111111111"
             value={examSessionId}
             onChange={(e) => setExamSessionId(e.target.value)}
+            options={(examSessionsQuery.data?.items ?? []).map((s) => ({
+              value: s.id,
+              label: `${s.name} · ${s.sessionDate.slice(0, 10)}`,
+            }))}
+            placeholder={examSessionsQuery.isLoading ? 'Loading exam sessions…' : 'Select an exam session'}
+            disabled={examSessionsQuery.isLoading}
             error={validationError ?? undefined}
             required
           />

@@ -9,6 +9,7 @@ function buildPrismaMock() {
   };
   return {
     reportJob: { findUnique: jest.fn(), update: jest.fn() },
+    examSession: { findUnique: jest.fn().mockResolvedValue({ name: 'Test Session', sessionDate: new Date('2026-01-15') }) },
     attendance: { findMany: jest.fn() },
     seatingPlan: { findMany: jest.fn() },
     incident: { findMany: jest.fn() },

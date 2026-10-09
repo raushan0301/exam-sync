@@ -53,7 +53,7 @@ export class RoomsService {
     private readonly prisma: PrismaService,
     private readonly auditHook: AuditHookService,
     private readonly importJobsService: ImportJobsService,
-  ) {}
+  ) { }
 
   /**
    * `POST /rooms` (ADMIN). Immediately generates the room's `room_seats`
@@ -128,11 +128,11 @@ export class RoomsService {
         ...(params.minCapacity !== undefined ? { capacity: { gte: params.minCapacity } } : {}),
         ...(params.search
           ? {
-              OR: [
-                { building: { contains: params.search, mode: 'insensitive' } },
-                { roomNumber: { contains: params.search, mode: 'insensitive' } },
-              ],
-            }
+            OR: [
+              { building: { contains: params.search, mode: 'insensitive' } },
+              { roomNumber: { contains: params.search, mode: 'insensitive' } },
+            ],
+          }
           : {}),
       },
       orderBy: { createdAt: 'asc' },
@@ -435,17 +435,16 @@ export class RoomsService {
   /** `GET /rooms/bulk-import/template` (ADMIN). */
   /** Example row is a real existing room — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
-    const sample = await this.prisma.room.findFirst({ where: { status: 'ACTIVE' }, orderBy: { createdAt: 'desc' } });
     return generateExcelTemplate({
       entityName: 'Room',
       uniqueFieldsNote: 'Unique combination: building + room_number',
       columns: [
-        { header: 'building', example: sample?.building ?? 'Main Block', note: 'Building name.' },
-        { header: 'room_number', example: sample?.roomNumber ?? 'A101', note: 'Unique together with building.' },
-        { header: 'floor', example: sample ? String(sample.floor) : '1', note: 'Integer floor number.' },
-        { header: 'capacity', example: sample ? String(sample.capacity) : '60', note: 'Integer seating capacity.' },
-        { header: 'rows', example: sample ? String(sample.rows) : '10', note: 'Integer number of seat rows.' },
-        { header: 'columns', example: sample ? String(sample.columns) : '6', note: 'Integer number of seat columns.' },
+        { header: 'building', example: 'F-Block', note: 'Building name.' },
+        { header: 'room_number', example: 'F-101', note: 'Unique together with building.' },
+        { header: 'floor', example: 'G', note: 'Integer floor number.' },
+        { header: 'capacity', example: '60', note: 'Integer seating capacity.' },
+        { header: 'rows', example: '10', note: 'Integer number of seat rows.' },
+        { header: 'columns', example: '6', note: 'Integer number of seat columns.' },
       ],
     });
   }

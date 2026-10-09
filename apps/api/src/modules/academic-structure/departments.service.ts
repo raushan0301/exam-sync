@@ -194,13 +194,12 @@ export class DepartmentsService {
    * way for the same reason (see each one's own reference to this note).
    */
   async generateBulkImportTemplate(): Promise<Buffer> {
-    const sample = await this.prisma.department.findFirst({ where: { status: 'ACTIVE' }, orderBy: { createdAt: 'desc' } });
     return generateExcelTemplate({
       entityName: 'Department',
       uniqueFieldsNote: 'Unique key: code',
       columns: [
-        { header: 'code', example: sample?.code ?? 'CSE', note: 'Unique — cannot repeat an existing department code.' },
-        { header: 'name', example: sample?.name ?? 'Computer Science & Engineering', note: 'Display name.' },
+        { header: 'code', example: 'CSED', note: 'Unique — cannot repeat an existing department code.' },
+        { header: 'name', example: 'COMPUTER SCIENCE AND ENGINEERING', note: 'Display name.' },
       ],
     });
   }

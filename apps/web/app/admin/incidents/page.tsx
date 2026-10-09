@@ -5,57 +5,39 @@ import { AlertTriangle } from 'lucide-react';
 import {
   Card,
   StatusBadge,
-  Badge,
   Skeleton,
-  EmptyState,
   ErrorState,
   Drawer,
   Modal,
   Textarea,
   Button,
+  Select,
+  FilterBar,
+  Pagination,
   Alert,
 } from '@/components/ui';
 import { cn } from '@/components/ui/utils';
+import { DataTable, type DataTableColumn } from '@/components/data-table/DataTable';
+import { useCursorPager } from '@/components/data-table/useCursorPager';
 import { useIncidents, useIncidentHistory } from '@/lib/queries/useIncidents';
 import { useUpdateIncidentStatus } from '@/lib/mutations/useIncidentMutations';
 import { mapError } from '@/lib/error-mapping';
 import { getAvailableActionsForStatus, actionRequiresResolution, INCIDENT_ACTION_LABELS } from '@/lib/incident-workflow';
-import type { Incident, IncidentAction, IncidentStatus } from '@/lib/queries/types';
-import { INCIDENT_TYPE_OPTIONS } from '@/components/incident/IncidentForm';
+import type { Incident, IncidentAction, IncidentSeverity, IncidentStatus } from '@/lib/queries/types';
+import { INCIDENT_TYPE_OPTIONS, SEVERITY_OPTIONS } from '@/components/incident/IncidentForm';
+import { IncidentSeatHighlight } from '@/components/incident/IncidentSeatHighlight';
 
-const COLUMNS: { status: IncidentStatus; label: string }[] = [
-  { status: 'OPEN', label: 'Open' },
-  { status: 'UNDER_REVIEW', label: 'Under Review' },
-  { status: 'ESCALATED', label: 'Escalated' },
-  { status: 'RESOLVED', label: 'Resolved' },
-  { status: 'DISMISSED', label: 'Dismissed' },
+const STATUS_TABS: { value: IncidentStatus | ''; label: string }[] = [
+  { value: '', label: 'All' },
+  { value: 'OPEN', label: 'Open' },
+  { value: 'UNDER_REVIEW', label: 'Under Review' },
+  { value: 'ESCALATED', label: 'Escalated' },
+  { value: 'RESOLVED', label: 'Resolved' },
+  { value: 'DISMISSED', label: 'Dismissed' },
 ];
 
 function typeLabel(type: string): string {
   return INCIDENT_TYPE_OPTIONS.find((o) => o.value === type)?.label ?? type;
-}
-
-function IncidentCard({ incident, onClick }: { incident: Incident; onClick: () => void }) {
-  const critical = incident.severity === 'CRITICAL';
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'flex w-full flex-col gap-2 rounded-lg border bg-surface p-3 text-left transition-colors duration-150 ease hover:bg-neutral-50',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500',
-        critical ? 'border-danger-border border-2' : 'border-border',
-      )}
-    >
-      <div className="flex items-center justify-between gap-2">
-        <StatusBadge status={incident.severity} />
-        {critical && <AlertTriangle size={16} className="text-danger-text" aria-hidden="true" />}
-      </div>
-      <p className="text-sm font-medium text-text">{typeLabel(incident.incidentType)}</p>
-      <p className="line-clamp-2 text-xs text-text-muted">{incident.description}</p>
-      <p className="text-[11px] text-text-subtle">{new Date(incident.createdAt).toLocaleDateString()}</p>
-    </button>
-  );
 }
 
 interface PendingAction {
@@ -143,6 +125,13 @@ function IncidentDetailDrawer({ incident, onClose }: { incident: Incident; onClo
           </div>
         )}
 
+        {incident.roomId && incident.seatId && (
+          <div className="border-t border-border pt-4">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">Seat</p>
+            <IncidentSeatHighlight roomId={incident.roomId} seatId={incident.seatId} studentLabel={incident.studentLabel} />
+          </div>
+        )}
+
         {availableActions.length > 0 && (
           <div className="flex flex-wrap gap-2 border-t border-border pt-4">
             {availableActions.map((action) => (
@@ -225,45 +214,137 @@ function IncidentDetailDrawer({ incident, onClose }: { incident: Incident; onClo
   );
 }
 
+const PAGE_SIZE = 25;
+
+/**
+ * Admin incident triage — a filtered, cursor-paginated table, not an
+ * unbounded per-status kanban board. The old version fetched a flat
+ * `limit: 100` and split it into 5 status columns client-side: at 10k+
+ * incidents that (a) only ever showed the newest 100 incidents total no
+ * matter which status column you looked at, and (b) rendered every one of
+ * those 100 as its own card, all at once, with no way to page further.
+ * Status/severity are now real server-side filters (`GET /incidents`
+ * already supported both — see `incidents.service.ts`'s `list()` — the old
+ * UI just never used them), each status tab and severity change resets
+ * pagination (`pager.reset()`) since a filter change invalidates any cursor
+ * from the previous filter's result set.
+ */
 export default function AdminIncidentsPage() {
-  const { data, isLoading, isError, refetch, isFetching } = useIncidents({ limit: 100 });
+  const [status, setStatus] = useState<IncidentStatus | ''>('');
+  const [severity, setSeverity] = useState<IncidentSeverity | ''>('');
+  const pager = useCursorPager();
+
+  const { data, isLoading, isError, refetch, isFetching } = useIncidents({
+    status: status || undefined,
+    severity: severity || undefined,
+    cursor: pager.cursor,
+    limit: PAGE_SIZE,
+  });
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const items = data?.items ?? [];
   const selected = items.find((i) => i.id === selectedId) ?? null;
-  const byStatus = (status: IncidentStatus) => items.filter((i) => i.status === status);
+
+  function onStatusChange(next: IncidentStatus | '') {
+    setStatus(next);
+    pager.reset();
+  }
+
+  function onSeverityChange(next: IncidentSeverity | '') {
+    setSeverity(next);
+    pager.reset();
+  }
+
+  const columns: DataTableColumn<Incident>[] = [
+    {
+      key: 'severity',
+      header: 'Severity',
+      render: (i) => (
+        <span className="flex items-center gap-1.5">
+          {i.severity === 'CRITICAL' && <AlertTriangle size={14} className="text-danger-text" aria-hidden="true" />}
+          <StatusBadge status={i.severity} />
+        </span>
+      ),
+    },
+    { key: 'type', header: 'Type', render: (i) => typeLabel(i.incidentType) },
+    { key: 'description', header: 'Description', render: (i) => <span className="line-clamp-1 max-w-xs">{i.description}</span> },
+    { key: 'session', header: 'Exam Session', render: (i) => i.examSessionName },
+    { key: 'room', header: 'Room', render: (i) => i.roomLabel ?? '—' },
+    { key: 'student', header: 'Student', render: (i) => i.studentLabel ?? '—' },
+    { key: 'status', header: 'Status', render: (i) => <StatusBadge status={i.status} /> },
+    { key: 'reported', header: 'Reported', render: (i) => new Date(i.createdAt).toLocaleString() },
+  ];
 
   return (
     <div className="flex flex-col gap-4">
       <div>
         <h1 className="text-xl font-semibold text-text">Incident Triage</h1>
-        <p className="text-sm text-text-muted">All reported incidents, grouped by status.</p>
+        <p className="text-sm text-text-muted">All reported incidents. Filter by status or severity — critical incidents are flagged.</p>
       </div>
 
-      {isError && <ErrorState title="Couldn't load incidents" onRetry={() => refetch()} retrying={isFetching} />}
+      <div className="flex flex-wrap gap-1 rounded-lg border border-border bg-surface-muted p-1" role="tablist" aria-label="Filter by status">
+        {STATUS_TABS.map((tab) => (
+          <button
+            key={tab.value || 'all'}
+            type="button"
+            role="tab"
+            aria-selected={status === tab.value}
+            onClick={() => onStatusChange(tab.value)}
+            className={cn(
+              'rounded-md px-3 py-1.5 text-sm font-medium transition-colors duration-150 ease focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500',
+              status === tab.value ? 'bg-surface text-text shadow-sm' : 'text-text-muted hover:text-text',
+            )}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
-      {!isError && (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
-          {COLUMNS.map((col) => (
-            <Card key={col.status} className="flex flex-col gap-3">
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-semibold text-text">{col.label}</h2>
-                <Badge color="neutral">{isLoading ? '…' : byStatus(col.status).length}</Badge>
-              </div>
-              <div className="flex flex-col gap-2">
-                {isLoading &&
-                  Array.from({ length: 2 }).map((_, i) => <Skeleton key={i} className="h-20 w-full" />)}
-                {!isLoading && byStatus(col.status).length === 0 && (
-                  <EmptyState title={`No ${col.label.toLowerCase()} incidents`} />
-                )}
-                {!isLoading &&
-                  byStatus(col.status).map((incident) => (
-                    <IncidentCard key={incident.id} incident={incident} onClick={() => setSelectedId(incident.id)} />
-                  ))}
-              </div>
-            </Card>
-          ))}
-        </div>
+      <FilterBar>
+        <Select
+          value={severity}
+          onChange={(e) => onSeverityChange(e.target.value as IncidentSeverity | '')}
+          options={[{ value: '', label: 'All severities' }, ...SEVERITY_OPTIONS.map((o) => ({ value: o.value, label: o.label }))]}
+          containerClassName="w-48"
+        />
+      </FilterBar>
+
+      {isError ? (
+        <ErrorState title="Couldn't load incidents" onRetry={() => refetch()} retrying={isFetching} />
+      ) : isLoading && items.length === 0 ? (
+        <Card>
+          <div className="flex flex-col gap-2">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-10 w-full" />
+            ))}
+          </div>
+        </Card>
+      ) : (
+        <>
+          <DataTable
+            columns={columns}
+            data={items}
+            getRowKey={(i) => i.id}
+            isLoading={isLoading}
+            isError={isError}
+            errorTitle="Couldn't load incidents"
+            emptyTitle="No incidents match these filters"
+            emptyDescription="Try a different status or severity."
+            rowClassName={(i) => (i.severity === 'CRITICAL' ? 'border-l-2 border-l-danger-text bg-danger-bg/40' : undefined)}
+            renderActions={(i) => (
+              <Button size="sm" variant="secondary" onClick={() => setSelectedId(i.id)}>
+                Review
+              </Button>
+            )}
+          />
+          <Pagination
+            hasNext={!!data?.next_cursor}
+            hasPrev={pager.hasPrev}
+            onNext={() => pager.goNext(data?.next_cursor)}
+            onPrev={pager.goPrev}
+          />
+        </>
       )}
 
       {selected && <IncidentDetailDrawer incident={selected} onClose={() => setSelectedId(null)} />}

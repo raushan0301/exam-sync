@@ -60,6 +60,15 @@ const ACTION_TARGET_STATUS: Record<IncidentAction, IncidentStatus | null> = {
   [IncidentAction.DISMISS]: IncidentStatus.DISMISSED,
 };
 
+/** Past-tense wording for the status-change notification message — `${action.toLowerCase()}d` breaks for DISMISS ("dismissd"), so spelled out explicitly instead. */
+const ACTION_PAST_TENSE: Record<IncidentAction, string> = {
+  [IncidentAction.CREATE]: 'reported',
+  [IncidentAction.INVESTIGATE]: 'moved to Under Review',
+  [IncidentAction.ESCALATE]: 'escalated',
+  [IncidentAction.RESOLVE]: 'resolved',
+  [IncidentAction.DISMISS]: 'dismissed',
+};
+
 /**
  * Owns `incidents` + `incident_history` (ARCHITECTURE.md §Z/§AA/§AD-2 #6,
  * IMPLEMENTATION_PLAN.md Phase 18: "incident CRUD, workflow, severity,
@@ -159,15 +168,20 @@ export class IncidentsService {
         },
       });
 
-      // BR-038: CRITICAL severity triggers an immediate Admin notification
-      // at creation time, in the SAME transaction as the write (BR-042
-      // outbox discipline) — queued into the critical lane automatically,
-      // since INCIDENT_STATUS_UPDATED is already routed there
-      // (`common/queue/queue.constants.ts`, pre-sized in Phase 15/16
-      // specifically for this caller).
-      if (dto.severity === IncidentSeverity.CRITICAL) {
-        await this.notifyAdmins(tx, incident, `A CRITICAL incident was reported: ${dto.incident_type}.`);
-      }
+      // BR-038: every newly-reported incident notifies admins immediately,
+      // in the SAME transaction as the write (BR-042 outbox discipline) —
+      // CRITICAL severity gets a distinctly worded message (still queued
+      // into the same critical lane INCIDENT_STATUS_UPDATED already routes
+      // to, `common/queue/queue.constants.ts`), everything else a plain
+      // "new incident reported" one so admins are never left waiting on
+      // the triage board to happen to refetch.
+      await this.notifyAdmins(
+        tx,
+        incident,
+        dto.severity === IncidentSeverity.CRITICAL
+          ? `A CRITICAL incident was reported: ${dto.incident_type}.`
+          : `A new incident was reported: ${dto.incident_type}.`,
+      );
 
       await this.auditHook.record(
         {
@@ -234,13 +248,12 @@ export class IncidentsService {
         },
       });
 
-      // ARCHITECTURE.md §AA/§Z's escalation rule + EC-030: an explicit
-      // ESCALATE always triggers the same immediate Admin notification
-      // CRITICAL severity does at creation, regardless of the incident's
-      // own severity value.
-      if (dto.action === IncidentAction.ESCALATE) {
-        await this.notifyAdmins(tx, row, `Incident escalated: ${existing.incidentType}.`);
-      }
+      // Every status transition notifies admins — not just ESCALATE
+      // (ARCHITECTURE.md §AA/§Z's escalation rule + EC-030 originally only
+      // required that one), so other admins stay in sync when one of them
+      // investigates/resolves/dismisses an incident too, not only when it
+      // gets worse.
+      await this.notifyAdmins(tx, row, `Incident ${ACTION_PAST_TENSE[dto.action]}: ${existing.incidentType}.`);
 
       await this.auditHook.record(
         {

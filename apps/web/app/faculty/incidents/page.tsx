@@ -7,6 +7,7 @@ import { DataTable, type DataTableColumn } from '@/components/data-table/DataTab
 import { useIncidents } from '@/lib/queries/useIncidents';
 import type { Incident, IncidentSeverity, IncidentStatus } from '@/lib/queries/types';
 import { INCIDENT_TYPE_OPTIONS, SEVERITY_OPTIONS } from '@/components/incident/IncidentForm';
+import { IncidentSeatHighlight } from '@/components/incident/IncidentSeatHighlight';
 
 const STATUS_OPTIONS: { value: IncidentStatus; label: string }[] = [
   { value: 'OPEN', label: 'Open' },
@@ -61,15 +62,13 @@ export default function FacultyIncidentsPage() {
         <Select
           value={status}
           onChange={(e) => setStatus(e.target.value)}
-          options={STATUS_OPTIONS}
-          placeholder="All statuses"
+          options={[{ value: '', label: 'All statuses' }, ...STATUS_OPTIONS]}
           containerClassName="w-48"
         />
         <Select
           value={severity}
           onChange={(e) => setSeverity(e.target.value)}
-          options={SEVERITY_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
-          placeholder="All severities"
+          options={[{ value: '', label: 'All severities' }, ...SEVERITY_OPTIONS.map((o) => ({ value: o.value, label: o.label }))]}
           containerClassName="w-48"
         />
       </FilterBar>
@@ -137,6 +136,12 @@ export default function FacultyIncidentsPage() {
               <div>
                 <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Resolution</p>
                 <p className="mt-1 text-sm text-text">{selected.resolution}</p>
+              </div>
+            )}
+            {selected.roomId && selected.seatId && (
+              <div>
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">Seat</p>
+                <IncidentSeatHighlight roomId={selected.roomId} seatId={selected.seatId} studentLabel={selected.studentLabel} />
               </div>
             )}
             <p className="text-xs text-text-subtle">

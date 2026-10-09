@@ -32,7 +32,7 @@ export class BatchesService {
     private readonly auditHook: AuditHookService,
     private readonly programsService: ProgramsService,
     private readonly importJobsService: ImportJobsService,
-  ) {}
+  ) { }
 
   async create(dto: CreateBatchDto, actor: AuthenticatedUser): Promise<Batch> {
     // Confirms the program exists — Batch belongs to exactly one Program.
@@ -182,19 +182,14 @@ export class BatchesService {
   /** `GET /batches/bulk-import/template` (ADMIN). */
   /** Example row is a real existing batch (+ its program's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
-    const sample = await this.prisma.batch.findFirst({
-      where: { status: 'ACTIVE', program: { status: 'ACTIVE' } },
-      orderBy: { createdAt: 'desc' },
-      include: { program: true },
-    });
     return generateExcelTemplate({
       entityName: 'Batch',
       uniqueFieldsNote: 'Unique combination: program code + year + section + subsection',
       columns: [
-        { header: 'program_code', example: sample?.program.code ?? 'BE-COE', note: 'Must match an existing Program\'s code.' },
-        { header: 'year', example: sample?.year ?? '4', note: 'Cohort label — a single year ("2026") or a span ("2023-2027").' },
-        { header: 'section', example: sample?.section ?? '4C2', note: 'Coarse section, groups multiple subsections.' },
-        { header: 'subsection', example: sample?.subsection ?? '4C24', note: 'Unique together with program code + year + section.' },
+        { header: 'program_code', example: 'BE-COE', note: 'Must match an existing Program\'s code.' },
+        { header: 'year', example: '2023-2027', note: 'Cohort label — a single year ("2026") or a span ("2023-2027").' },
+        { header: 'section', example: '4C2', note: 'Coarse section, groups multiple subsections.' },
+        { header: 'subsection', example: '4C24', note: 'Unique together with program code + year + section.' },
       ],
     });
   }

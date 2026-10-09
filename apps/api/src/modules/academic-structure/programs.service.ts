@@ -32,7 +32,7 @@ export class ProgramsService {
     private readonly auditHook: AuditHookService,
     private readonly departmentsService: DepartmentsService,
     private readonly importJobsService: ImportJobsService,
-  ) {}
+  ) { }
 
   async create(dto: CreateProgramDto, actor: AuthenticatedUser): Promise<Program> {
     // Confirms the department exists (API_CONTRACT.md: "404 bad dept") —
@@ -87,11 +87,11 @@ export class ProgramsService {
         departmentId: params.departmentId,
         ...(params.search
           ? {
-              OR: [
-                { name: { contains: params.search, mode: 'insensitive' } },
-                { code: { contains: params.search, mode: 'insensitive' } },
-              ],
-            }
+            OR: [
+              { name: { contains: params.search, mode: 'insensitive' } },
+              { code: { contains: params.search, mode: 'insensitive' } },
+            ],
+          }
           : {}),
       },
       orderBy: { createdAt: 'asc' },
@@ -166,18 +166,13 @@ export class ProgramsService {
   /** `GET /programs/bulk-import/template` (ADMIN). */
   /** Example row is a real existing program (+ its department's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
-    const sample = await this.prisma.program.findFirst({
-      where: { status: 'ACTIVE', department: { status: 'ACTIVE' } },
-      orderBy: { createdAt: 'desc' },
-      include: { department: true },
-    });
     return generateExcelTemplate({
       entityName: 'Program',
       uniqueFieldsNote: 'Unique key: code',
       columns: [
-        { header: 'department_code', example: sample?.department.code ?? 'CSE', note: 'Must match an existing Department\'s code.' },
-        { header: 'code', example: sample?.code ?? 'BTECH-CSE', note: 'Unique — cannot repeat an existing program code.' },
-        { header: 'name', example: sample?.name ?? 'B.Tech Computer Science', note: 'Display name.' },
+        { header: 'department_code', example: 'CSED', note: 'Must match an existing Department\'s code.' },
+        { header: 'code', example: 'BE-COE', note: 'Unique — cannot repeat an existing program code.' },
+        { header: 'name', example: 'Computer Engineering', note: 'Display name.' },
       ],
     });
   }

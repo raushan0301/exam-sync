@@ -45,6 +45,13 @@ async function bootstrap() {
   app.enableCors({
     origin: (process.env.CORS_ALLOWED_ORIGINS ?? 'http://localhost:3001').split(','),
     credentials: false, // bearer-token auth, not cookies — no credentials mode needed
+    // Response headers are otherwise invisible to cross-origin JS (the CORS
+    // "safelist" is tiny by default and doesn't include this one) — without
+    // it, `GET /report-jobs/{id}/download`'s `Content-Disposition` header
+    // reads back as null in the browser even though curl/Postman see it
+    // fine, and apps/web's `downloadReportJob` silently falls back to a
+    // meaningless `report-${jobId}` filename.
+    exposedHeaders: ['Content-Disposition'],
   });
 
   // Input validation at the API boundary (ARCHITECTURE.md §AG) — every DTO

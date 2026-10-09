@@ -35,7 +35,7 @@ export class SubjectsService {
     private readonly departmentsService: DepartmentsService,
     private readonly programsService: ProgramsService,
     private readonly importJobsService: ImportJobsService,
-  ) {}
+  ) { }
 
   async create(dto: CreateSubjectDto, actor: AuthenticatedUser): Promise<Subject> {
     await this.departmentsService.findById(dto.department_id);
@@ -92,11 +92,11 @@ export class SubjectsService {
         programId: params.programId,
         ...(params.search
           ? {
-              OR: [
-                { name: { contains: params.search, mode: 'insensitive' } },
-                { code: { contains: params.search, mode: 'insensitive' } },
-              ],
-            }
+            OR: [
+              { name: { contains: params.search, mode: 'insensitive' } },
+              { code: { contains: params.search, mode: 'insensitive' } },
+            ],
+          }
           : {}),
       },
       orderBy: { createdAt: 'asc' },
@@ -174,20 +174,15 @@ export class SubjectsService {
   /** `GET /subjects/bulk-import/template` (ADMIN). */
   /** Example row is a real existing subject (+ its department's/program's real codes) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
-    const sample = await this.prisma.subject.findFirst({
-      where: { isActive: true, department: { status: 'ACTIVE' } },
-      orderBy: { createdAt: 'desc' },
-      include: { department: true, program: true },
-    });
     return generateExcelTemplate({
       entityName: 'Subject',
       uniqueFieldsNote: 'Unique key: code',
       columns: [
-        { header: 'department_code', example: sample?.department.code ?? 'CSE', note: 'Must match an existing Department\'s code.' },
-        { header: 'program_code', example: sample?.program?.code ?? '', note: 'Optional — must match an existing Program\'s code when given, blank otherwise.' },
-        { header: 'code', example: sample?.code ?? 'CS301', note: 'Unique — cannot repeat an existing subject code.' },
-        { header: 'name', example: sample?.name ?? 'Data Structures', note: 'Display name.' },
-        { header: 'credits', example: sample?.credits != null ? String(sample.credits) : '4.5', note: 'Optional — a number, whole or half-credit (e.g. 4, 3.5).' },
+        { header: 'department_code', example: 'CSED', note: 'Must match an existing Department\'s code.' },
+        { header: 'program_code', example: 'BE-COE', note: 'Optional — must match an existing Program\'s code when given, blank otherwise.' },
+        { header: 'code', example: 'UCS301', note: 'Unique — cannot repeat an existing subject code.' },
+        { header: 'name', example: 'Data Structures', note: 'Display name.' },
+        { header: 'credits', example: '4.5', note: 'Optional — a number, whole or half-credit (e.g. 4, 3.5).' },
       ],
     });
   }

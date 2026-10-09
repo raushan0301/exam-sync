@@ -210,15 +210,19 @@ describe('IncidentsService', () => {
       );
     });
 
-    it('does NOT queue a notification for non-CRITICAL severity', async () => {
+    it('also queues an Admin notification for non-CRITICAL severity, so admins are never left waiting on the triage board', async () => {
       examSessionsService.findById.mockResolvedValue({ id: 's1', status: 'IN_PROGRESS' });
       facultyService.findByUserId.mockResolvedValue({ id: 'fac-1' });
       prisma.examInvigilator.findFirst.mockResolvedValue({ facultyId: 'fac-1' });
       prisma.__tx.incident.create.mockResolvedValue({ ...baseIncident, severity: IncidentSeverity.LOW });
+      prisma.__tx.user.findMany.mockResolvedValue([{ id: 'admin-user-1' }]);
 
       await service.create(dto, facultyActor);
 
-      expect(notificationsOutbox.queue).not.toHaveBeenCalled();
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        prisma.__tx,
+        expect.objectContaining({ recipientId: 'admin-user-1', eventType: 'INCIDENT_STATUS_UPDATED' }),
+      );
     });
 
     it('validates optional FK targets exist (quiz/student/room)', async () => {
@@ -317,13 +321,14 @@ describe('IncidentsService', () => {
       );
     });
 
-    it('UNDER_REVIEW -> RESOLVED via RESOLVE with a resolution, stamping resolvedByAdminId/resolvedAt', async () => {
+    it('UNDER_REVIEW -> RESOLVED via RESOLVE with a resolution, stamping resolvedByAdminId/resolvedAt, and notifies Admins', async () => {
       prisma.incident.findUnique.mockResolvedValue({ ...baseIncident, status: IncidentStatus.UNDER_REVIEW });
       prisma.__tx.incident.update.mockResolvedValue({
         ...baseIncident,
         status: IncidentStatus.RESOLVED,
         resolution: 'Verified false alarm',
       });
+      prisma.__tx.user.findMany.mockResolvedValue([{ id: 'admin-user-1' }]);
 
       const result = await service.updateStatus(
         'inc-1',
@@ -341,6 +346,10 @@ describe('IncidentsService', () => {
           resolvedAt: expect.any(Date),
         },
       });
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        prisma.__tx,
+        expect.objectContaining({ recipientId: 'admin-user-1', eventType: 'INCIDENT_STATUS_UPDATED' }),
+      );
     });
 
     it('UNDER_REVIEW -> DISMISSED via DISMISS with a resolution', async () => {

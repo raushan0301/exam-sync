@@ -59,7 +59,7 @@ export class ReportWorkerService implements OnModuleInit, OnModuleDestroy {
     try {
       const table = await this.buildTable(job.reportType, job.examSessionId);
       const file = await writeReportFile(table, job.format);
-      const filename = `${job.reportType.toLowerCase()}-${job.examSessionId}.${file.extension}`;
+      const filename = await this.buildFilename(job.reportType, job.examSessionId, file.extension);
 
       const resultUrl = `/report-jobs/${reportJobId}/download`;
       // BR-042 outbox discipline: the COMPLETED status write and the
@@ -96,6 +96,26 @@ export class ReportWorkerService implements OnModuleInit, OnModuleDestroy {
         data: { status: ReportJobStatus.FAILED, errorMessage: (err as Error).message },
       });
     }
+  }
+
+  /**
+   * A human-readable download filename — the exam session's own name and
+   * date, not its raw UUID (which is what the old `${reportType}-${examSessionId}`
+   * pattern produced, and all a downloader ever saw was a meaningless
+   * random-looking string). Falls back to the UUID only if the session
+   * was deleted out from under an already-COMPLETED job (can't happen
+   * today — nothing deletes exam sessions — but cheaper than a crash if
+   * that ever changes).
+   */
+  private async buildFilename(reportType: ReportType, examSessionId: string, extension: string): Promise<string> {
+    const session = await this.prisma.examSession.findUnique({
+      where: { id: examSessionId },
+      select: { name: true, sessionDate: true },
+    });
+    const sessionSlug = session
+      ? `${slugify(session.name)}-${session.sessionDate.toISOString().slice(0, 10)}`
+      : examSessionId;
+    return `${slugify(reportType)}-${sessionSlug}.${extension}`;
   }
 
   /**
@@ -170,4 +190,12 @@ export class ReportWorkerService implements OnModuleInit, OnModuleDestroy {
       }
     }
   }
+}
+
+/** Lowercase, hyphen-separated, filesystem-safe — e.g. "Cyber quiz 1 — Exam" -> "cyber-quiz-1-exam". */
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'report';
 }

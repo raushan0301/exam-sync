@@ -27,7 +27,7 @@ const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024; // 5 MB — mirrors students.cont
 /** Matches API_CONTRACT.md "Departments / Programs / Batches" exactly. */
 @Controller('departments')
 export class DepartmentsController {
-  constructor(private readonly departmentsService: DepartmentsService) {}
+  constructor(private readonly departmentsService: DepartmentsService) { }
 
   @Roles(ROLE.ADMIN)
   @Post()

@@ -38,6 +38,8 @@ export interface DataTableProps<T> {
   renderActions?: (item: T) => ReactNode;
   /** Number of skeleton rows to render while loading with no cached data yet. */
   skeletonRows?: number;
+  /** Optional per-row className (e.g. a left-border accent for high-severity rows). */
+  rowClassName?: (item: T) => string | undefined;
 }
 
 /**
@@ -62,6 +64,7 @@ export function DataTable<T>({
   emptyAction,
   renderActions,
   skeletonRows = 5,
+  rowClassName,
 }: DataTableProps<T>) {
   if (isError) {
     return <ErrorState title={errorTitle} description={errorDescription} onRetry={onRetry} retrying={retrying} />;
@@ -118,7 +121,7 @@ export function DataTable<T>({
       </TableHeader>
       <TableBody>
         {data.map((item) => (
-          <TableRow key={getRowKey(item)}>
+          <TableRow key={getRowKey(item)} className={rowClassName?.(item)}>
             {columns.map((col) => (
               <TableCell key={col.key} align={col.align}>
                 {col.render(item)}

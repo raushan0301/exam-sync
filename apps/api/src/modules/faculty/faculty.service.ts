@@ -45,7 +45,7 @@ export class FacultyService {
     private readonly passwordService: PasswordService,
     private readonly accessRepository: FacultyAccessRepository,
     private readonly importJobsService: ImportJobsService,
-  ) {}
+  ) { }
 
   async create(dto: CreateFacultyDto, actor: AuthenticatedUser): Promise<Faculty> {
     await this.departmentsService.findById(dto.department_id);
@@ -145,11 +145,11 @@ export class FacultyService {
         departmentId: params.departmentId,
         ...(params.search
           ? {
-              OR: [
-                { name: { contains: params.search, mode: 'insensitive' } },
-                { employeeCode: { contains: params.search, mode: 'insensitive' } },
-              ],
-            }
+            OR: [
+              { name: { contains: params.search, mode: 'insensitive' } },
+              { employeeCode: { contains: params.search, mode: 'insensitive' } },
+            ],
+          }
           : {}),
       },
       orderBy: { createdAt: 'asc' },
@@ -224,19 +224,14 @@ export class FacultyService {
   /** `GET /faculty/bulk-import/template` (ADMIN). */
   /** Example row is a real existing faculty member (+ their department's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
-    const sample = await this.prisma.faculty.findFirst({
-      where: { status: 'ACTIVE', department: { status: 'ACTIVE' } },
-      orderBy: { createdAt: 'desc' },
-      include: { department: true, user: true },
-    });
     return generateExcelTemplate({
       entityName: 'Faculty',
       uniqueFieldsNote: 'Unique key: employee_code (email must also be unique)',
       columns: [
-        { header: 'department_code', example: sample?.department.code ?? 'CSE', note: 'Must match an existing Department\'s code.' },
-        { header: 'employee_code', example: sample?.employeeCode ?? 'EMP1001', note: 'Unique — cannot repeat an existing employee code.' },
-        { header: 'name', example: sample?.name ?? 'Dr. Jane Doe', note: 'Full name.' },
-        { header: 'email', example: sample?.user.email ?? 'jane.doe@example.com', note: 'Unique — used to provision the faculty login.' },
+        { header: 'department_code', example: 'CSED', note: 'Must match an existing Department\'s code.' },
+        { header: 'employee_code', example: '102303', note: 'Unique — cannot repeat an existing employee code.' },
+        { header: 'name', example: 'Dr. Jaskirat Singh', note: 'Full name.' },
+        { header: 'email', example: 'jsingh@thapar.edu', note: 'Unique — used to provision the faculty login.' },
       ],
     });
   }
