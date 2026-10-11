@@ -11,6 +11,7 @@ export const STATUS_CONFIG = {
   // Quiz
   DRAFT: { label: 'Draft', color: 'neutral' },
   SUBMITTED: { label: 'Submitted', color: 'info' },
+  PENDING: { label: 'Pending', color: 'warning' },
   APPROVED: { label: 'Approved', color: 'success' },
   REJECTED: { label: 'Rejected', color: 'danger' },
 

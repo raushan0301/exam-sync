@@ -1,10 +1,12 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, StudentSubjectEnrollment, EnrollmentStatus } from '@exam-sync/db';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma, StudentSubjectEnrollment, EnrollmentStatus, ImportJob } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
 import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
+import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
+import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
 import { StudentsService } from '../students';
 import { SubjectsService, BatchesService } from '../academic-structure';
 import { FacultyAssignmentsService } from '../faculty-assignment';
@@ -243,34 +245,219 @@ export class EnrollmentsService {
     rows: CreateEnrollmentDto[],
     actor: AuthenticatedUser,
   ) {
-    const results: ImportRowResult[] = [];
-    let successCount = 0;
-    let failureCount = 0;
+    const uniq = (vals: string[]) => [...new Set(vals)];
+    const [students, subjects, batches] = await Promise.all([
+      this.prisma.student.findMany({ where: { id: { in: uniq(rows.map((r) => r.student_id)) } }, select: { id: true } }),
+      this.prisma.subject.findMany({ where: { id: { in: uniq(rows.map((r) => r.subject_id)) } }, select: { id: true } }),
+      this.prisma.batch.findMany({ where: { id: { in: uniq(rows.map((r) => r.batch_id)) } }, select: { id: true } }),
+    ]);
+    const studentIds = new Set(students.map((x) => x.id));
+    const subjectIds = new Set(subjects.map((x) => x.id));
+    const batchIds = new Set(batches.map((x) => x.id));
 
-    for (let i = 0; i < rows.length; i++) {
-      const rowNumber = i + 1;
+    return this.runBulk(
+      rows.map((dto, i) => ({
+        rowNumber: i + 1,
+        resolve: () => {
+          if (!studentIds.has(dto.student_id)) throw new NotFoundException('Student not found');
+          if (!subjectIds.has(dto.subject_id)) throw new NotFoundException('Subject not found');
+          if (!batchIds.has(dto.batch_id)) throw new NotFoundException('Batch not found');
+          return dto;
+        },
+      })),
+      actor,
+    );
+  }
+
+  /**
+   * Fixed number of queries regardless of row count (the old per-row loop
+   * cost ~7 sequential round trips to the remote database PER enrollment):
+   * one duplicate lookup, one batched insert, one batched audit write.
+   * One bad row never blocks the rest (EC-044).
+   */
+  private async runBulk(
+    items: { rowNumber: number; resolve: () => CreateEnrollmentDto }[],
+    actor: AuthenticatedUser,
+  ): Promise<ImportJob> {
+    const failures = new Map<number, string>();
+    const created = new Map<number, string>();
+    const valid: { rowNumber: number; dto: CreateEnrollmentDto }[] = [];
+
+    for (const item of items) {
       try {
-        const enrollment = await this.create(rows[i], actor);
-        results.push({ row: rowNumber, status: 'SUCCESS', id: enrollment.id });
-        successCount++;
+        valid.push({ rowNumber: item.rowNumber, dto: item.resolve() });
       } catch (err) {
-        results.push({
-          row: rowNumber,
-          status: 'FAILURE',
-          error: err instanceof Error ? err.message : 'Unknown error',
-        });
-        failureCount++;
+        failures.set(item.rowNumber, err instanceof Error ? err.message : 'Unknown error');
       }
     }
 
+    if (valid.length > 0) {
+      await this.insertEnrollments(valid, actor, created, failures);
+    }
+
+    const results: ImportRowResult[] = items.map((item) =>
+      created.has(item.rowNumber)
+        ? { row: item.rowNumber, status: 'SUCCESS', id: created.get(item.rowNumber) }
+        : { row: item.rowNumber, status: 'FAILURE', error: failures.get(item.rowNumber) ?? 'Unknown error' },
+    );
+
     return this.importJobsService.create({
       resourceType: 'enrollments',
-      totalRows: rows.length,
-      successCount,
-      failureCount,
+      totalRows: items.length,
+      successCount: created.size,
+      failureCount: items.length - created.size,
       results,
       createdByUserId: actor.id,
     });
+  }
+
+  private async insertEnrollments(
+    valid: { rowNumber: number; dto: CreateEnrollmentDto }[],
+    actor: AuthenticatedUser,
+    created: Map<number, string>,
+    failures: Map<number, string>,
+  ): Promise<void> {
+    const ALREADY = 'This student is already enrolled in this subject for this academic year/semester.';
+    const keyOf = (d: CreateEnrollmentDto) => `${d.student_id}|${d.subject_id}|${d.academic_year}|${d.semester}`;
+    const uniq = <T,>(vals: T[]) => [...new Set(vals)];
+
+    // Superset query (each column IN its own values), then exact-match in memory.
+    const existing = await this.prisma.studentSubjectEnrollment.findMany({
+      where: {
+        studentId: { in: uniq(valid.map((v) => v.dto.student_id)) },
+        subjectId: { in: uniq(valid.map((v) => v.dto.subject_id)) },
+        academicYear: { in: uniq(valid.map((v) => v.dto.academic_year)) },
+        semester: { in: uniq(valid.map((v) => v.dto.semester)) },
+      },
+      select: { studentId: true, subjectId: true, academicYear: true, semester: true },
+    });
+    const taken = new Set(existing.map((e) => `${e.studentId}|${e.subjectId}|${e.academicYear}|${e.semester}`));
+
+    const toCreate: typeof valid = [];
+    for (const v of valid) {
+      const key = keyOf(v.dto);
+      if (taken.has(key)) {
+        failures.set(v.rowNumber, ALREADY);
+      } else {
+        taken.add(key); // a repeat later in the same file now counts as already enrolled
+        toCreate.push(v);
+      }
+    }
+    if (toCreate.length === 0) return;
+
+    try {
+      const rows = await this.prisma.$transaction(async (tx) => {
+        const inserted = await tx.studentSubjectEnrollment.createManyAndReturn({
+          data: toCreate.map((v) => ({
+            studentId: v.dto.student_id,
+            subjectId: v.dto.subject_id,
+            batchId: v.dto.batch_id,
+            academicYear: v.dto.academic_year,
+            semester: v.dto.semester,
+          })),
+        });
+        await this.auditHook.recordMany(
+          inserted.map((row) => ({
+            actor,
+            action: 'CREATE' as const,
+            entityType: 'StudentSubjectEnrollment',
+            entityId: row.id,
+            newValue: row,
+          })),
+          tx,
+        );
+        return inserted;
+      });
+      const idByKey = new Map(rows.map((r) => [`${r.studentId}|${r.subjectId}|${r.academicYear}|${r.semester}`, r.id]));
+      for (const v of toCreate) created.set(v.rowNumber, idByKey.get(keyOf(v.dto)) as string);
+    } catch {
+      // The batched insert is all-or-nothing (e.g. a concurrent request enrolled one of
+      // these after the duplicate check) — retry row by row so only the offender fails.
+      for (const v of toCreate) {
+        try {
+          created.set(v.rowNumber, (await this.create(v.dto, actor)).id);
+        } catch (err) {
+          failures.set(v.rowNumber, err instanceof Error ? err.message : 'Unknown error');
+        }
+      }
+    }
+  }
+
+  /** `GET /enrollments/bulk-import/template` (ADMIN). */
+  async generateBulkImportTemplate(): Promise<Buffer> {
+    return generateExcelTemplate({
+      entityName: 'Enrollment',
+      uniqueFieldsNote: 'Unique combination: roll_number + subject_code + academic_year + semester. One row per student per subject.',
+      columns: [
+        { header: 'roll_number', example: '102303986', note: 'Must match an existing student\'s roll number.' },
+        { header: 'subject_code', example: 'UCS301', note: 'Must match an existing subject\'s code.' },
+        { header: 'academic_year', example: '2025-2026', note: 'Academic year label, e.g. "2025-2026".' },
+        { header: 'semester', example: '5', note: 'Whole number, 1 or higher.' },
+      ],
+    });
+  }
+
+  /**
+   * `POST /enrollments/bulk-import` (ADMIN) — one row per student per subject.
+   * The enrollment's batch is the student's CURRENT batch (the point-in-time
+   * snapshot rule, EC-017, is applied at enrollment time). One bad row never
+   * blocks the rest (EC-044); an already-enrolled row is a per-row FAILURE,
+   * same as every other bulk import.
+   */
+  async bulkImport(buffer: Buffer, actor: AuthenticatedUser): Promise<ImportJob> {
+    const records = await parseExcelBuffer(buffer, ['roll_number', 'subject_code', 'academic_year', 'semester']);
+
+    // Two lookups for the whole file instead of two per row.
+    const rollNumbers = [...new Set(records.map((r) => r.roll_number?.trim()).filter(Boolean))];
+    const subjectCodes = [...new Set(records.map((r) => r.subject_code?.trim()).filter(Boolean))];
+    const [students, subjects] = await Promise.all([
+      this.prisma.student.findMany({
+        where: { rollNumber: { in: rollNumbers } },
+        select: { id: true, rollNumber: true, batchId: true },
+      }),
+      this.prisma.subject.findMany({
+        where: { code: { in: subjectCodes } },
+        select: { id: true, code: true },
+      }),
+    ]);
+    const studentByRoll = new Map(students.map((s) => [s.rollNumber, s]));
+    const subjectByCode = new Map(subjects.map((s) => [s.code, s]));
+
+    return this.runBulk(
+      records.map((record, i) => ({
+        rowNumber: i + 2, // +1 for 0-index, +1 for the header row
+        resolve: (): CreateEnrollmentDto => {
+          const rollNumber = record.roll_number?.trim() ?? '';
+          const subjectCode = record.subject_code?.trim() ?? '';
+          const academicYear = record.academic_year?.trim() ?? '';
+          const semesterRaw = record.semester?.trim() ?? '';
+
+          const student = studentByRoll.get(rollNumber);
+          if (!student) {
+            throw new BadRequestException(`Roll number '${rollNumber}' not found`);
+          }
+          const subject = subjectByCode.get(subjectCode);
+          if (!subject) {
+            throw new BadRequestException(`Subject code '${subjectCode}' not found`);
+          }
+          if (!academicYear) {
+            throw new BadRequestException(`'academic_year' is required`);
+          }
+          const semester = Number(semesterRaw);
+          if (semesterRaw === '' || !Number.isInteger(semester) || semester < 1) {
+            throw new BadRequestException(`'semester' must be a whole number, 1 or higher`);
+          }
+          return {
+            student_id: student.id,
+            subject_id: subject.id,
+            batch_id: student.batchId,
+            academic_year: academicYear,
+            semester,
+          };
+        },
+      })),
+      actor,
+    );
   }
 
   private mapUniqueViolation(err: unknown): never {

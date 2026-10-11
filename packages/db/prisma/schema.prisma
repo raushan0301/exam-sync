@@ -79,17 +79,18 @@ model User {
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
 
-  roles               UserRole[]
-  refreshTokens       RefreshToken[]
-  student             Student?
-  faculty             Faculty?
-  quizApprovalActions QuizApprovalHistory[]
-  createdExamSessions ExamSession[]
-  resolvedIncidents   Incident[]            @relation("IncidentResolvedBy")
-  disclosedIncidents  Incident[]            @relation("IncidentDisclosedBy")
-  incidentActions     IncidentHistory[]
-  requestedReportJobs ReportJob[]
-  auditLogEntries     AuditLog[]
+  roles                      UserRole[]
+  refreshTokens              RefreshToken[]
+  student                    Student?
+  faculty                    Faculty?
+  quizApprovalActions        QuizApprovalHistory[]
+  createdExamSessions        ExamSession[]
+  resolvedIncidents          Incident[]                     @relation("IncidentResolvedBy")
+  disclosedIncidents         Incident[]                     @relation("IncidentDisclosedBy")
+  incidentActions            IncidentHistory[]
+  requestedReportJobs        ReportJob[]
+  reviewedSuspensionRequests ExamSessionSuspensionRequest[] @relation("SuspensionReviewedBy")
+  auditLogEntries            AuditLog[]
 
   @@map("users")
 }
@@ -396,14 +397,15 @@ model Faculty {
   createdAt    DateTime       @default(now()) @map("created_at")
   updatedAt    DateTime       @updatedAt @map("updated_at")
 
-  user              User                            @relation(fields: [userId], references: [id])
-  department        Department                      @relation(fields: [departmentId], references: [id])
-  assignments       FacultySubjectBatchAssignment[]
-  quizzes           Quiz[]
-  invigilations     ExamInvigilator[]
-  attendanceMarked  Attendance[]
-  attendanceChanges AttendanceHistory[]
-  reportedIncidents Incident[]
+  user               User                            @relation(fields: [userId], references: [id])
+  department         Department                      @relation(fields: [departmentId], references: [id])
+  assignments        FacultySubjectBatchAssignment[]
+  quizzes            Quiz[]
+  invigilations      ExamInvigilator[]
+  attendanceMarked   Attendance[]
+  attendanceChanges  AttendanceHistory[]
+  reportedIncidents  Incident[]
+  suspensionRequests ExamSessionSuspensionRequest[]
 
   @@index([departmentId])
   @@map("faculty")
@@ -746,8 +748,8 @@ model ExamSession {
   createdAt              DateTime          @default(now()) @map("created_at")
   updatedAt              DateTime          @updatedAt @map("updated_at")
 
-  createdByAdmin     User                    @relation(fields: [createdByAdminId], references: [id])
-  backupRoom         Room?                   @relation("ExamSessionBackupRoom", fields: [backupRoomId], references: [id])
+  createdByAdmin     User                           @relation(fields: [createdByAdminId], references: [id])
+  backupRoom         Room?                          @relation("ExamSessionBackupRoom", fields: [backupRoomId], references: [id])
   quizzes            ExamSessionQuiz[]
   studentAssignments QuizStudentAssignment[]
   allocatedRooms     ExamSessionRoom[]
@@ -755,9 +757,45 @@ model ExamSession {
   invigilators       ExamInvigilator[]
   incidents          Incident[]
   reportJobs         ReportJob[]
+  suspensionRequests ExamSessionSuspensionRequest[]
 
   @@index([status])
   @@map("exam_sessions")
+}
+
+enum SuspensionRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// A faculty member's request to suspend (= cancel) an exam session, pending
+/// admin review. Approval runs the SAME cancellation `ExamSessionsService`
+/// always did (releases quizzes/rooms/invigilators/seating plans, notifies
+/// students) and moves the session to History as CANCELLED; rejection leaves
+/// the session untouched. At most ONE pending request per session — enforced
+/// by a partial unique index in the migration (Prisma can't express it).
+model ExamSessionSuspensionRequest {
+  id                   String                  @id @default(uuid()) @db.Uuid
+  examSessionId        String                  @map("exam_session_id") @db.Uuid
+  requestedByFacultyId String                  @map("requested_by_faculty_id") @db.Uuid
+  /// The faculty's written justification — shown to the admin, copied into the cancellation's audit reason + student notices on approval.
+  reason               String
+  status               SuspensionRequestStatus @default(PENDING)
+  reviewedByAdminId    String?                 @map("reviewed_by_admin_id") @db.Uuid
+  /// Admin's note — required when rejecting, optional when approving.
+  reviewNote           String?                 @map("review_note")
+  reviewedAt           DateTime?               @map("reviewed_at")
+  createdAt            DateTime                @default(now()) @map("created_at")
+  updatedAt            DateTime                @updatedAt @map("updated_at")
+
+  examSession        ExamSession @relation(fields: [examSessionId], references: [id])
+  requestedByFaculty Faculty     @relation(fields: [requestedByFacultyId], references: [id])
+  reviewedByAdmin    User?       @relation("SuspensionReviewedBy", fields: [reviewedByAdminId], references: [id])
+
+  @@index([examSessionId])
+  @@index([status, createdAt])
+  @@map("exam_session_suspension_requests")
 }
 
 /// Matches ARCHITECTURE.md §AC's literal `exam_session_quizzes(exam_session_id,
@@ -1136,6 +1174,16 @@ enum NotificationEventType {
   SEAT_ASSIGNED
   EXAM_SESSION_RESCHEDULED
   EXAM_SESSION_CANCELLED
+  /// Faculty asked admins to suspend (cancel) a session — fans out to every ADMIN.
+  SUSPENSION_REQUESTED
+  /// Admin approved the suspension request — sent to the requesting faculty.
+  SUSPENSION_APPROVED
+  /// Admin declined the suspension request — sent to the requesting faculty.
+  SUSPENSION_REJECTED
+  /// A faculty member was assigned invigilator duty for a room in a session — sent to that faculty.
+  INVIGILATOR_ASSIGNED
+  /// An invigilator duty ended: the assignment was removed, or the session was cancelled — sent to that faculty.
+  INVIGILATOR_REMOVED
   INCIDENT_STATUS_UPDATED
   /// Phase 19 — ARCHITECTURE.md §AV/line 809: exports are "delivered via
   /// signed URL + notification". Added here (additive enum member, same

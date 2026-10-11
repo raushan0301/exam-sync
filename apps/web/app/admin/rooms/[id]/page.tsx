@@ -58,7 +58,7 @@ export default function RoomDetailPage() {
 function RoomDetailInner({ roomId }: { roomId: string }) {
   const roomQuery = useRoom(roomId);
   const seatsQuery = useRoomSeats(roomId);
-  const blocksQuery = useRoomAvailabilityBlocks(roomId, { limit: 50 });
+  const blocksQuery = useRoomAvailabilityBlocks(roomId, { all: true });
   const updateSeatMutation = useUpdateRoomSeat(roomId);
   const createBlockMutation = useCreateAvailabilityBlock(roomId);
 

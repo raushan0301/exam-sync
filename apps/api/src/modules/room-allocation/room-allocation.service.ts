@@ -1,3 +1,4 @@
+import { packMixed } from './mixed-room-packing';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { ExamSession, ExamSessionStatus, Prisma, QuizStudentAssignmentStatus } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -562,7 +563,15 @@ export class RoomAllocationService {
           });
         }
 
-        const placements = this.bestFitDecreasing(groups, candidateRoomIds, activeSeatCounts);
+        // Several subjects in several rooms: give every room a mix of every subject (so seating has something
+        // to mix). One subject, or a single room, keeps the Best-Fit Decreasing packer.
+        const placements =
+          groups.length >= 2 && candidateRoomIds.length >= 2
+            ? packMixed(
+                groups,
+                candidateRoomIds.map((id) => ({ roomId: id, capacity: activeSeatCounts.get(id) ?? 0 })),
+              )
+            : this.bestFitDecreasing(groups, candidateRoomIds, activeSeatCounts);
         const perRoomTotals = new Map<string, number>();
         const placementsByRoom = new Map<string, Placement[]>();
         for (const p of placements) {

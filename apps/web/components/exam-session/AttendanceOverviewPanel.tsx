@@ -17,7 +17,7 @@ export interface AttendanceOverviewPanelProps {
  * `quiz_student_assignment_id`/`seat_id` the base `Attendance` row carries.
  */
 export function AttendanceOverviewPanel({ session }: AttendanceOverviewPanelProps) {
-  const { data, isLoading, isError, error, refetch, isFetching } = useSessionAttendance(session.id, { limit: 100 });
+  const { data, isLoading, isError, error, refetch, isFetching } = useSessionAttendance(session.id, { all: true });
 
   const columns: DataTableColumn<AttendanceOverviewRow>[] = [
     {

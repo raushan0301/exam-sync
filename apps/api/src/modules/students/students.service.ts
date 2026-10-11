@@ -226,7 +226,6 @@ export class StudentsService {
   }
 
   /** `GET /students/bulk-import/template` (ADMIN). */
-  /** Example row is a real existing student (+ their program's/batch's real codes) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
     return generateExcelTemplate({
       entityName: 'Student',

@@ -180,7 +180,6 @@ export class BatchesService {
   }
 
   /** `GET /batches/bulk-import/template` (ADMIN). */
-  /** Example row is a real existing batch (+ its program's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
     return generateExcelTemplate({
       entityName: 'Batch',

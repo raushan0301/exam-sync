@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { SeatingEngineService } from './seating-engine.service';
 import { GenerateSeatingDto } from './dto/generate-seating.dto';
 import { Roles } from '../../common/auth/roles.decorator';
@@ -40,6 +40,17 @@ export class SeatingEngineController {
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.seatingEngineService.regenerate(id, dto, actor);
+  }
+
+  /** The room's current (non-superseded) plan id, or `null` — lets the page find it again after a reload. */
+  @Roles(ROLE.ADMIN, ROLE.FACULTY)
+  @Get('exam-sessions/:id/seating/current')
+  current(
+    @Param('id') id: string,
+    @Query('room_id') roomId: string,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.seatingEngineService.currentPlan(id, roomId, actor);
   }
 
   @Roles(ROLE.ADMIN, ROLE.FACULTY)

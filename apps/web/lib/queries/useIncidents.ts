@@ -4,7 +4,8 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { Incident, IncidentHistoryEntry, IncidentSeverity, IncidentStatus, PaginatedResult } from './types';
+import { fetchList } from './fetch-list';
+import type { Incident, IncidentHistoryEntry, IncidentSeverity, IncidentStatus } from './types';
 
 export interface UseIncidentsParams {
   status?: IncidentStatus;
@@ -12,6 +13,8 @@ export interface UseIncidentsParams {
   examSessionId?: string;
   cursor?: string;
   limit?: number;
+  /** Fetch EVERY page (follows `next_cursor`) instead of one page — for views that must show/count all rows. */
+  all?: boolean;
 }
 
 /**
@@ -25,11 +28,12 @@ export function useIncidents(params: UseIncidentsParams = {}) {
     exam_session_id: params.examSessionId,
     cursor: params.cursor,
     limit: params.limit ? String(params.limit) : undefined,
+    all: params.all ? 'true' : undefined,
   };
 
   return useQuery({
     queryKey: queryKeys.incidents(query),
-    queryFn: () => apiFetch<PaginatedResult<Incident>>('/incidents', { query }),
+    queryFn: () => fetchList<Incident>('/incidents', query),
     enabled: hasStoredSession(),
     staleTime: 30_000,
   });

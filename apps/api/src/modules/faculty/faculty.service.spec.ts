@@ -48,27 +48,16 @@ describe('FacultyService (mirrors StudentsService)', () => {
   });
 
   describe('generateBulkImportTemplate', () => {
-    it('uses a real existing faculty member (+ their department\'s real code) as the example row', async () => {
-      prisma.faculty.findFirst.mockResolvedValue({
-        employeeCode: 'EMP2050', name: 'Dr. Real Person',
-        department: { code: 'ECE' }, user: { email: 'real.person@example.edu' },
-      });
+
+    it('uses a fixed example row, independent of existing data', async () => {
 
       const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
 
-      expect(row.department_code).toBe('ECE');
-      expect(row.employee_code).toBe('EMP2050');
-      expect(row.name).toBe('Dr. Real Person');
-      expect(row.email).toBe('real.person@example.edu');
+
+      expect(row.department_code).toBe('CSED');
+
     });
 
-    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
-      prisma.faculty.findFirst.mockResolvedValue(null);
-
-      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
-
-      expect(row.employee_code).toBe('EMP1001');
-    });
   });
 
   describe('create', () => {

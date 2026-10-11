@@ -4,6 +4,7 @@ import { useQuery, useQueries } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
+import { fetchAllPages } from './fetch-list';
 import type { AcademicStatus, PaginatedResult, Student } from './types';
 
 export interface UseStudentsParams {
@@ -44,7 +45,7 @@ export function useStudentsForBatches(batchIds: string[]) {
   const results = useQueries({
     queries: batchIds.map((batchId) => ({
       queryKey: queryKeys.students({ status: 'ACTIVE', batch_id: batchId, limit: '200' }),
-      queryFn: () => apiFetch<PaginatedResult<Student>>('/students', { query: { status: 'ACTIVE', batch_id: batchId, limit: '200' } }),
+      queryFn: () => fetchAllPages<Student>('/students', { status: 'ACTIVE', batch_id: batchId }),
       enabled: hasStoredSession(),
       staleTime: 30_000,
     })),

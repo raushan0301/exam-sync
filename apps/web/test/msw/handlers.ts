@@ -394,6 +394,30 @@ export interface MockConflictDetail {
   message: string;
 }
 
+export interface MockSuspensionRequest {
+  id: string;
+  examSessionId: string;
+  requestedByFacultyId: string;
+  reason: string;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  reviewedByAdminId: string | null;
+  reviewNote: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  examSessionName: string;
+  examSessionDate: string;
+  examSessionStartTime: string;
+  examSessionEndTime: string;
+  examSessionStatus: string;
+  facultyName: string;
+  facultyEmployeeCode: string;
+}
+export let SUSPENSION_REQUESTS: MockSuspensionRequest[] = [];
+export function setMockSuspensionRequests(items: MockSuspensionRequest[]) {
+  SUSPENSION_REQUESTS = items;
+}
+
 export let EXAM_SESSIONS: MockExamSession[] = [];
 export let EXAM_SESSION_ROOMS: { building: string; floor: number; roomNumber: string; capacity: number; rows: number; columns: number; status: string; allocatedCapacity: number; id: string }[] = [];
 export let EXAM_SESSION_CONFLICT_RESULT: { hard: MockConflictDetail[]; warnings: MockConflictDetail[] } = { hard: [], warnings: [] };
@@ -480,6 +504,22 @@ export let ROOM_SEATS: MockRoomSeat[] = [];
 export let AVAILABILITY_BLOCKS: MockAvailabilityBlock[] = [];
 export let ROSTER: MockRosterEntry[] = [];
 export let FACULTY_ASSIGNMENTS: MockFacultyAssignment[] = [];
+
+export interface MockEnrollment {
+  id: string;
+  studentId: string;
+  subjectId: string;
+  batchId: string;
+  academicYear: string;
+  semester: number;
+}
+export let ENROLLMENTS: MockEnrollment[] = [];
+/** Every enrollment write request, in order — lets tests assert ONE bulk call instead of one call per row. */
+export let ENROLLMENT_REQUESTS: { path: string; rows: number }[] = [];
+export function setMockEnrollments(items: MockEnrollment[]) {
+  ENROLLMENTS = items;
+  ENROLLMENT_REQUESTS = [];
+}
 export let ROOM_ALLOCATION_CONFLICT = false;
 export let ASSIGN_STUDENTS_RESULT = { total: 0, success: 0, failure: 0 };
 export let ELIGIBLE_STUDENT_COUNT = 0;
@@ -525,7 +565,7 @@ export interface MockSeatingPlan {
   id: string;
   examSessionId: string;
   roomId: string;
-  strategy: 'SEQUENTIAL' | 'RANDOMIZED' | 'ALTERNATE_SUBJECT' | 'ALTERNATE_BATCH' | 'SUBJECT_BATCH_MIX' | 'ANTI_CHEATING';
+  strategy: 'SEQUENTIAL' | 'ALTERNATE_SUBJECT' | 'ALTERNATE_BATCH' | 'SUBJECT_BATCH_MIX';
   status: 'DRAFT' | 'VALIDATED' | 'FAILED' | 'FINALIZED' | 'SUPERSEDED';
   softConstraintScore: number | null;
   violationReport: unknown[] | null;
@@ -599,9 +639,6 @@ export function setMockInvigilatorOverlapConflict(value: boolean) {
   INVIGILATOR_OVERLAP_CONFLICT = value;
 }
 
-const ANTI_CHEATING_DISCLAIMER =
-  'Seating adjacency rules reduce opportunistic copying risk between neighbors; they are not a guarantee against all forms of cheating and must be combined with active invigilation.';
-
 function toSeatingSummary(plan: MockSeatingPlan) {
   return {
     job_id: plan.id,
@@ -610,7 +647,6 @@ function toSeatingSummary(plan: MockSeatingPlan) {
     soft_constraint_score: plan.softConstraintScore,
     hard_violations: plan.status === 'FAILED' ? (plan.violationReport ?? []) : [],
     soft_violations: plan.status === 'VALIDATED' ? (plan.violationReport ?? []) : [],
-    ...(plan.strategy === 'ANTI_CHEATING' ? { disclaimer: ANTI_CHEATING_DISCLAIMER } : {}),
   };
 }
 
@@ -1438,6 +1474,22 @@ export const handlers = [
     return HttpResponse.json(toExamSessionResponse(created), { status: 201 });
   }),
 
+  // GET /exam-sessions — paginated list (ADMIN unscoped). Cursor = id of the last item of the previous page.
+  http.get(`${API_BASE_URL}/exam-sessions`, ({ request }) => {
+    const user = userFromAuthHeader(request);
+    if (!user) return HttpResponse.json({ message: 'Unauthorized' }, { status: 401 });
+    const url = new URL(request.url);
+    const limit = Math.min(Number(url.searchParams.get('limit') ?? 25), 200);
+    const cursor = url.searchParams.get('cursor');
+    const start = cursor ? EXAM_SESSIONS.findIndex((x) => x.id === cursor) + 1 : 0;
+    const page = EXAM_SESSIONS.slice(start, start + limit);
+    const hasMore = start + limit < EXAM_SESSIONS.length;
+    return HttpResponse.json({
+      items: page.map(toExamSessionResponse),
+      next_cursor: hasMore ? page[page.length - 1].id : null,
+    });
+  }),
+
   http.get(`${API_BASE_URL}/exam-sessions/:id`, ({ params }) => {
     const session = EXAM_SESSIONS.find((s) => s.id === params.id);
     if (!session) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
@@ -1508,22 +1560,105 @@ export const handlers = [
     return HttpResponse.json(toExamSessionResponse(EXAM_SESSIONS[idx]));
   }),
 
-  http.post(`${API_BASE_URL}/exam-sessions/:id/cancel`, async ({ request, params }) => {
-    const idx = EXAM_SESSIONS.findIndex((s) => s.id === params.id);
-    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
-    const session = EXAM_SESSIONS[idx];
-    if (['IN_PROGRESS', 'COMPLETED', 'CANCELLED'].includes(session.status)) {
-      return HttpResponse.json(
-        { message: `Exam session is in status "${session.status}" and cannot be cancelled.` },
-        { status: 409 },
-      );
-    }
+  // -- Suspension requests: faculty ask, admin decides (replaces the old direct faculty cancel) --------
+  http.get(`${API_BASE_URL}/suspension-requests`, ({ request }) => {
+    const url = new URL(request.url);
+    const status = url.searchParams.get('status');
+    const sessionId = url.searchParams.get('exam_session_id');
+    const limit = Math.min(Number(url.searchParams.get('limit') ?? 25), 200);
+    const cursor = url.searchParams.get('cursor');
+    let items = [...SUSPENSION_REQUESTS].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (status) items = items.filter((r) => r.status === status);
+    if (sessionId) items = items.filter((r) => r.examSessionId === sessionId);
+    const start = cursor ? items.findIndex((r) => r.id === cursor) + 1 : 0;
+    const page = items.slice(start, start + limit);
+    return HttpResponse.json({ items: page, next_cursor: start + limit < items.length ? page[page.length - 1].id : null });
+  }),
+
+  http.post(`${API_BASE_URL}/exam-sessions/:id/suspension-request`, async ({ request, params }) => {
+    const session = EXAM_SESSIONS.find((s) => s.id === params.id);
+    if (!session) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
     const body = (await request.json()) as { reason?: string };
-    if (!body.reason || body.reason.trim().length === 0) {
-      return HttpResponse.json({ message: 'A cancellation reason is required.' }, { status: 422 });
+    if (!body.reason || body.reason.trim().length < 10) {
+      return HttpResponse.json({ message: 'Please describe why this session should be suspended (at least 10 characters).' }, { status: 400 });
     }
-    EXAM_SESSIONS[idx] = { ...session, status: 'CANCELLED', quizIds: [], version: session.version + 1, updatedAt: NOW() };
-    return HttpResponse.json(toExamSessionResponse(EXAM_SESSIONS[idx]));
+    if (['IN_PROGRESS', 'COMPLETED', 'CANCELLED'].includes(session.status)) {
+      return HttpResponse.json({ message: `Exam session is in status "${session.status}" and cannot be suspended.` }, { status: 409 });
+    }
+    if (SUSPENSION_REQUESTS.some((r) => r.examSessionId === session.id && r.status === 'PENDING')) {
+      return HttpResponse.json({ message: 'A suspension request for this session is already waiting for admin review.' }, { status: 409 });
+    }
+    const created: MockSuspensionRequest = {
+      id: nextId('susp'),
+      examSessionId: session.id,
+      requestedByFacultyId: 'fac-1',
+      reason: body.reason.trim(),
+      status: 'PENDING',
+      reviewedByAdminId: null,
+      reviewNote: null,
+      reviewedAt: null,
+      createdAt: NOW(),
+      updatedAt: NOW(),
+      examSessionName: session.name,
+      examSessionDate: session.sessionDate,
+      examSessionStartTime: session.startTime,
+      examSessionEndTime: session.endTime,
+      examSessionStatus: session.status,
+      facultyName: 'Dr. Smith',
+      facultyEmployeeCode: 'E001',
+    };
+    SUSPENSION_REQUESTS = [...SUSPENSION_REQUESTS, created];
+    return HttpResponse.json(created, { status: 201 });
+  }),
+
+  http.post(`${API_BASE_URL}/suspension-requests/:id/approve`, async ({ request, params }) => {
+    const idx = SUSPENSION_REQUESTS.findIndex((r) => r.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const req = SUSPENSION_REQUESTS[idx];
+    if (req.status !== 'PENDING') {
+      return HttpResponse.json({ message: `This suspension request was already ${req.status.toLowerCase()}.` }, { status: 409 });
+    }
+    const sIdx = EXAM_SESSIONS.findIndex((s) => s.id === req.examSessionId);
+    const session = EXAM_SESSIONS[sIdx];
+    if (session && ['IN_PROGRESS', 'COMPLETED', 'CANCELLED'].includes(session.status)) {
+      return HttpResponse.json({ message: `Exam session is in status "${session.status}" and cannot be cancelled.` }, { status: 409 });
+    }
+    const body = (await request.json().catch(() => ({}))) as { note?: string };
+    if (sIdx !== -1) {
+      EXAM_SESSIONS[sIdx] = { ...session, status: 'CANCELLED', quizIds: [], version: session.version + 1, updatedAt: NOW() };
+    }
+    SUSPENSION_REQUESTS[idx] = {
+      ...req,
+      status: 'APPROVED',
+      reviewedByAdminId: 'admin-1',
+      reviewNote: body.note?.trim() || null,
+      reviewedAt: NOW(),
+      updatedAt: NOW(),
+      examSessionStatus: 'CANCELLED',
+    };
+    return HttpResponse.json(SUSPENSION_REQUESTS[idx]);
+  }),
+
+  http.post(`${API_BASE_URL}/suspension-requests/:id/reject`, async ({ request, params }) => {
+    const idx = SUSPENSION_REQUESTS.findIndex((r) => r.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const req = SUSPENSION_REQUESTS[idx];
+    if (req.status !== 'PENDING') {
+      return HttpResponse.json({ message: `This suspension request was already ${req.status.toLowerCase()}.` }, { status: 409 });
+    }
+    const body = (await request.json()) as { note?: string };
+    if (!body.note || !body.note.trim()) {
+      return HttpResponse.json({ message: 'Please explain why the request is being declined.' }, { status: 400 });
+    }
+    SUSPENSION_REQUESTS[idx] = {
+      ...req,
+      status: 'REJECTED',
+      reviewedByAdminId: 'admin-1',
+      reviewNote: body.note.trim(),
+      reviewedAt: NOW(),
+      updatedAt: NOW(),
+    };
+    return HttpResponse.json(SUSPENSION_REQUESTS[idx]);
   }),
 
   http.get(`${API_BASE_URL}/exam-sessions/:id/conflicts`, ({ params }) => {
@@ -1986,6 +2121,71 @@ export const handlers = [
     return HttpResponse.json(ROSTER[idx]);
   }),
 
+  // -- Enrollments -------------------------------------------------------
+  http.post(`${API_BASE_URL}/enrollments`, async ({ request }) => {
+    const body = (await request.json()) as Record<string, unknown>;
+    ENROLLMENT_REQUESTS = [...ENROLLMENT_REQUESTS, { path: '/enrollments', rows: 1 }];
+    const dup = ENROLLMENTS.find(
+      (e) => e.studentId === body.student_id && e.subjectId === body.subject_id && e.academicYear === body.academic_year && e.semester === body.semester,
+    );
+    if (dup) {
+      return HttpResponse.json(
+        { message: 'This student is already enrolled in this subject for this academic year/semester.' },
+        { status: 409 },
+      );
+    }
+    const created: MockEnrollment = {
+      id: nextId('enr'),
+      studentId: body.student_id as string,
+      subjectId: body.subject_id as string,
+      batchId: body.batch_id as string,
+      academicYear: body.academic_year as string,
+      semester: body.semester as number,
+    };
+    ENROLLMENTS = [...ENROLLMENTS, created];
+    return HttpResponse.json(created, { status: 201 });
+  }),
+
+  // POST /enrollments/bulk — ADMIN, one request for all rows; per-row results via an import job.
+  http.post(`${API_BASE_URL}/enrollments/bulk`, async ({ request }) => {
+    const body = (await request.json()) as { enrollments: Record<string, unknown>[] };
+    ENROLLMENT_REQUESTS = [...ENROLLMENT_REQUESTS, { path: '/enrollments/bulk', rows: body.enrollments.length }];
+    const results: MockImportJob['results'] = [];
+    body.enrollments.forEach((row, i) => {
+      const dup = ENROLLMENTS.find(
+        (e) => e.studentId === row.student_id && e.subjectId === row.subject_id && e.academicYear === row.academic_year && e.semester === row.semester,
+      );
+      if (dup) {
+        results.push({ row: i + 1, status: 'FAILURE', error: 'This student is already enrolled in this subject for this academic year/semester.' });
+        return;
+      }
+      const created: MockEnrollment = {
+        id: nextId('enr'),
+        studentId: row.student_id as string,
+        subjectId: row.subject_id as string,
+        batchId: row.batch_id as string,
+        academicYear: row.academic_year as string,
+        semester: row.semester as number,
+      };
+      ENROLLMENTS = [...ENROLLMENTS, created];
+      results.push({ row: i + 1, status: 'SUCCESS', id: created.id });
+    });
+    const successCount = results.filter((r) => r.status === 'SUCCESS').length;
+    const job: MockImportJob = {
+      id: nextId('job'),
+      resourceType: 'enrollments',
+      status: successCount > 0 ? 'COMPLETED' : 'FAILED',
+      totalRows: results.length,
+      successCount,
+      failureCount: results.length - successCount,
+      results,
+      createdByUserId: 'admin-1',
+      createdAt: NOW(),
+    };
+    IMPORT_JOBS = [...IMPORT_JOBS, job];
+    return HttpResponse.json({ job_id: job.id }, { status: 202 });
+  }),
+
   // -- Milestone 7: Faculty Assignments ----------------------------------
   http.post(`${API_BASE_URL}/faculty-assignments`, async ({ request }) => {
     const body = (await request.json()) as Record<string, unknown>;
@@ -2015,6 +2215,62 @@ export const handlers = [
     };
     FACULTY_ASSIGNMENTS = [...FACULTY_ASSIGNMENTS, assignment];
     return HttpResponse.json(assignment, { status: 201 });
+  }),
+
+  // POST /faculty-assignments/bulk — per-row results via a (synchronously final) import job, like the real API.
+  http.post(`${API_BASE_URL}/faculty-assignments/bulk`, async ({ request }) => {
+    const body = (await request.json()) as { assignments: Record<string, unknown>[] };
+    const results: MockImportJob['results'] = [];
+    body.assignments.forEach((row, i) => {
+      const dup = FACULTY_ASSIGNMENTS.find(
+        (a) =>
+          !a.endedAt &&
+          a.facultyId === row.faculty_id &&
+          a.subjectId === row.subject_id &&
+          a.batchId === row.batch_id &&
+          a.academicYear === row.academic_year &&
+          a.semester === row.semester,
+      );
+      if (dup) {
+        const f = FACULTY.find((x) => x.id === row.faculty_id);
+        const sub = SUBJECTS.find((x) => x.id === row.subject_id);
+        const b = BATCHES.find((x) => x.id === row.batch_id);
+        results.push({
+          row: i + 1,
+          status: 'FAILURE',
+          error: `Already assigned: ${f?.employeeCode} → ${sub?.code} · ${b?.year} ${b?.section}/${b?.subsection} · ${row.academic_year} sem ${row.semester}.`,
+        });
+        return;
+      }
+      const assignment: MockFacultyAssignment = {
+        id: nextId('fa'),
+        facultyId: row.faculty_id as string,
+        subjectId: row.subject_id as string,
+        batchId: row.batch_id as string,
+        academicYear: row.academic_year as string,
+        semester: row.semester as number,
+        role: row.role as 'PRIMARY_INSTRUCTOR' | 'CO_INSTRUCTOR',
+        createdAt: NOW(),
+        updatedAt: NOW(),
+        endedAt: null,
+      };
+      FACULTY_ASSIGNMENTS = [...FACULTY_ASSIGNMENTS, assignment];
+      results.push({ row: i + 1, status: 'SUCCESS', id: assignment.id });
+    });
+    const successCount = results.filter((r) => r.status === 'SUCCESS').length;
+    const job: MockImportJob = {
+      id: nextId('job'),
+      resourceType: 'faculty-assignments',
+      status: successCount > 0 ? 'COMPLETED' : 'FAILED',
+      totalRows: results.length,
+      successCount,
+      failureCount: results.length - successCount,
+      results,
+      createdByUserId: 'admin-1',
+      createdAt: NOW(),
+    };
+    IMPORT_JOBS = [...IMPORT_JOBS, job];
+    return HttpResponse.json({ job_id: job.id }, { status: 202 });
   }),
 
   http.delete(`${API_BASE_URL}/faculty-assignments/:id`, ({ params }) => {
@@ -2094,6 +2350,14 @@ export const handlers = [
     const plan = SEATING_PLANS.find((p) => p.id === params.id);
     if (!plan) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
     return HttpResponse.json(toSeatingSummary(plan));
+  }),
+
+  http.get(`${API_BASE_URL}/exam-sessions/:id/seating/current`, ({ request, params }) => {
+    const roomId = new URL(request.url).searchParams.get('room_id');
+    const plan = [...SEATING_PLANS]
+      .reverse()
+      .find((p) => p.examSessionId === params.id && p.roomId === roomId && p.status !== 'SUPERSEDED');
+    return HttpResponse.json({ seating_plan_id: plan?.id ?? null });
   }),
 
   http.get(`${API_BASE_URL}/seating-plans/:id`, ({ params }) => {

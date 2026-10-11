@@ -433,7 +433,6 @@ export class RoomsService {
   }
 
   /** `GET /rooms/bulk-import/template` (ADMIN). */
-  /** Example row is a real existing room — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
     return generateExcelTemplate({
       entityName: 'Room',
@@ -441,7 +440,7 @@ export class RoomsService {
       columns: [
         { header: 'building', example: 'F-Block', note: 'Building name.' },
         { header: 'room_number', example: 'F-101', note: 'Unique together with building.' },
-        { header: 'floor', example: 'G', note: 'Integer floor number.' },
+        { header: 'floor', example: 'G', note: 'Integer floor number, or "G" for ground floor (stored as 0).' },
         { header: 'capacity', example: '60', note: 'Integer seating capacity.' },
         { header: 'rows', example: '10', note: 'Integer number of seat rows.' },
         { header: 'columns', example: '6', note: 'Integer number of seat columns.' },
@@ -470,8 +469,10 @@ export class RoomsService {
       try {
         const numericFields: Record<string, number> = {};
         for (const field of ['floor', 'capacity', 'rows', 'columns'] as const) {
-          const value = Number(record[field]);
-          if (!Number.isFinite(value) || !Number.isInteger(value)) {
+          const raw = String(record[field] ?? '').trim();
+          // Ground floor is commonly written "G" — stored as floor 0.
+          const value = field === 'floor' && /^(g|ground)$/i.test(raw) ? 0 : Number(raw);
+          if (raw === '' || !Number.isFinite(value) || !Number.isInteger(value)) {
             throw new BadRequestException(`'${field}' must be a number`);
           }
           numericFields[field] = value;

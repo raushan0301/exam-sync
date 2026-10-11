@@ -46,7 +46,7 @@ type CreateExamSessionFormValues = z.infer<typeof createExamSessionSchema>;
 export default function NewExamSessionPage() {
   const router = useRouter();
   const createMutation = useCreateExamSession();
-  const approvedQuizzesQuery = useQuizzes({ status: 'APPROVED', limit: 200 });
+  const approvedQuizzesQuery = useQuizzes({ status: 'APPROVED', all: true });
   const [selectedQuizId, setSelectedQuizId] = useState('');
   const [submitError, setSubmitError] = useState<string | null>(null);
 

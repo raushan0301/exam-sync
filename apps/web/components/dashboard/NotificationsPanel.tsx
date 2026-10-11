@@ -8,12 +8,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { useNotifications } from '@/lib/queries/useNotifications';
 import { mapError } from '@/lib/error-mapping';
-
-/** Humanizes a NotificationEventType-shaped string, e.g. QUIZ_APPROVED -> "Quiz approved". */
-function humanizeEventType(eventType: string): string {
-  const lower = eventType.toLowerCase().replace(/_/g, ' ');
-  return lower.charAt(0).toUpperCase() + lower.slice(1);
-}
+import { describeNotification } from '@/lib/notification-text';
 
 export interface NotificationsPanelProps {
   limit?: number;
@@ -69,15 +64,19 @@ export function NotificationsPanel({ limit = 8 }: NotificationsPanelProps) {
         />
       ) : (
         <ul className="flex flex-col divide-y divide-border">
-          {items.map((n) => (
-            <li key={n.id} className="flex items-start justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
-              <div className="flex min-w-0 flex-col">
-                <span className="truncate text-sm text-text">{humanizeEventType(n.eventType)}</span>
-                <span className="text-xs text-text-muted">{new Date(n.createdAt).toLocaleString()}</span>
-              </div>
-              {!n.readAt && <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary-600" aria-label="unread" />}
-            </li>
-          ))}
+          {items.map((n) => {
+            const { title, body } = describeNotification(n.eventType, n.payload);
+            return (
+              <li key={n.id} className="flex items-start justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
+                <div className="flex min-w-0 flex-col">
+                  <span className="truncate text-sm font-medium text-text">{title}</span>
+                  {body && <span className="text-sm text-text-muted">{body}</span>}
+                  <span className="mt-0.5 text-xs text-text-subtle">{new Date(n.createdAt).toLocaleString()}</span>
+                </div>
+                {!n.readAt && <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary-600" aria-label="unread" />}
+              </li>
+            );
+          })}
         </ul>
       )}
     </Card>

@@ -30,8 +30,8 @@ describe('ExamSessionsController — @Roles metadata (faculty-lifecycle-ownershi
     expect(rolesOf('reschedule')).toEqual([ROLE.FACULTY]);
   });
 
-  it('cancel: FACULTY only', () => {
-    expect(rolesOf('cancel')).toEqual([ROLE.FACULTY]);
+  it('has NO direct cancel route any more — cancellation only happens through an admin-approved suspension request', () => {
+    expect((ExamSessionsController.prototype as unknown as Record<string, unknown>).cancel).toBeUndefined();
   });
 
   it('findOne (GET :id): ADMIN retains read access, alongside FACULTY', () => {

@@ -50,27 +50,16 @@ describe('SubjectsService', () => {
   });
 
   describe('generateBulkImportTemplate', () => {
-    it('uses a real existing subject (+ its department\'s/program\'s real codes) as the example row', async () => {
-      prisma.subject.findFirst.mockResolvedValue({
-        code: 'CS450', name: 'Operating Systems', credits: 3.5,
-        department: { code: 'CSE' }, program: { code: 'BTECH-CSE' },
-      });
+
+    it('uses a fixed example row, independent of existing data', async () => {
 
       const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
 
-      expect(row.department_code).toBe('CSE');
-      expect(row.program_code).toBe('BTECH-CSE');
-      expect(row.code).toBe('CS450');
-      expect(row.credits).toBe('3.5');
+
+      expect(row.department_code).toBe('CSED');
+
     });
 
-    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
-      prisma.subject.findFirst.mockResolvedValue(null);
-
-      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
-
-      expect(row.code).toBe('CS301');
-    });
   });
 
   describe('create', () => {

@@ -22,7 +22,7 @@ export interface QuizAttachPanelProps {
  */
 export function QuizAttachPanel({ session, readOnly = false }: QuizAttachPanelProps) {
   const editable = session.status === 'DRAFT' && !readOnly;
-  const approvedQuizzesQuery = useQuizzes({ status: 'APPROVED', limit: 200 });
+  const approvedQuizzesQuery = useQuizzes({ status: 'APPROVED', all: true });
   const updateQuizzesMutation = useUpdateSessionQuizzes(session.id);
   const [selectedQuizId, setSelectedQuizId] = useState('');
 

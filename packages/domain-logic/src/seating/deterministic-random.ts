@@ -25,13 +25,7 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-/** Deterministic Fisher-Yates shuffle, seeded by an arbitrary string. Same `seed` + same input array (by value) ⇒ same output order, always (reproducibility). Never mutates the input. */
-export function seededShuffle<T>(items: readonly T[], seed: string): T[] {
-  const result = items.slice();
-  const rand = mulberry32(hashSeed(seed));
-  for (let i = result.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [result[i], result[j]] = [result[j], result[i]];
-  }
-  return result;
+/** Deterministic `[0,1)` random stream for an arbitrary seed string — same seed ⇒ same sequence. */
+export function seededRandom(seed: string): () => number {
+  return mulberry32(hashSeed(seed));
 }

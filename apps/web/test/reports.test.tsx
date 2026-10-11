@@ -3,7 +3,14 @@ import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { setTokens } from '@/lib/token-storage';
 import { renderWithProviders } from './utils/renderWithProviders';
-import { SESSION_TOKENS, ADMIN_USER, STUDENT_REFRESH_TOKEN, setMockReportJobs, setReportJobShouldFail } from './msw/handlers';
+import {
+  SESSION_TOKENS,
+  ADMIN_USER,
+  STUDENT_REFRESH_TOKEN,
+  setMockReportJobs,
+  setReportJobShouldFail,
+  setMockExamSessions,
+} from './msw/handlers';
 
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
@@ -21,14 +28,40 @@ function signInAsAdmin() {
 
 const VALID_SESSION_ID = '11111111-1111-4111-8111-111111111111';
 
+function seedSessions() {
+  setMockExamSessions([
+    {
+      id: VALID_SESSION_ID,
+      name: 'Cyber quiz 1 — Exam',
+      sessionDate: '2026-09-22',
+      startTime: '17:10',
+      endTime: '17:30',
+      status: 'IN_PROGRESS',
+      createdByAdminId: 'admin-1',
+      version: 1,
+      quizIds: [],
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    },
+  ]);
+}
+
+/** The exam session is picked from a dropdown of real sessions (GET /exam-sessions), not typed as a UUID. */
+async function pickSession() {
+  const select = await screen.findByLabelText(/^exam session/i);
+  await waitFor(() => expect(select).toBeEnabled());
+  await userEvent.selectOptions(select, VALID_SESSION_ID);
+}
+
 describe('Admin: report generation', () => {
   it('shows polling progress then a download link on completion', async () => {
     signInAsAdmin();
     setMockReportJobs({});
     setReportJobShouldFail(false);
+    seedSessions();
     renderWithProviders(<AdminReportsPage />);
 
-    await userEvent.type(screen.getByLabelText(/exam session id/i), VALID_SESSION_ID);
+    await pickSession();
     await userEvent.click(screen.getByRole('button', { name: /generate report/i }));
 
     // PENDING/RUNNING indeterminate progress shown while polling
@@ -45,9 +78,10 @@ describe('Admin: report generation', () => {
     signInAsAdmin();
     setMockReportJobs({});
     setReportJobShouldFail(true);
+    seedSessions();
     renderWithProviders(<AdminReportsPage />);
 
-    await userEvent.type(screen.getByLabelText(/exam session id/i), VALID_SESSION_ID);
+    await pickSession();
     await userEvent.click(screen.getByRole('button', { name: /generate report/i }));
 
     expect(
@@ -62,13 +96,22 @@ describe('Admin: report generation', () => {
     setReportJobShouldFail(false);
   }, 15000);
 
-  it('validates the exam session ID as a UUID before submitting', async () => {
+  it('lists the real exam sessions in the dropdown, labelled by name and date', async () => {
     signInAsAdmin();
+    seedSessions();
     renderWithProviders(<AdminReportsPage />);
 
-    await userEvent.type(screen.getByLabelText(/exam session id/i), 'not-a-uuid');
+    expect(await screen.findByRole('option', { name: 'Cyber quiz 1 — Exam · 2026-09-22' })).toBeInTheDocument();
+  });
+
+  it('requires choosing an exam session before submitting', async () => {
+    signInAsAdmin();
+    seedSessions();
+    renderWithProviders(<AdminReportsPage />);
+
+    await screen.findByRole('option', { name: /cyber quiz 1/i });
     await userEvent.click(screen.getByRole('button', { name: /generate report/i }));
 
-    expect(await screen.findByText(/valid exam session id/i)).toBeInTheDocument();
+    expect(await screen.findByText(/select an exam session/i)).toBeInTheDocument();
   });
 });

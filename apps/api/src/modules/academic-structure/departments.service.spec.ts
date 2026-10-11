@@ -43,24 +43,16 @@ describe('DepartmentsService', () => {
   });
 
   describe('generateBulkImportTemplate', () => {
-    it('uses a real existing department as the example row instead of a fictional placeholder', async () => {
-      prisma.department.findFirst.mockResolvedValue({ id: 'd1', code: 'ECE', name: 'Electronics & Comms' });
 
-      const buffer = await service.generateBulkImportTemplate();
-      const row = await readTemplateExampleRow(buffer);
+    it('uses a fixed example row, independent of existing data', async () => {
 
-      expect(row.code).toBe('ECE');
-      expect(row.name).toBe('Electronics & Comms');
+      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+
+
+      expect(row.code).toBe('CSED');
+
     });
 
-    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
-      prisma.department.findFirst.mockResolvedValue(null);
-
-      const buffer = await service.generateBulkImportTemplate();
-      const row = await readTemplateExampleRow(buffer);
-
-      expect(row.code).toBe('CSE');
-    });
   });
 
   describe('create', () => {

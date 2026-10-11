@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { setTokens } from '@/lib/token-storage';
+import { http, HttpResponse } from 'msw';
+import { server } from './msw/server';
 import { renderWithProviders } from './utils/renderWithProviders';
 import {
   setMockFaculty,
@@ -10,6 +12,7 @@ import {
   setMockFacultyAssignments,
   VALID_ACCESS_TOKEN,
   VALID_REFRESH_TOKEN,
+  API_BASE_URL,
   type MockFaculty,
   type MockSubject,
   type MockBatch,
@@ -202,7 +205,11 @@ describe('Faculty Assignments', () => {
     // the modal stays open reporting exactly which batch failed and why.
     await waitFor(() => expect(screen.getAllByText('Data Structures')).toHaveLength(2));
     expect(await screen.findByText(/assigned 1 of 2 batch/i)).toBeInTheDocument();
-    expect(screen.getByText(/already exists/i)).toBeInTheDocument();
+    // The failure names the existing assignment (employee code, subject, batch, term) — not a bare "already exists".
+    expect(screen.getByText(/already assigned: E001 → CS102/i)).toBeInTheDocument();
+    // Only the failed batch stays ticked, so a retry resubmits just that one.
+    expect(screen.getByLabelText('B/B1 (2025)')).toBeChecked();
+    expect(screen.getByLabelText('A/A1 (2025)')).not.toBeChecked();
   });
 
   it('ends an assignment', async () => {
@@ -223,5 +230,94 @@ describe('Faculty Assignments', () => {
     await userEvent.click(screen.getByRole('button', { name: /end assignment/i }));
 
     await waitFor(() => expect(screen.queryByRole('button', { name: /^end$/i })).not.toBeInTheDocument());
+  });
+
+  it('filters the faculty dropdown as you type, but keeps the selected person listed', async () => {
+    signInAsAdmin();
+    setMockFaculty([
+      makeFaculty(),
+      makeFaculty({ id: 'fac-2', name: 'Dr. Jones', employeeCode: 'E002' }),
+      makeFaculty({ id: 'fac-3', name: 'Dr. Patel', employeeCode: 'X900' }),
+    ]);
+    setMockSubjects([makeSubject()]);
+    setMockBatches([makeBatch()]);
+    setMockFacultyAssignments([]);
+
+    renderWithProviders(<FacultyAssignmentsPage />);
+    await screen.findByText('E001 — Dr. Smith');
+
+    await userEvent.type(screen.getByLabelText(/search faculty/i), 'jones');
+    expect(screen.queryByText('E001 — Dr. Smith')).not.toBeInTheDocument();
+    expect(screen.getByText('E002 — Dr. Jones')).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText(/^faculty member/i), 'fac-2');
+    await userEvent.clear(screen.getByLabelText(/search faculty/i));
+    await userEvent.type(screen.getByLabelText(/search faculty/i), 'patel');
+    // The person already chosen stays in the list even when the search no longer matches them.
+    expect(screen.getByText('E002 — Dr. Jones')).toBeInTheDocument();
+    expect(screen.getByText('X900 — Dr. Patel')).toBeInTheDocument();
+  });
+
+  it('selects all matching batches with one click, and Clear empties the selection', async () => {
+    signInAsAdmin();
+    setMockFaculty([makeFaculty()]);
+    setMockSubjects([makeSubject()]);
+    setMockBatches([
+      makeBatch(),
+      makeBatch({ id: BATCH_ID_2, section: 'B', subsection: 'B1' }),
+      makeBatch({ id: '66666666-6666-4666-8666-666666666666', section: 'C', subsection: 'C1' }),
+    ]);
+    setMockFacultyAssignments([]);
+
+    renderWithProviders(<FacultyAssignmentsPage />);
+    await screen.findByText('E001 — Dr. Smith');
+    await userEvent.selectOptions(await screen.findByLabelText(/^faculty member/i), 'fac-1');
+    await screen.findByText(/no teaching assignments/i);
+    await userEvent.click(screen.getAllByRole('button', { name: /add assignment/i })[0]);
+
+    await userEvent.type(screen.getByLabelText(/search batches/i), 'B1');
+    await userEvent.click(screen.getByLabelText(/select all matching \(1\)/i));
+    expect(screen.getByText(/1 selected/i)).toBeInTheDocument();
+    expect(screen.getByLabelText('B/B1 (2025)')).toBeChecked();
+
+    await userEvent.clear(screen.getByLabelText(/search batches/i));
+    await userEvent.click(screen.getByLabelText(/select all \(3\)/i));
+    expect(screen.getByText(/3 selected/i)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /^clear$/i }));
+    expect(screen.queryByText(/\d+ selected/i)).toBeInTheDocument(); // counter still shown...
+    expect(screen.getByText(/0 selected/i)).toBeInTheDocument(); // ...at zero
+  });
+
+  it('lists EVERY faculty member even when the server paginates (page cap is 200)', async () => {
+    signInAsAdmin();
+    setMockSubjects([makeSubject()]);
+    setMockBatches([makeBatch()]);
+    setMockFacultyAssignments([]);
+    const everyone = Array.from({ length: 250 }, (_, i) =>
+      makeFaculty({ id: `fac-${i}`, name: `Faculty ${i}`, employeeCode: `EMP${String(i).padStart(3, '0')}` }),
+    );
+    const requestedLimits: (string | null)[] = [];
+    server.use(
+      http.get(`${API_BASE_URL}/faculty`, ({ request }) => {
+        const url = new URL(request.url);
+        requestedLimits.push(url.searchParams.get('limit'));
+        // Behave like the real API: at most 200 per page, opaque cursor = last id of the previous page.
+        const cursor = url.searchParams.get('cursor');
+        const start = cursor ? everyone.findIndex((f) => f.id === cursor) + 1 : 0;
+        const page = everyone.slice(start, start + 200);
+        return HttpResponse.json({
+          items: page,
+          next_cursor: start + 200 < everyone.length ? page[page.length - 1].id : null,
+        });
+      }),
+    );
+
+    renderWithProviders(<FacultyAssignmentsPage />);
+
+    // The 250th person (only reachable via page 2) is selectable, and the count says so.
+    expect(await screen.findByRole('option', { name: 'EMP249 — Faculty 249' })).toBeInTheDocument();
+    expect(screen.getByText(/select a faculty member \(250 people\)/i)).toBeInTheDocument();
+    expect(requestedLimits).toEqual(['200', '200']);
   });
 });

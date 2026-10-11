@@ -135,7 +135,7 @@ function TopBar({
   }, []);
 
   return (
-    <header className="flex h-14 shrink-0 items-center justify-between border-b border-border bg-surface px-3 sm:px-4">
+    <header className="relative z-drawer flex h-14 shrink-0 items-center justify-between border-b border-border bg-surface px-3 sm:px-4">
       <div className="flex items-center gap-2">
         {showMenuButton && (
           <IconButton

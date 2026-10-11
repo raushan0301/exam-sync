@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { Upload } from 'lucide-react';
 import { useForm, FormProvider, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -23,7 +24,14 @@ import { useFaculty } from '@/lib/queries/useFaculty';
 import { useSubjects } from '@/lib/queries/useSubjects';
 import { useBatches } from '@/lib/queries/useBatches';
 import { useFacultyAssignments } from '@/lib/queries/useFacultyAssignments';
-import { useCreateFacultyAssignment, useEndFacultyAssignment } from '@/lib/mutations/useFacultyAssignmentMutations';
+import {
+  useBulkAssignFaculty,
+  useBulkImportFacultyAssignments,
+  useEndFacultyAssignment,
+  downloadFacultyAssignmentTemplate,
+} from '@/lib/mutations/useFacultyAssignmentMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { mapError } from '@/lib/error-mapping';
 import type { FacultyAssignment } from '@/lib/queries/types';
 
@@ -50,15 +58,20 @@ export default function FacultyAssignmentsPage() {
   const [addOpen, setAddOpen] = useState(false);
   const [ending, setEnding] = useState<FacultyAssignment | null>(null);
 
-  const facultyQuery = useFaculty({ limit: 200, status: 'ACTIVE' });
-  const subjectsQuery = useSubjects({ limit: 200, isActive: true });
-  const batchesQuery = useBatches({ limit: 200, status: 'ACTIVE' });
-  const assignmentsQuery = useFacultyAssignments(facultyId || undefined, { limit: 50 });
+  const facultyQuery = useFaculty({ all: true, status: 'ACTIVE' });
+  const allFaculty = facultyQuery.data?.items ?? [];
+  const subjectsQuery = useSubjects({ all: true, isActive: true });
+  const batchesQuery = useBatches({ all: true, status: 'ACTIVE' });
+  const assignmentsQuery = useFacultyAssignments(facultyId || undefined, { all: true });
 
   const subjectById = new Map((subjectsQuery.data?.items ?? []).map((s) => [s.id, s]));
   const batchById = new Map((batchesQuery.data?.items ?? []).map((b) => [b.id, b]));
 
-  const createMutation = useCreateFacultyAssignment();
+  const bulkAssignMutation = useBulkAssignFaculty();
+  const bulkImportMutation = useBulkImportFacultyAssignments();
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
+  const [batchSearch, setBatchSearch] = useState('');
+  const [facultySearch, setFacultySearch] = useState('');
   const endMutation = useEndFacultyAssignment(facultyId);
 
   const form = useForm<AssignmentFormValues>({
@@ -68,42 +81,44 @@ export default function FacultyAssignmentsPage() {
 
   async function onSubmit(values: AssignmentFormValues) {
     const { batch_ids, ...rest } = values;
-    // Each batch is its own independent assignment row on the backend
-    // (FacultySubjectBatchAssignment has no batch_ids[] — unlike Quiz,
-    // each row has its own lifecycle, e.g. "End" one batch without
-    // affecting the others) — so one batch failing (e.g. a duplicate) must
-    // not block the rest, same "one bad row never blocks the rest"
-    // philosophy already used for bulk-import.
-    const results = await Promise.allSettled(
-      batch_ids.map((batch_id) => createMutation.mutateAsync({ faculty_id: facultyId, batch_id, ...rest })),
-    );
+    // Each batch is its own independent assignment row on the backend (each
+    // has its own lifecycle, e.g. "End" one batch without affecting the
+    // others), sent as ONE bulk request — one bad row (e.g. a duplicate)
+    // never blocks the rest, and each failure comes back with its own message.
+    let job;
+    try {
+      job = await bulkAssignMutation.mutateAsync(
+        batch_ids.map((batch_id) => ({ faculty_id: facultyId, batch_id, ...rest })),
+      );
+    } catch (err) {
+      form.setError('root', { message: mapError(err).description });
+      return;
+    }
 
-    const failures = results
-      .map((r, i) => ({ r, batchId: batch_ids[i] }))
-      .filter((x): x is { r: PromiseRejectedResult; batchId: string } => x.r.status === 'rejected');
+    // Results come back in request order (row i+1 <-> batch_ids[i]).
+    const failures = job.results
+      .filter((r) => r.status === 'FAILURE')
+      .map((r) => ({ batchId: batch_ids[r.row - 1], error: r.error ?? 'Unknown error' }));
 
     if (failures.length === 0) {
       setAddOpen(false);
+      setBatchSearch('');
       form.reset({ subject_id: '', batch_ids: [], academic_year: '', semester: 1, role: 'PRIMARY_INSTRUCTOR' });
       return;
     }
 
-    const succeededCount = results.length - failures.length;
-    const failureLines = failures.map(({ r, batchId }) => {
-      const label = batchById.get(batchId)
-        ? `${batchById.get(batchId)!.section}/${batchById.get(batchId)!.subsection}`
-        : batchId;
-      return `${label}: ${mapError(r.reason).description}`;
+    const failureLines = failures.map(({ batchId, error }) => {
+      const b = batchById.get(batchId);
+      return `${b ? `${b.section}/${b.subsection}` : batchId}: ${error}`;
     });
     form.setError('root', {
       message:
-        succeededCount > 0
-          ? `Assigned ${succeededCount} of ${results.length} batch(es). Failed — ${failureLines.join('; ')}`
+        job.successCount > 0
+          ? `Assigned ${job.successCount} of ${job.totalRows} batch(es). Failed — ${failureLines.join('; ')}`
           : `Could not create the assignment — ${failureLines.join('; ')}`,
     });
-    // Only clear the batches that succeeded, so retrying only resubmits the failed ones.
-    const failedIds = new Set(failures.map((f) => f.batchId));
-    form.setValue('batch_ids', batch_ids.filter((id) => failedIds.has(id)));
+    // Keep only the failed batches selected, so retrying resubmits just those.
+    form.setValue('batch_ids', failures.map((f) => f.batchId));
   }
 
   async function confirmEnd() {
@@ -135,18 +150,41 @@ export default function FacultyAssignmentsPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div>
-        <h1 className="text-xl font-semibold text-text">Faculty Assignments</h1>
-        <p className="text-sm text-text-muted">Manage which faculty member teaches which subject/batch, and when.</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold text-text">Faculty Assignments</h1>
+          <p className="text-sm text-text-muted">Manage which faculty member teaches which subject/batch, and when.</p>
+        </div>
+        <Button variant="secondary" leadingIcon={<Upload size={16} aria-hidden="true" />} onClick={() => setBulkImportOpen(true)}>
+          Bulk Import
+        </Button>
       </div>
 
-      <Select
-        label="Faculty member"
-        value={facultyId}
-        onChange={(e) => setFacultyId(e.target.value)}
-        options={(facultyQuery.data?.items ?? []).map((f) => ({ value: f.id, label: `${f.employeeCode} — ${f.name}` }))}
-        placeholder={facultyQuery.isLoading ? 'Loading faculty…' : 'Select a faculty member'}
-      />
+      <div className="flex flex-col gap-2">
+        <Input
+          aria-label="Search faculty"
+          placeholder="Search faculty by name or employee code…"
+          value={facultySearch}
+          onChange={(e) => setFacultySearch(e.target.value)}
+        />
+        <Select
+          label="Faculty member"
+          value={facultyId}
+          onChange={(e) => setFacultyId(e.target.value)}
+          options={allFaculty
+            .filter(
+              (f) =>
+                f.id === facultyId ||
+                `${f.employeeCode} ${f.name}`.toLowerCase().includes(facultySearch.trim().toLowerCase()),
+            )
+            .map((f) => ({ value: f.id, label: `${f.employeeCode} — ${f.name}` }))}
+          placeholder={
+            facultyQuery.isLoading
+              ? 'Loading faculty…'
+              : `Select a faculty member (${allFaculty.length} ${allFaculty.length === 1 ? 'person' : 'people'})`
+          }
+        />
+      </div>
 
       {!facultyId ? (
         <EmptyState title="Select a faculty member" description="Choose a faculty member above to view and manage their teaching assignments." />
@@ -198,12 +236,12 @@ export default function FacultyAssignmentsPage() {
 
       <Modal
         open={addOpen}
-        onOpenChange={(next) => { setAddOpen(next); if (!next) createMutation.reset(); }}
+        onOpenChange={(next) => { setAddOpen(next); if (!next) { bulkAssignMutation.reset(); setBatchSearch(''); } }}
         title="Add Teaching Assignment"
         footer={
           <>
             <Button variant="secondary" onClick={() => setAddOpen(false)}>Cancel</Button>
-            <Button onClick={form.handleSubmit(onSubmit)} loading={createMutation.isPending}>Add</Button>
+            <Button onClick={form.handleSubmit(onSubmit)} loading={bulkAssignMutation.isPending}>Add</Button>
           </>
         }
       >
@@ -225,19 +263,54 @@ export default function FacultyAssignmentsPage() {
               name="batch_ids"
               control={form.control}
               render={({ field, fieldState }) => {
-                const batches = batchesQuery.data?.items ?? [];
+                const allBatches = batchesQuery.data?.items ?? [];
+                const q = batchSearch.trim().toLowerCase();
+                const batches = allBatches.filter((b) =>
+                  `${b.year} ${b.section} ${b.subsection}`.toLowerCase().includes(q),
+                );
                 const selected = field.value as string[];
+                const allVisibleSelected = batches.length > 0 && batches.every((b) => selected.includes(b.id));
                 return (
                   <div className="flex flex-col gap-2">
-                    <span className="text-sm font-medium text-text">
-                      Batches <span className="text-danger-text">*</span>
-                    </span>
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium text-text">
+                        Batches <span className="text-danger-text">*</span>
+                      </span>
+                      <span className="flex items-center gap-2 text-xs text-text-muted">
+                        {selected.length} selected
+                        {selected.length > 0 && (
+                          <button type="button" className="text-primary-700 hover:underline" onClick={() => field.onChange([])}>
+                            Clear
+                          </button>
+                        )}
+                      </span>
+                    </div>
                     <p className="text-xs text-text-muted">
                       Select one or more batches — a separate assignment is created for each.
                     </p>
+                    <Input
+                      aria-label="Search batches"
+                      placeholder="Search by year, section or subsection…"
+                      value={batchSearch}
+                      onChange={(e) => setBatchSearch(e.target.value)}
+                    />
+                    {batches.length > 0 && (
+                      <Checkbox
+                        label={q ? `Select all matching (${batches.length})` : `Select all (${batches.length})`}
+                        checked={allVisibleSelected}
+                        onChange={() => {
+                          const visibleIds = batches.map((b) => b.id);
+                          field.onChange(
+                            allVisibleSelected
+                              ? selected.filter((id) => !visibleIds.includes(id))
+                              : [...new Set([...selected, ...visibleIds])],
+                          );
+                        }}
+                      />
+                    )}
                     <div className="flex max-h-48 flex-col gap-1 overflow-y-auto rounded border border-border p-2">
                       {batches.length === 0 && (
-                        <p className="text-sm text-text-muted">No active batches available.</p>
+                        <p className="text-sm text-text-muted">{allBatches.length === 0 ? 'No active batches available.' : 'No batches match.'}</p>
                       )}
                       {batches.map((b) => {
                         const checked = selected.includes(b.id);
@@ -296,6 +369,15 @@ export default function FacultyAssignmentsPage() {
         destructive
         loading={endMutation.isPending}
         onConfirm={confirmEnd}
+      />
+
+      <BulkImportModal
+        open={bulkImportOpen}
+        onClose={() => setBulkImportOpen(false)}
+        entityLabel="Faculty Assignment"
+        onDownloadTemplate={downloadFacultyAssignmentTemplate}
+        onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+        onPollJob={fetchImportJob}
       />
     </div>
   );

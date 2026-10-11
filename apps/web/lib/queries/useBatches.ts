@@ -1,10 +1,10 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { AcademicStatus, Batch, PaginatedResult } from './types';
+import { fetchList } from './fetch-list';
+import type { AcademicStatus, Batch } from './types';
 
 export interface UseBatchesParams {
   status?: AcademicStatus;
@@ -12,6 +12,8 @@ export interface UseBatchesParams {
   year?: number;
   cursor?: string;
   limit?: number;
+  /** Fetch EVERY page (follows `next_cursor`) instead of one page — for pick-lists that must show all rows. */
+  all?: boolean;
 }
 
 /**
@@ -27,11 +29,12 @@ export function useBatches(params: UseBatchesParams = {}) {
     year: params.year ? String(params.year) : undefined,
     cursor: params.cursor,
     limit: params.limit ? String(params.limit) : undefined,
+    all: params.all ? 'true' : undefined,
   };
 
   return useQuery({
     queryKey: queryKeys.batches(query),
-    queryFn: () => apiFetch<PaginatedResult<Batch>>('/batches', { query }),
+    queryFn: () => fetchList<Batch>('/batches', query),
     enabled: hasStoredSession(),
     staleTime: 30_000,
   });

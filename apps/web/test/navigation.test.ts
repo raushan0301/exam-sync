@@ -55,14 +55,25 @@ describe('nav config data shape', () => {
     expect(FACULTY_NAV).toHaveLength(7);
   });
 
-  it('STUDENT nav has exactly 4 entries', () => {
-    expect(STUDENT_NAV).toHaveLength(4);
-    expect(STUDENT_NAV.map((e) => e.label)).toEqual(['Dashboard', 'My Schedule', 'Notifications', 'Attendance History']);
+  it('STUDENT nav has exactly 2 entries (no schedule/attendance-history pages exist yet, so none are listed)', () => {
+    expect(STUDENT_NAV).toHaveLength(2);
+    expect(STUDENT_NAV.map((e) => e.label)).toEqual(['Dashboard', 'Notifications']);
   });
 
-  it('items without a real page have no href (disabled-label convention)', () => {
-    const invigilation = ADMIN_NAV.find((e) => e.label === 'Invigilation');
-    expect(invigilation && !isNavGroup(invigilation) ? invigilation.href : undefined).toBeUndefined();
+  it('no role shows a disabled (href-less) entry — every listed item is a real page', () => {
+    const hrefless = (nav: typeof ADMIN_NAV) =>
+      nav.flatMap((e) => (isNavGroup(e) ? e.items : [e])).filter((e) => !e.href).map((e) => e.label);
+    expect(hrefless(ADMIN_NAV)).toEqual([]);
+    expect(hrefless(FACULTY_NAV)).toEqual([]);
+    expect(hrefless(STUDENT_NAV)).toEqual([]);
+  });
+
+  it('ADMIN nav links System Health to its page, and no longer lists Invigilation/Attendance', () => {
+    const labels = ADMIN_NAV.map((e) => e.label);
+    expect(labels).not.toContain('Invigilation');
+    expect(labels).not.toContain('Attendance');
+    const health = ADMIN_NAV.find((e) => e.label === 'System Health');
+    expect(health && !isNavGroup(health) ? health.href : undefined).toBe('/admin/system-health');
   });
 
   it('ADMIN nav Rooms links to the real Rooms management page (Milestone 7)', () => {
@@ -85,5 +96,12 @@ describe('nav config data shape', () => {
   it('FACULTY nav Exam Sessions links to the real "My Exam Sessions" list page (faculty-lifecycle-ownership change)', () => {
     const examSessions = FACULTY_NAV.find((e) => e.label === 'Exam Sessions');
     expect(examSessions && !isNavGroup(examSessions) ? examSessions.href : undefined).toBe('/faculty/exam-sessions');
+  });
+
+  it('ADMIN nav lists Suspension Requests right under Exam Sessions', () => {
+    const labels = ADMIN_NAV.map((e) => e.label);
+    expect(labels.indexOf('Suspension Requests')).toBe(labels.indexOf('Exam Sessions') + 1);
+    const item = ADMIN_NAV.find((e) => e.label === 'Suspension Requests');
+    expect(item && !isNavGroup(item) ? item.href : undefined).toBe('/admin/suspension-requests');
   });
 });

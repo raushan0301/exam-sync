@@ -309,23 +309,16 @@ describe('RoomsService — Phase 11 (rooms, seats, availability calendar)', () =
   });
 
   describe('generateBulkImportTemplate', () => {
-    it('uses a real existing room as the example row instead of a fictional placeholder', async () => {
-      prisma.room.findFirst.mockResolvedValue({ building: 'North Wing', roomNumber: 'N-204', floor: 2, capacity: 48, rows: 8, columns: 6 });
+
+    it('uses a fixed example row, independent of existing data', async () => {
 
       const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
 
-      expect(row.building).toBe('North Wing');
-      expect(row.room_number).toBe('N-204');
-      expect(row.capacity).toBe('48');
+
+      expect(row.building).toBe('F-Block');
+
     });
 
-    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
-      prisma.room.findFirst.mockResolvedValue(null);
-
-      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
-
-      expect(row.building).toBe('Main Block');
-    });
   });
 
   describe('bulkImport', () => {
@@ -344,6 +337,43 @@ describe('RoomsService — Phase 11 (rooms, seats, availability calendar)', () =
           successCount: 1,
           failureCount: 0,
           results: [{ row: 2, status: 'SUCCESS', id: 'r1' }],
+        }),
+      );
+    });
+
+    it.each([['G'], ['g'], ['Ground'], [' G ']])('reads floor %j as ground floor (0)', async (floor) => {
+      prisma.room.findUnique.mockResolvedValue(null);
+      prisma.__tx.room.create.mockResolvedValue({ id: 'r1', building: 'F-Block', roomNumber: 'F-101' });
+      const buffer = await buildXlsxBuffer(
+        ['building', 'room_number', 'floor', 'capacity', 'rows', 'columns'],
+        [['F-Block', 'F-101', floor, 60, 10, 6]],
+      );
+
+      await service.bulkImport(buffer, admin);
+
+      expect(prisma.__tx.room.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ floor: 0 }) }),
+      );
+    });
+
+    it('still reads numeric floors, and rejects non-numeric, non-ground values', async () => {
+      prisma.room.findUnique.mockResolvedValue(null);
+      prisma.__tx.room.create.mockResolvedValue({ id: 'r1', building: 'F-Block', roomNumber: 'F-101' });
+      const buffer = await buildXlsxBuffer(
+        ['building', 'room_number', 'floor', 'capacity', 'rows', 'columns'],
+        [['F-Block', 'F-101', 3, 60, 10, 6], ['F-Block', 'F-102', 'X', 60, 10, 6]],
+      );
+
+      await service.bulkImport(buffer, admin);
+
+      expect(importJobsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          successCount: 1,
+          failureCount: 1,
+          results: [
+            expect.objectContaining({ row: 2, status: 'SUCCESS' }),
+            expect.objectContaining({ row: 3, status: 'FAILURE', error: expect.stringContaining("'floor' must be a number") }),
+          ],
         }),
       );
     });

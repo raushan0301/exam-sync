@@ -60,6 +60,29 @@ const ACTION_TARGET_STATUS: Record<IncidentAction, IncidentStatus | null> = {
   [IncidentAction.DISMISS]: IncidentStatus.DISMISSED,
 };
 
+const INCIDENT_TYPE_LABELS: Record<string, string> = {
+  CHEATING_SUSPICION: 'Suspected cheating',
+  UNAUTHORIZED_MATERIAL: 'Unauthorized material',
+  MISCONDUCT: 'Misconduct',
+  MISSING: 'Student missing',
+  LATE: 'Late arrival',
+  MEDICAL: 'Medical issue',
+  SEATING: 'Seating issue',
+  TECHNICAL: 'Technical issue',
+  ROOM: 'Room issue',
+  IDENTITY: 'Identity verification',
+  PAPER: 'Question paper issue',
+  OTHER: 'Other',
+};
+
+const ACTION_TITLE: Record<IncidentAction, string> = {
+  [IncidentAction.CREATE]: 'New incident reported',
+  [IncidentAction.INVESTIGATE]: 'Incident under review',
+  [IncidentAction.ESCALATE]: 'Incident escalated',
+  [IncidentAction.RESOLVE]: 'Incident resolved',
+  [IncidentAction.DISMISS]: 'Incident dismissed',
+};
+
 /** Past-tense wording for the status-change notification message — `${action.toLowerCase()}d` breaks for DISMISS ("dismissd"), so spelled out explicitly instead. */
 const ACTION_PAST_TENSE: Record<IncidentAction, string> = {
   [IncidentAction.CREATE]: 'reported',
@@ -170,18 +193,14 @@ export class IncidentsService {
 
       // BR-038: every newly-reported incident notifies admins immediately,
       // in the SAME transaction as the write (BR-042 outbox discipline) —
-      // CRITICAL severity gets a distinctly worded message (still queued
-      // into the same critical lane INCIDENT_STATUS_UPDATED already routes
-      // to, `common/queue/queue.constants.ts`), everything else a plain
-      // "new incident reported" one so admins are never left waiting on
-      // the triage board to happen to refetch.
-      await this.notifyAdmins(
-        tx,
-        incident,
-        dto.severity === IncidentSeverity.CRITICAL
-          ? `A CRITICAL incident was reported: ${dto.incident_type}.`
-          : `A new incident was reported: ${dto.incident_type}.`,
-      );
+      // CRITICAL severity gets a distinct title (still queued into the same
+      // critical lane INCIDENT_STATUS_UPDATED already routes to,
+      // `common/queue/queue.constants.ts`), so admins are never left waiting
+      // on the triage board to happen to refetch.
+      await this.notifyAdmins(tx, incident, {
+        title: dto.severity === IncidentSeverity.CRITICAL ? 'Critical incident reported' : ACTION_TITLE[IncidentAction.CREATE],
+        action: IncidentAction.CREATE,
+      });
 
       await this.auditHook.record(
         {
@@ -253,7 +272,7 @@ export class IncidentsService {
       // required that one), so other admins stay in sync when one of them
       // investigates/resolves/dismisses an incident too, not only when it
       // gets worse.
-      await this.notifyAdmins(tx, row, `Incident ${ACTION_PAST_TENSE[dto.action]}: ${existing.incidentType}.`);
+      await this.notifyAdmins(tx, row, { title: ACTION_TITLE[dto.action], action: dto.action });
 
       await this.auditHook.record(
         {
@@ -402,12 +421,33 @@ export class IncidentsService {
     }
   }
 
-  /** Fans out an immediate, critical-lane notification to every ADMIN user (BR-038). */
-  private async notifyAdmins(tx: Prisma.TransactionClient, incident: Incident, message: string): Promise<void> {
+  /**
+   * Fans out an immediate, critical-lane notification to every ADMIN user (BR-038).
+   * The message is a complete sentence naming the incident type, severity (on
+   * creation) and the exam — not a raw enum — so it reads clearly on its own.
+   */
+  private async notifyAdmins(
+    tx: Prisma.TransactionClient,
+    incident: Incident,
+    event: { title: string; action: IncidentAction },
+  ): Promise<void> {
     const admins = await tx.user.findMany({
       where: { roles: { some: { role: { name: ROLE.ADMIN } } } },
       select: { id: true },
     });
+    if (admins.length === 0) return;
+
+    const session = await tx.examSession.findUnique({
+      where: { id: incident.examSessionId },
+      select: { name: true },
+    });
+    const typeLabel = INCIDENT_TYPE_LABELS[incident.incidentType] ?? incident.incidentType;
+    const where = session?.name ? ` “${session.name}”` : ' an exam';
+    const message =
+      event.action === IncidentAction.CREATE
+        ? `${typeLabel} (${incident.severity.toLowerCase()} severity) was reported during${where}.`
+        : `${typeLabel} incident for${where} was ${ACTION_PAST_TENSE[event.action]}.`;
+
     for (const admin of admins) {
       await this.notificationsOutbox.queue(tx, {
         recipientType: NotificationRecipientType.ADMIN,
@@ -418,8 +458,11 @@ export class IncidentsService {
         payload: {
           incident_id: incident.id,
           exam_session_id: incident.examSessionId,
+          incident_type: incident.incidentType,
+          session_name: session?.name ?? null,
           severity: incident.severity,
           status: incident.status,
+          title: event.title,
           message,
         },
       });

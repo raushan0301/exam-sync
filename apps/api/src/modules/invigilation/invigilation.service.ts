@@ -1,7 +1,14 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { ExamInvigilator, ExamSessionStatus, Prisma } from '@exam-sync/db';
+import {
+  ExamInvigilator,
+  ExamSessionStatus,
+  NotificationEventType,
+  NotificationRecipientType,
+  Prisma,
+} from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
+import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 import {
   cursorFindManyArgs,
@@ -64,6 +71,7 @@ export class InvigilationService {
     private readonly facultyService: FacultyService,
     private readonly conflictEngine: ConflictEngineService,
     private readonly examSessionOwnershipService: ExamSessionOwnershipService,
+    private readonly notificationsOutbox: NotificationsOutboxService,
   ) {}
 
   /**
@@ -101,7 +109,7 @@ export class InvigilationService {
       throw new ConflictException('This exam session is CANCELLED and cannot receive new invigilator assignments.');
     }
 
-    await this.facultyService.findById(dto.faculty_id);
+    const assignedFaculty = await this.facultyService.findById(dto.faculty_id);
 
     const allocatedRoom = await this.prisma.examSessionRoom.findUnique({
       where: { roomId_examSessionId: { roomId: dto.room_id, examSessionId } },
@@ -170,6 +178,24 @@ export class InvigilationService {
           tx,
         );
 
+        // Tell the faculty member (BR-042: same transaction as the assignment, via the outbox).
+        await this.notificationsOutbox.queue(tx, {
+          recipientType: NotificationRecipientType.FACULTY,
+          recipientId: assignedFaculty.userId,
+          eventType: NotificationEventType.INVIGILATOR_ASSIGNED,
+          entityId: invigilator.id,
+          entityVersion: 'ASSIGNED',
+          payload: {
+            exam_session_id: examSessionId,
+            session_name: session.name,
+            session_date: session.sessionDate.toISOString().slice(0, 10),
+            start_time: session.startTime.toISOString().slice(11, 16),
+            end_time: session.endTime.toISOString().slice(11, 16),
+            room_label: await this.roomLabel(tx, dto.room_id),
+            role: dto.role,
+          },
+        });
+
         return invigilator;
       })
       .catch((err) => this.mapUniqueViolation(err));
@@ -196,12 +222,15 @@ export class InvigilationService {
    * `assign` again with the corrected room/faculty/role.
    */
   async remove(examSessionId: string, invigilatorId: string, actor: AuthenticatedUser): Promise<void> {
-    await this.examSessionsService.findById(examSessionId);
+    const session = await this.examSessionsService.findById(examSessionId);
     if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
       throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
     }
 
-    const invigilator = await this.prisma.examInvigilator.findUnique({ where: { id: invigilatorId } });
+    const invigilator = await this.prisma.examInvigilator.findUnique({
+      where: { id: invigilatorId },
+      include: { faculty: { select: { userId: true } } },
+    });
     if (!invigilator || invigilator.examSessionId !== examSessionId) {
       throw new NotFoundException();
     }
@@ -223,7 +252,26 @@ export class InvigilationService {
         },
         tx,
       );
+      await this.notificationsOutbox.queue(tx, {
+        recipientType: NotificationRecipientType.FACULTY,
+        recipientId: invigilator.faculty.userId,
+        eventType: NotificationEventType.INVIGILATOR_REMOVED,
+        entityId: invigilator.id,
+        entityVersion: 'REMOVED',
+        payload: {
+          exam_session_id: examSessionId,
+          session_name: session.name,
+          room_label: await this.roomLabel(tx, invigilator.roomId),
+          cause: 'REMOVED',
+        },
+      });
     });
+  }
+
+  /** "B-107" — the same building-roomNumber label other notifications use. */
+  private async roomLabel(tx: Prisma.TransactionClient, roomId: string): Promise<string> {
+    const room = await tx.room.findUnique({ where: { id: roomId }, select: { building: true, roomNumber: true } });
+    return room ? `${room.building}-${room.roomNumber}` : '';
   }
 
   /**

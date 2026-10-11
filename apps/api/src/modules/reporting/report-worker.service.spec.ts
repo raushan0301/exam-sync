@@ -91,7 +91,17 @@ describe('ReportWorkerService', () => {
 
     expect(notificationsOutbox.queue).toHaveBeenCalledWith(
       prisma.__tx,
-      expect.objectContaining({ recipientId: 'admin-user-1', eventType: 'REPORT_READY', entityId: 'job-1' }),
+      expect.objectContaining({
+        recipientId: 'admin-user-1',
+        eventType: 'REPORT_READY',
+        entityId: 'job-1',
+        // Readable fields so the notification can say WHICH report for WHICH exam.
+        payload: expect.objectContaining({
+          report_label: 'Attendance Report',
+          session_name: 'Test Session',
+          filename: 'attendance-test-session-2026-01-15.csv',
+        }),
+      }),
     );
   });
 

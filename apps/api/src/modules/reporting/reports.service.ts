@@ -1,4 +1,4 @@
-import { ConflictException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Inject, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import { ReportJob, ReportJobStatus, ReportType } from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -22,8 +22,20 @@ import { CreateReportDto } from './dto/create-report.dto';
  * `actor.roles` beyond what the controller's `@Roles(ROLE.ADMIN)` already
  * enforces.
  */
+const ENQUEUE_TIMEOUT_MS = 3000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 @Injectable()
 export class ReportsService {
+  private readonly logger = new Logger(ReportsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly examSessionsService: ExamSessionsService,
@@ -42,7 +54,23 @@ export class ReportsService {
       },
     });
 
-    await this.reportsQueue.add('generate', { reportJobId: job.id }, { jobId: job.id, attempts: 1 });
+    try {
+      await withTimeout(
+        this.reportsQueue.add('generate', { reportJobId: job.id }, { jobId: job.id, attempts: 1 }),
+        ENQUEUE_TIMEOUT_MS,
+      );
+    } catch (err) {
+      // Redis down/unreachable: ioredis (maxRetriesPerRequest: null, required by BullMQ's
+      // Worker on the shared connection) would otherwise queue this command forever and the
+      // HTTP request would hang. Fail the row so no PENDING orphan lingers — if the stuck
+      // `add` ever completes later, the worker's `status !== PENDING` guard skips it.
+      this.logger.error(`Could not enqueue report job ${job.id}: ${(err as Error).message}`);
+      await this.prisma.reportJob.update({
+        where: { id: job.id },
+        data: { status: ReportJobStatus.FAILED, errorMessage: 'Report queue unavailable' },
+      });
+      throw new ServiceUnavailableException('The report service is temporarily unavailable. Please try again shortly.');
+    }
 
     return job;
   }

@@ -61,8 +61,8 @@ export default function StudentsPage() {
     cursor: pager.cursor,
     limit: 25,
   });
-  const { data: programsData } = usePrograms({ limit: 200, status: 'ACTIVE' });
-  const { data: batchesData } = useBatches({ limit: 200, status: 'ACTIVE' });
+  const { data: programsData } = usePrograms({ all: true, status: 'ACTIVE' });
+  const { data: batchesData } = useBatches({ all: true, status: 'ACTIVE' });
   const programOptions = (programsData?.items ?? []).map((p) => ({ value: p.id, label: `${p.code} — ${p.name}` }));
   const batchOptions = (batchesData?.items ?? []).map((b) => ({ value: b.id, label: `${b.section}/${b.subsection} (${b.year})` }));
   const programById = new Map((programsData?.items ?? []).map((p) => [p.id, p]));

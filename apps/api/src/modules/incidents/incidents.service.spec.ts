@@ -15,6 +15,7 @@ function buildPrismaMock() {
     incident: { create: jest.fn(), update: jest.fn() },
     incidentHistory: { create: jest.fn() },
     user: { findMany: jest.fn().mockResolvedValue([]) },
+    examSession: { findUnique: jest.fn().mockResolvedValue({ name: 'Cyber quiz 1 — Exam' }) },
   };
   return {
     incident: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
@@ -509,6 +510,63 @@ describe('IncidentsService', () => {
 
       expect(result).toEqual(alreadyDisclosed);
       expect(prisma.incident.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('admin notification wording — clear sentences, not raw enums', () => {
+    const payloadOf = () => notificationsOutbox.queue.mock.calls[0][1].payload;
+    const dto = {
+      exam_session_id: 's1',
+      incident_type: IncidentType.MISCONDUCT,
+      severity: IncidentSeverity.LOW,
+      description: 'Student talking during exam',
+    };
+
+    it('NEW incident: names the type, severity and exam', async () => {
+      examSessionsService.findById.mockResolvedValue({ id: 's1', status: 'IN_PROGRESS' });
+      facultyService.findByUserId.mockResolvedValue({ id: 'fac-1' });
+      prisma.examInvigilator.findFirst.mockResolvedValue({ facultyId: 'fac-1' });
+      prisma.__tx.incident.create.mockResolvedValue({ ...baseIncident, incidentType: 'CHEATING_SUSPICION', severity: IncidentSeverity.HIGH });
+      prisma.__tx.user.findMany.mockResolvedValue([{ id: 'admin-user-1' }]);
+
+      await service.create({ ...dto, incident_type: 'CHEATING_SUSPICION' as any, severity: IncidentSeverity.HIGH }, facultyActor);
+
+      expect(payloadOf()).toEqual(
+        expect.objectContaining({
+          title: 'New incident reported',
+          message: 'Suspected cheating (high severity) was reported during “Cyber quiz 1 — Exam”.',
+          session_name: 'Cyber quiz 1 — Exam',
+          incident_type: 'CHEATING_SUSPICION',
+        }),
+      );
+    });
+
+    it('CRITICAL incident gets a distinct title', async () => {
+      examSessionsService.findById.mockResolvedValue({ id: 's1', status: 'IN_PROGRESS' });
+      facultyService.findByUserId.mockResolvedValue({ id: 'fac-1' });
+      prisma.examInvigilator.findFirst.mockResolvedValue({ facultyId: 'fac-1' });
+      prisma.__tx.incident.create.mockResolvedValue({ ...baseIncident, severity: IncidentSeverity.CRITICAL });
+      prisma.__tx.user.findMany.mockResolvedValue([{ id: 'admin-user-1' }]);
+
+      await service.create({ ...dto, severity: IncidentSeverity.CRITICAL }, facultyActor);
+
+      expect(payloadOf().title).toBe('Critical incident reported');
+    });
+
+    it.each([
+      [IncidentAction.INVESTIGATE, IncidentStatus.OPEN, IncidentStatus.UNDER_REVIEW, 'Incident under review', 'was moved to Under Review.'],
+      [IncidentAction.ESCALATE, IncidentStatus.UNDER_REVIEW, IncidentStatus.ESCALATED, 'Incident escalated', 'was escalated.'],
+      [IncidentAction.RESOLVE, IncidentStatus.UNDER_REVIEW, IncidentStatus.RESOLVED, 'Incident resolved', 'was resolved.'],
+      [IncidentAction.DISMISS, IncidentStatus.UNDER_REVIEW, IncidentStatus.DISMISSED, 'Incident dismissed', 'was dismissed.'],
+    ])('status change via %s says what happened', async (action, from, to, title, endsWith) => {
+      prisma.incident.findUnique.mockResolvedValue({ ...baseIncident, status: from });
+      prisma.__tx.incident.update.mockResolvedValue({ ...baseIncident, incidentType: 'MISCONDUCT', status: to });
+      prisma.__tx.user.findMany.mockResolvedValue([{ id: 'admin-user-1' }]);
+
+      await service.updateStatus('inc-1', { action, resolution: 'ok' } as any, admin);
+
+      expect(payloadOf().title).toBe(title);
+      expect(payloadOf().message).toBe(`Misconduct incident for “Cyber quiz 1 — Exam” ${endsWith}`);
     });
   });
 });

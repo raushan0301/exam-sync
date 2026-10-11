@@ -37,7 +37,7 @@ export default function FacultyIncidentsPage() {
   const { data, isLoading, isError, refetch, isFetching } = useIncidents({
     status: (status || undefined) as IncidentStatus | undefined,
     severity: (severity || undefined) as IncidentSeverity | undefined,
-    limit: 50,
+    all: true,
   });
 
   const columns: DataTableColumn<Incident>[] = [

@@ -55,7 +55,7 @@ export default function ProgramsPage() {
     cursor: pager.cursor,
     limit: 25,
   });
-  const { data: departmentsData } = useDepartments({ limit: 200, status: 'ACTIVE' });
+  const { data: departmentsData } = useDepartments({ all: true, status: 'ACTIVE' });
   const departmentOptions = (departmentsData?.items ?? []).map((d) => ({ value: d.id, label: `${d.code} — ${d.name}` }));
   const departmentById = new Map((departmentsData?.items ?? []).map((d) => [d.id, d]));
 

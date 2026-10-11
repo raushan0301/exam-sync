@@ -1,4 +1,4 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { ReportFormat, ReportJobStatus, ReportType } from '@exam-sync/db';
 import { ReportsService } from './reports.service';
 import { ExamSessionsService } from '../exam-session';
@@ -6,7 +6,7 @@ import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 
 function buildPrismaMock() {
   return {
-    reportJob: { create: jest.fn(), findUnique: jest.fn() },
+    reportJob: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
   } as any;
 }
 
@@ -50,6 +50,43 @@ describe('ReportsService', () => {
         { reportJobId: 'job-1' },
         expect.objectContaining({ jobId: 'job-1' }),
       );
+    });
+  });
+
+  describe('create — queue unavailable (fail fast)', () => {
+    const dto = { exam_session_id: 's1', format: ReportFormat.CSV };
+
+    beforeEach(() => {
+      examSessionsService.findById.mockResolvedValue({ id: 's1' });
+      prisma.reportJob.create.mockResolvedValue({ id: 'job-1', status: ReportJobStatus.PENDING });
+    });
+
+    it('marks the job FAILED and throws 503 when the enqueue rejects', async () => {
+      reportsQueue.add.mockRejectedValue(new Error('ECONNREFUSED'));
+
+      await expect(service.create(ReportType.ATTENDANCE, dto, admin)).rejects.toThrow(ServiceUnavailableException);
+      expect(prisma.reportJob.update).toHaveBeenCalledWith({
+        where: { id: 'job-1' },
+        data: { status: ReportJobStatus.FAILED, errorMessage: 'Report queue unavailable' },
+      });
+    });
+
+    it('does not hang when the enqueue never settles (Redis down, offline queue) — 503 after the timeout', async () => {
+      jest.useFakeTimers();
+      try {
+        reportsQueue.add.mockReturnValue(new Promise(() => undefined));
+
+        const assertion = expect(service.create(ReportType.ATTENDANCE, dto, admin)).rejects.toThrow(
+          ServiceUnavailableException,
+        );
+        await jest.advanceTimersByTimeAsync(3100);
+        await assertion;
+        expect(prisma.reportJob.update).toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ status: ReportJobStatus.FAILED }) }),
+        );
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 

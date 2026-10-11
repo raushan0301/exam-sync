@@ -8,17 +8,13 @@ import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/utils';
 import { useNotifications } from '@/lib/queries/useNotifications';
 import { useMarkNotificationRead } from '@/lib/mutations/useNotificationMutations';
+import { describeNotification } from '@/lib/notification-text';
 
 const NOTIFICATIONS_HREF_BY_ROLE: Record<string, string> = {
   ADMIN: '/admin/notifications',
   FACULTY: '/faculty/notifications',
   STUDENT: '/student/notifications',
 };
-
-function humanizeEventType(eventType: string): string {
-  const lower = eventType.toLowerCase().replace(/_/g, ' ');
-  return lower.charAt(0).toUpperCase() + lower.slice(1);
-}
 
 /**
  * Header bell — a live quick-preview of `GET /me/notifications` (same
@@ -83,6 +79,7 @@ export function NotificationsBell({ primaryRole }: { primaryRole: string | null 
             <ul className="max-h-80 overflow-y-auto">
               {items.map((n) => {
                 const unread = !n.readAt;
+                const { title, body } = describeNotification(n.eventType, n.payload);
                 return (
                   <li
                     key={n.id}
@@ -91,10 +88,8 @@ export function NotificationsBell({ primaryRole }: { primaryRole: string | null 
                     <div className="flex min-w-0 flex-1 items-start gap-2">
                       {unread && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary-600" aria-hidden="true" />}
                       <div className={cn('flex min-w-0 flex-col', !unread && 'pl-4')}>
-                        <span className={cn('text-text', unread && 'font-semibold')}>{humanizeEventType(n.eventType)}</span>
-                        {typeof n.payload?.message === 'string' && (
-                          <span className="text-xs text-text-muted">{n.payload.message as string}</span>
-                        )}
+                        <span className={cn('text-text', unread && 'font-semibold')}>{title}</span>
+                        {body && <span className="text-xs text-text-muted">{body}</span>}
                       </div>
                     </div>
                     {unread && (

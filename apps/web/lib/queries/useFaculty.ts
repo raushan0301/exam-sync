@@ -4,7 +4,8 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { AcademicStatus, Faculty, PaginatedResult } from './types';
+import { fetchList } from './fetch-list';
+import type { AcademicStatus, Faculty } from './types';
 
 export interface UseFacultyParams {
   status?: AcademicStatus;
@@ -12,6 +13,8 @@ export interface UseFacultyParams {
   departmentId?: string;
   cursor?: string;
   limit?: number;
+  /** Fetch EVERY page (follows `next_cursor`) instead of one page — for pick-lists that must show all rows. */
+  all?: boolean;
 }
 
 /** GET /faculty — ADMIN or FACULTY (used by InvigilatorPanel's "Assign Invigilator" picker). Supports search (faculty.controller.ts). */
@@ -22,11 +25,12 @@ export function useFaculty(params: UseFacultyParams = {}) {
     department_id: params.departmentId,
     cursor: params.cursor,
     limit: params.limit ? String(params.limit) : undefined,
+    all: params.all ? 'true' : undefined,
   };
 
   return useQuery({
     queryKey: queryKeys.faculty(query),
-    queryFn: () => apiFetch<PaginatedResult<Faculty>>('/faculty', { query }),
+    queryFn: () => fetchList<Faculty>('/faculty', query),
     enabled: hasStoredSession(),
     staleTime: 30_000,
   });

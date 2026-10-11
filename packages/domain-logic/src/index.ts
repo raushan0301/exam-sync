@@ -15,7 +15,7 @@
 export * from './seating/types';
 export { generateSeating } from './seating/generate-seating';
 export { validateSeating } from './seating/validate-seating';
-export { seededShuffle } from './seating/deterministic-random';
+export { keepAlternateColumns } from './seating/single-subject-spread';
 
 export * from './notifications/types';
 export { renderMessage } from './notifications/render-message';

@@ -258,31 +258,6 @@ describe('Exam Session detail', () => {
     setMockExamSessionRescheduleConflict(false);
   });
 
-  it('requires a reason to cancel, then cancels', async () => {
-    signInAsAdmin();
-    currentSessionId = 'session-1';
-    setMockExamSessions([makeSession({ id: 'session-1' })]);
-    setMockQuizzes([]);
-    setMockExamSessionRooms([]);
-
-    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
-
-    await screen.findByText('Midterm Session');
-    await userEvent.click(screen.getByRole('button', { name: /cancel session/i }));
-
-    const dialog = await screen.findByRole('dialog');
-    const confirmButton = within(dialog).getByRole('button', { name: /cancel session/i });
-    expect(confirmButton).toBeDisabled();
-
-    await userEvent.type(within(dialog).getByLabelText(/reason/i), 'Venue unavailable.');
-    expect(confirmButton).toBeEnabled();
-    await userEvent.click(confirmButton);
-
-    // Milestone 7's Roster status filter also has a "Cancelled" <option>,
-    // so scope this to the status badge specifically (not any-role text).
-    await waitFor(() => expect(screen.getByText('Cancelled', { selector: 'span' })).toBeInTheDocument());
-  });
-
   it('checks conflicts and displays hard vs warning distinctly', async () => {
     signInAsAdmin();
     currentSessionId = 'session-1';

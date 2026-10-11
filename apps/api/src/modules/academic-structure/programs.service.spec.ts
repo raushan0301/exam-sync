@@ -46,22 +46,16 @@ describe('ProgramsService', () => {
   });
 
   describe('generateBulkImportTemplate', () => {
-    it('uses a real existing program (+ its department\'s real code) as the example row', async () => {
-      prisma.program.findFirst.mockResolvedValue({ id: 'p1', code: 'BTECH-ECE', name: 'B.Tech ECE', department: { code: 'ECE' } });
+
+    it('uses a fixed example row, independent of existing data', async () => {
 
       const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
 
-      expect(row.department_code).toBe('ECE');
-      expect(row.code).toBe('BTECH-ECE');
+
+      expect(row.department_code).toBe('CSED');
+
     });
 
-    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
-      prisma.program.findFirst.mockResolvedValue(null);
-
-      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
-
-      expect(row.code).toBe('BTECH-CSE');
-    });
   });
 
   describe('create', () => {

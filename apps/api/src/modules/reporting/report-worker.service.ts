@@ -59,7 +59,11 @@ export class ReportWorkerService implements OnModuleInit, OnModuleDestroy {
     try {
       const table = await this.buildTable(job.reportType, job.examSessionId);
       const file = await writeReportFile(table, job.format);
-      const filename = await this.buildFilename(job.reportType, job.examSessionId, file.extension);
+      const session = await this.prisma.examSession.findUnique({
+        where: { id: job.examSessionId },
+        select: { name: true, sessionDate: true },
+      });
+      const filename = buildFilename(job.reportType, job.examSessionId, session, file.extension);
 
       const resultUrl = `/report-jobs/${reportJobId}/download`;
       // BR-042 outbox discipline: the COMPLETED status write and the
@@ -86,7 +90,15 @@ export class ReportWorkerService implements OnModuleInit, OnModuleDestroy {
           eventType: NotificationEventType.REPORT_READY,
           entityId: reportJobId,
           entityVersion: ReportJobStatus.COMPLETED,
-          payload: { report_job_id: reportJobId, report_type: job.reportType, download_url: resultUrl },
+          payload: {
+            report_job_id: reportJobId,
+            report_type: job.reportType,
+            // Human-readable fields so the notification can say WHICH report for WHICH exam.
+            report_label: REPORT_LABELS[job.reportType],
+            session_name: session?.name ?? null,
+            filename,
+            download_url: resultUrl,
+          },
         });
       });
     } catch (err) {
@@ -96,26 +108,6 @@ export class ReportWorkerService implements OnModuleInit, OnModuleDestroy {
         data: { status: ReportJobStatus.FAILED, errorMessage: (err as Error).message },
       });
     }
-  }
-
-  /**
-   * A human-readable download filename — the exam session's own name and
-   * date, not its raw UUID (which is what the old `${reportType}-${examSessionId}`
-   * pattern produced, and all a downloader ever saw was a meaningless
-   * random-looking string). Falls back to the UUID only if the session
-   * was deleted out from under an already-COMPLETED job (can't happen
-   * today — nothing deletes exam sessions — but cheaper than a crash if
-   * that ever changes).
-   */
-  private async buildFilename(reportType: ReportType, examSessionId: string, extension: string): Promise<string> {
-    const session = await this.prisma.examSession.findUnique({
-      where: { id: examSessionId },
-      select: { name: true, sessionDate: true },
-    });
-    const sessionSlug = session
-      ? `${slugify(session.name)}-${session.sessionDate.toISOString().slice(0, 10)}`
-      : examSessionId;
-    return `${slugify(reportType)}-${sessionSlug}.${extension}`;
   }
 
   /**
@@ -190,6 +182,27 @@ export class ReportWorkerService implements OnModuleInit, OnModuleDestroy {
       }
     }
   }
+}
+
+const REPORT_LABELS: Record<ReportType, string> = {
+  [ReportType.ATTENDANCE]: 'Attendance Report',
+  [ReportType.SEATING_PLAN]: 'Seating Plan Report',
+  [ReportType.INCIDENT_REPORT]: 'Incident Report',
+  [ReportType.ROOM_UTILIZATION]: 'Room Utilization Report',
+};
+
+/**
+ * A human-readable download filename — the exam session's own name and date,
+ * not its raw UUID. Falls back to the UUID only if the session no longer exists.
+ */
+function buildFilename(
+  reportType: ReportType,
+  examSessionId: string,
+  session: { name: string; sessionDate: Date } | null,
+  extension: string,
+): string {
+  const sessionSlug = session ? `${slugify(session.name)}-${session.sessionDate.toISOString().slice(0, 10)}` : examSessionId;
+  return `${slugify(reportType)}-${sessionSlug}.${extension}`;
 }
 
 /** Lowercase, hyphen-separated, filesystem-safe — e.g. "Cyber quiz 1 — Exam" -> "cyber-quiz-1-exam". */

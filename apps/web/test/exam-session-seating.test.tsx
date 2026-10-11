@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { setTokens } from '@/lib/token-storage';
+import { http, HttpResponse } from 'msw';
+import { server } from './msw/server';
+import { API_BASE_URL } from './msw/handlers';
 import { renderWithProviders } from './utils/renderWithProviders';
 import {
   setMockExamSessions,
@@ -153,12 +156,57 @@ function setUpBaseFixtures() {
   setMockSeatingFinalizeHardViolations(false);
 }
 
+describe('Seating — empty-column question and room layout', () => {
+  it('shows the room name and layout before generating, and blocks Generate until the empty-column question is answered', async () => {
+    setUpBaseFixtures();
+    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
+
+    await screen.findByText('Midterm Session');
+    expect(await screen.findByText(/Room 101 layout/i)).toBeInTheDocument();
+    expect(await screen.findByText(/leave an empty seat column between students/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /generate seating/i })).toBeDisabled();
+
+    await userEvent.click(screen.getByLabelText(/no — use every column/i));
+    expect(screen.getByRole('button', { name: /generate seating/i })).toBeEnabled();
+  });
+
+  it('does not offer empty columns when the remaining seats cannot hold everyone', async () => {
+    setUpBaseFixtures(); // 4 students allocated, 2x2 seats -> only 2 usable
+    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
+
+    await screen.findByText('Midterm Session');
+    expect(await screen.findByLabelText(/leave every second column empty/i)).toBeDisabled();
+    expect(screen.getByText(/not enough seats: 2 usable for 4 students/i)).toBeInTheDocument();
+  });
+
+  it('sends skip_alternate_columns when the faculty chooses empty columns', async () => {
+    setUpBaseFixtures();
+    const room = makeRoom();
+    setMockExamSessionRooms([{ ...room, allocatedCapacity: 2 }]);
+    let sent: Record<string, unknown> | null = null;
+    server.use(
+      http.post(`${API_BASE_URL}/exam-sessions/:id/seating/generate`, async ({ request }) => {
+        sent = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ message: 'stop here' }, { status: 409 });
+      }),
+    );
+    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
+
+    await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/leave every second column empty/i));
+    await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
+
+    await waitFor(() => expect(sent).toMatchObject({ room_id: 'room-1', skip_alternate_columns: true }));
+  });
+});
+
 describe('Seating generation', () => {
   it('generates a seating plan and shows the seat map', async () => {
     setUpBaseFixtures();
     renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
     await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
 
     // A VALIDATED plan shows a success-ish status and the seat map with the assigned student's initials/roll rendered as an aria-label.
@@ -178,20 +226,17 @@ describe('Seating generation', () => {
     expect(screen.getByRole('button', { name: /generate seating/i })).toBeDisabled();
   });
 
-  it('shows the ANTI_CHEATING disclaimer verbatim when present', async () => {
+  it('offers only the four strategies and explains in one line how each arranges seats', async () => {
     setUpBaseFixtures();
     renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
-    const strategySelect = screen.getByLabelText(/strategy/i);
-    await userEvent.selectOptions(strategySelect, 'ANTI_CHEATING');
-    await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
-
-    expect(
-      await screen.findByText(
-        'Seating adjacency rules reduce opportunistic copying risk between neighbors; they are not a guarantee against all forms of cheating and must be combined with active invigilation.',
-      ),
-    ).toBeInTheDocument();
+    const options = within(await screen.findByLabelText(/strategy/i)).getAllByRole('option').map((o) => o.textContent);
+    expect(options).toEqual(['Sequential', 'Alternate Subject', 'Alternate Batch', 'Subject + Batch Mix']);
+    expect(screen.getByText(/fills seats row by row in roster order/i)).toBeInTheDocument();
+    expect(screen.getByText(/one student from each subject in turn/i)).toBeInTheDocument();
+    expect(screen.getByText(/one student from each batch in turn/i)).toBeInTheDocument();
+    expect(screen.getByText(/each subject-and-batch combination in turn/i)).toBeInTheDocument();
   });
 
   it('shows hard violations when generation fails', async () => {
@@ -200,6 +245,7 @@ describe('Seating generation', () => {
     renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
     await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
 
     await screen.findByText('Failed');
@@ -211,6 +257,7 @@ describe('Seating generation', () => {
     renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
     await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
 
     const seatButton = await screen.findByLabelText(/seat a1, occupied by jane doe/i);
@@ -226,12 +273,55 @@ describe('Seating generation', () => {
   });
 });
 
+describe('Seating — score explanation', () => {
+  it('explains the Soft Constraint Score in plain words next to the number', async () => {
+    setUpBaseFixtures();
+    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
+
+    await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
+    await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
+
+    const note = await screen.findByTestId('score-explanation');
+    expect(note).toHaveTextContent(/what this score means/i);
+    expect(note).toHaveTextContent(/100% = nobody has a matching neighbour/i);
+    expect(note).toHaveTextContent(/never blocks finalizing/i);
+  });
+});
+
+describe('Seating after a page reload', () => {
+  it('shows the room\'s existing plan instead of offering a fresh Generate (which would hand back the old plan and ignore new choices)', async () => {
+    setUpBaseFixtures();
+    setMockSeatingPlans([
+      {
+        id: 'plan-existing',
+        examSessionId: 'session-1',
+        roomId: 'room-1',
+        strategy: 'ALTERNATE_SUBJECT',
+        status: 'VALIDATED',
+        softConstraintScore: 1,
+        violationReport: [],
+        version: 1,
+        generatedAt: NOW,
+        finalizedAt: null,
+      },
+    ]);
+    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
+
+    await screen.findByText('Midterm Session');
+    await waitFor(() => expect(screen.getAllByText('Validated').length).toBeGreaterThan(0));
+    expect(screen.queryByRole('button', { name: /generate seating/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /change strategy/i })).toBeInTheDocument();
+  });
+});
+
 describe('Seating finalization', () => {
   it('finalizes successfully from VALIDATED', async () => {
     setUpBaseFixtures();
     renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
     await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
     await screen.findByText('Validated');
 
@@ -261,8 +351,7 @@ describe('Seating finalization', () => {
     renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
-    // Regenerating short-circuits (EC-032) to the existing FINALIZED plan.
-    await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
+    // The existing FINALIZED plan is found again on load — no Generate form is offered.
     await waitFor(() => expect(screen.getAllByText('Finalized').length).toBeGreaterThan(0));
 
     // A FINALIZED plan offers no Finalize action at all (read-only).
@@ -275,6 +364,7 @@ describe('Seating finalization', () => {
     renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
     await userEvent.click(screen.getByRole('button', { name: /generate seating/i }));
     await waitFor(() => expect(screen.getAllByText('Validated').length).toBeGreaterThan(0));
 

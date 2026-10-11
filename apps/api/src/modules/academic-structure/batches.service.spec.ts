@@ -46,22 +46,16 @@ describe('BatchesService', () => {
   });
 
   describe('generateBulkImportTemplate', () => {
-    it('uses a real existing batch (+ its program\'s real code) as the example row', async () => {
-      prisma.batch.findFirst.mockResolvedValue({ year: '2026', section: '2C1', subsection: '2C11', program: { code: 'BTECH-CIVIL' } });
+
+    it('uses a fixed example row, independent of existing data', async () => {
 
       const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
 
-      expect(row.program_code).toBe('BTECH-CIVIL');
-      expect(row.subsection).toBe('2C11');
-    });
-
-    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
-      prisma.batch.findFirst.mockResolvedValue(null);
-
-      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
 
       expect(row.program_code).toBe('BE-COE');
+
     });
+
   });
 
   describe('create', () => {

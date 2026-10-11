@@ -5,6 +5,7 @@ import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-sessio
 import { FacultyService } from '../faculty';
 import { ConflictEngineService } from '../conflict-engine';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
+import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 
 function p2002(): Prisma.PrismaClientKnownRequestError {
@@ -18,6 +19,7 @@ function buildPrismaMock() {
   const tx = {
     $queryRaw: jest.fn(),
     examInvigilator: { findUnique: jest.fn(), create: jest.fn(), delete: jest.fn() },
+    room: { findUnique: jest.fn().mockResolvedValue({ building: 'B', roomNumber: '107' }) },
   };
   return {
     examSessionRoom: { findUnique: jest.fn() },
@@ -33,6 +35,7 @@ const studentActor: AuthenticatedUser = { id: 'user-stu-1', email: 's@example.co
 
 const activeSession = {
   id: 's1',
+  name: 'Finals',
   status: ExamSessionStatus.SEATING_GENERATION,
   sessionDate: new Date('2026-05-01'),
   startTime: new Date('1970-01-01T10:00:00Z'),
@@ -46,6 +49,7 @@ describe('InvigilationService', () => {
   let facultyService: { findById: jest.Mock; findByUserId: jest.Mock };
   let conflictEngine: { checkInvigilatorAssignment: jest.Mock };
   let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
+  let notificationsOutbox: { queue: jest.Mock };
   let service: InvigilationService;
 
   beforeEach(() => {
@@ -55,6 +59,7 @@ describe('InvigilationService', () => {
     facultyService = { findById: jest.fn(), findByUserId: jest.fn() };
     conflictEngine = { checkInvigilatorAssignment: jest.fn() };
     examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
+    notificationsOutbox = { queue: jest.fn() };
 
     service = new InvigilationService(
       prisma,
@@ -63,6 +68,7 @@ describe('InvigilationService', () => {
       facultyService as unknown as FacultyService,
       conflictEngine as unknown as ConflictEngineService,
       examSessionOwnershipService as unknown as ExamSessionOwnershipService,
+      notificationsOutbox as unknown as NotificationsOutboxService,
     );
   });
 
@@ -87,7 +93,7 @@ describe('InvigilationService', () => {
 
     it('404s when the target room is not allocated to this session', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examSessionRoom.findUnique.mockResolvedValue(null);
 
       await expect(service.assign('s1', dto, admin)).rejects.toThrow(NotFoundException);
@@ -103,7 +109,7 @@ describe('InvigilationService', () => {
 
     it('locks the faculty row before checking/inserting (ADR-003-style concurrency guard)', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
       prisma.__tx.$queryRaw.mockResolvedValue([{ id: 'fac-1' }]);
       prisma.__tx.examInvigilator.findUnique.mockResolvedValue(null);
@@ -123,7 +129,7 @@ describe('InvigilationService', () => {
 
     it('409s when the exact (session, room, faculty) triple already exists — "already assigned", not a conflict-engine hit', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
       prisma.__tx.$queryRaw.mockResolvedValue([{ id: 'fac-1' }]);
       prisma.__tx.examInvigilator.findUnique.mockResolvedValue({ id: 'existing-inv' });
@@ -135,7 +141,7 @@ describe('InvigilationService', () => {
 
     it('409s with BR-031 details when the Conflict Engine reports a FACULTY_OVERLAP', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
       prisma.__tx.$queryRaw.mockResolvedValue([{ id: 'fac-1' }]);
       prisma.__tx.examInvigilator.findUnique.mockResolvedValue(null);
@@ -150,7 +156,7 @@ describe('InvigilationService', () => {
 
     it('creates the invigilator assignment and audits it when everything checks out', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
       prisma.__tx.$queryRaw.mockResolvedValue([{ id: 'fac-1' }]);
       prisma.__tx.examInvigilator.findUnique.mockResolvedValue(null);
@@ -175,9 +181,51 @@ describe('InvigilationService', () => {
       expect(examSessionsService.maybeAdvanceToReadyForFinalization).toHaveBeenCalledWith('s1');
     });
 
+    it('notifies the assigned faculty member (in the same transaction) with exam, room, date, time and role', async () => {
+      examSessionsService.findById.mockResolvedValue(activeSession);
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
+      prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
+      prisma.__tx.$queryRaw.mockResolvedValue([{ id: 'fac-1' }]);
+      prisma.__tx.examInvigilator.findUnique.mockResolvedValue(null);
+      conflictEngine.checkInvigilatorAssignment.mockResolvedValue({ hard: [], warnings: [] });
+      prisma.__tx.examInvigilator.create.mockResolvedValue({ id: 'inv-1', examSessionId: 's1', roomId: 'room-1', facultyId: 'fac-1', role: dto.role });
+
+      await service.assign('s1', dto, admin);
+
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        prisma.__tx,
+        expect.objectContaining({
+          recipientType: 'FACULTY',
+          recipientId: 'user-fac-1',
+          eventType: 'INVIGILATOR_ASSIGNED',
+          entityId: 'inv-1',
+          payload: expect.objectContaining({
+            session_name: 'Finals',
+            room_label: 'B-107',
+            session_date: '2026-05-01',
+            start_time: '10:00',
+            end_time: '11:00',
+            role: dto.role,
+          }),
+        }),
+      );
+    });
+
+    it('does NOT notify when the assignment is rejected (overlap conflict)', async () => {
+      examSessionsService.findById.mockResolvedValue(activeSession);
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
+      prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
+      prisma.__tx.$queryRaw.mockResolvedValue([{ id: 'fac-1' }]);
+      prisma.__tx.examInvigilator.findUnique.mockResolvedValue(null);
+      conflictEngine.checkInvigilatorAssignment.mockResolvedValue({ hard: [{ type: 'FACULTY_OVERLAP', message: 'x' }], warnings: [] });
+
+      await expect(service.assign('s1', dto, admin)).rejects.toThrow(ConflictException);
+      expect(notificationsOutbox.queue).not.toHaveBeenCalled();
+    });
+
     it('maps a concurrent unique-constraint race (P2002) to a clean 409, never a raw 500 (ADR-003 backstop)', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
       prisma.$transaction.mockRejectedValue(p2002());
 
@@ -186,7 +234,7 @@ describe('InvigilationService', () => {
 
     it('lets an unrelated transaction error propagate unmapped', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1' });
       const genuinelyUnexpected = new Error('db exploded');
       prisma.$transaction.mockRejectedValue(genuinelyUnexpected);
@@ -197,7 +245,7 @@ describe('InvigilationService', () => {
 
   describe('listDuties — self/ADMIN, 404-not-403 (BR-045-style IDOR posture)', () => {
     it('ADMIN can list any faculty\'s duties', async () => {
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examInvigilator.findMany.mockResolvedValue([]);
 
       const result = await service.listDuties('fac-1', admin, {});
@@ -207,7 +255,7 @@ describe('InvigilationService', () => {
     });
 
     it('includes the exam session name/schedule and room label — an invigilator on someone else\'s session cannot GET that session directly to learn this', async () => {
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       prisma.examInvigilator.findMany.mockResolvedValue([
         {
           id: 'inv-1',
@@ -258,7 +306,7 @@ describe('InvigilationService', () => {
     });
 
     it('cursor-paginates using the shared pagination helpers', async () => {
-      facultyService.findById.mockResolvedValue({ id: 'fac-1' });
+      facultyService.findById.mockResolvedValue({ id: 'fac-1', userId: 'user-fac-1' });
       const rows = Array.from({ length: 26 }, (_, i) => ({ id: `inv${i}` }));
       prisma.examInvigilator.findMany.mockResolvedValue(rows);
 
@@ -293,7 +341,7 @@ describe('InvigilationService', () => {
   describe('remove — the only way to correct a wrong/outdated invigilator assignment', () => {
     it('deletes the assignment and audits it', async () => {
       examSessionsService.findById.mockResolvedValue(activeSession);
-      prisma.examInvigilator.findUnique.mockResolvedValue({ id: 'inv-1', examSessionId: 's1', roomId: 'room-1', facultyId: 'fac-1', role: InvigilatorRole.LEAD_INVIGILATOR });
+      prisma.examInvigilator.findUnique.mockResolvedValue({ id: 'inv-1', examSessionId: 's1', roomId: 'room-1', facultyId: 'fac-1', role: InvigilatorRole.LEAD_INVIGILATOR, faculty: { userId: 'user-fac-1' } });
 
       await service.remove('s1', 'inv-1', facultyActor);
 
@@ -301,6 +349,15 @@ describe('InvigilationService', () => {
       expect(auditHook.record).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'UPDATE', entityType: 'ExamInvigilator', entityId: 'inv-1', newValue: null }),
         expect.anything(),
+      );
+      // The faculty member is told the duty is gone.
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        prisma.__tx,
+        expect.objectContaining({
+          recipientId: 'user-fac-1',
+          eventType: 'INVIGILATOR_REMOVED',
+          payload: expect.objectContaining({ session_name: 'Finals', room_label: 'B-107', cause: 'REMOVED' }),
+        }),
       );
     });
 

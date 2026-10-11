@@ -109,8 +109,8 @@ export interface QuizFormProps {
  * multi-select primitive and the batch count per program is small.
  */
 export function QuizForm({ form, onSubmit, submitLabel, submitting, rootError, autoFillStudentCount = false }: QuizFormProps) {
-  const { data: subjectsData } = useSubjects({ limit: 200, isActive: true });
-  const { data: batchesData } = useBatches({ limit: 200, status: 'ACTIVE' });
+  const { data: subjectsData } = useSubjects({ all: true, isActive: true });
+  const { data: batchesData } = useBatches({ all: true, status: 'ACTIVE' });
   const subjectOptions = (subjectsData?.items ?? []).map((s) => ({ value: s.id, label: `${s.code} — ${s.name}` }));
   const batches = batchesData?.items ?? [];
 

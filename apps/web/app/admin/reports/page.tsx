@@ -50,7 +50,7 @@ export default function AdminReportsPage() {
   const createReport = useCreateReport(reportType);
   const download = useDownloadReportJob();
   const job = useReportJob(activeJobId);
-  const examSessionsQuery = useExamSessions({ limit: 200 });
+  const examSessionsQuery = useExamSessions({ all: true });
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();

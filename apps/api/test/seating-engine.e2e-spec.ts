@@ -276,8 +276,15 @@ describe('Seating Engine (e2e) — Phase 13', () => {
         .expect(400);
     });
 
-    // ANTI_CHEATING itself is now a fully-supported strategy — see
-    // test/anti-cheating.e2e-spec.ts (Phase 14).
+    it.each(['RANDOMIZED', 'ANTI_CHEATING'])('rejects the removed strategy %s with 400', async (strategy) => {
+      const { sessionId, roomId } = await setupSingleRoomSession(3, 10);
+
+      await request(app.getHttpServer())
+        .post(`/exam-sessions/${sessionId}/seating/generate`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ room_id: roomId, strategy })
+        .expect(400);
+    });
 
     it('rejects a session not yet in SEATING_GENERATION', async () => {
       const batchId = await createIsolatedBatch();
@@ -344,7 +351,7 @@ describe('Seating Engine (e2e) — Phase 13', () => {
       const second = await request(app.getHttpServer())
         .post(`/exam-sessions/${sessionId}/seating/generate`)
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ room_id: roomId, strategy: 'RANDOMIZED' }) // even with a DIFFERENT strategy — still short-circuited
+        .send({ room_id: roomId, strategy: 'ALTERNATE_BATCH' }) // even with a DIFFERENT strategy — still short-circuited
         .expect(202);
 
       expect(second.body.seating_plan_id).toBe(first.body.seating_plan_id);
@@ -602,7 +609,7 @@ describe('Seating Engine (e2e) — Phase 13', () => {
   });
 
   describe('every Phase 13 strategy produces a valid, complete plan end-to-end', () => {
-    const strategies = ['SEQUENTIAL', 'RANDOMIZED', 'ALTERNATE_SUBJECT', 'ALTERNATE_BATCH', 'SUBJECT_BATCH_MIX'];
+    const strategies = ['SEQUENTIAL', 'ALTERNATE_SUBJECT', 'ALTERNATE_BATCH', 'SUBJECT_BATCH_MIX'];
 
     it.each(strategies)('%s: every student seated exactly once, every seat used at most once', async (strategy) => {
       const { sessionId, roomId } = await setupSingleRoomSession(6, 10);

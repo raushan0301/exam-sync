@@ -9,6 +9,18 @@ interface DependencyCheck {
   error?: string;
 }
 
+// Bounded so a dead dependency reports `error` instead of hanging the probe —
+// the shared Redis connection retries forever by design (BullMQ requirement).
+const CHECK_TIMEOUT_MS = 2000;
+
+function withTimeout<T>(promise: PromiseLike<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
 @Controller('health')
 export class HealthController {
   constructor(
@@ -61,7 +73,7 @@ export class HealthController {
 
   private async checkDatabase(): Promise<DependencyCheck> {
     try {
-      await this.prisma.$queryRaw`SELECT 1`;
+      await withTimeout(this.prisma.$queryRaw`SELECT 1`, CHECK_TIMEOUT_MS);
       return { status: 'ok' };
     } catch (err) {
       return { status: 'error', error: (err as Error).message };
@@ -70,7 +82,7 @@ export class HealthController {
 
   private async checkRedis(): Promise<DependencyCheck> {
     try {
-      await this.redis.ping();
+      await withTimeout(this.redis.ping(), CHECK_TIMEOUT_MS);
       return { status: 'ok' };
     } catch (err) {
       return { status: 'error', error: (err as Error).message };

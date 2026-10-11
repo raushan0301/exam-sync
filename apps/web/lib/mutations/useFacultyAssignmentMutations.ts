@@ -2,8 +2,9 @@
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
+import { downloadBulkImportTemplate, uploadBulkImportFile } from './bulk-import-helpers';
 import { queryKeys } from '../queries/queryKeys';
-import type { FacultyAssignment, FacultyAssignmentRole } from '../queries/types';
+import type { FacultyAssignment, FacultyAssignmentRole, ImportJob } from '../queries/types';
 
 export interface CreateFacultyAssignmentInput {
   faculty_id: string;
@@ -38,6 +39,47 @@ export function useEndFacultyAssignment(facultyId: string) {
       queryClient.invalidateQueries({ queryKey: queryKeys.facultyAssignments(facultyId) });
     },
   });
+}
+
+/**
+ * POST /faculty-assignments/bulk — ADMIN only, one request for many rows
+ * (e.g. one faculty + subject across many batches). Processing is
+ * synchronous server-side, so the import job is already final when the id
+ * comes back; it's fetched once to read the per-row results (a failed row
+ * never blocks the rest — each carries its own message).
+ */
+export function useBulkAssignFaculty() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (assignments: CreateFacultyAssignmentInput[]): Promise<ImportJob> => {
+      const { job_id } = await apiFetch<{ job_id: string }>('/faculty-assignments/bulk', {
+        method: 'POST',
+        body: { assignments },
+      });
+      return apiFetch<ImportJob>(`/import-jobs/${job_id}`);
+    },
+    onSuccess: (_job, variables) => {
+      for (const id of new Set(variables.map((v) => v.faculty_id))) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.facultyAssignments(id) });
+      }
+    },
+  });
+}
+
+/** POST /faculty-assignments/bulk-import — ADMIN only, multipart/form-data, field name `file`. */
+export function useBulkImportFacultyAssignments() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (file: File) => uploadBulkImportFile('faculty-assignments', file),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['faculty-assignments', 'list'] });
+    },
+  });
+}
+
+/** GET /faculty-assignments/bulk-import/template — downloads the .xlsx template via the browser. */
+export function downloadFacultyAssignmentTemplate() {
+  return downloadBulkImportTemplate('faculty-assignments', 'faculty-assignment-bulk-import-template.xlsx');
 }
 
 export type { FacultyAssignment };

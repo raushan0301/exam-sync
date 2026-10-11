@@ -323,6 +323,23 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
       expect(largeGroupPlacement.allocatedCapacity).toBe(25); // quiz-large (25) got the exact-fit room
     });
 
+    it('several subjects in several rooms: EVERY room gets a mix of every subject, not one subject per room', async () => {
+      examSessionsService.findById.mockResolvedValue(draftLikeSession);
+      mockGroups([{ quizId: 'quiz-a', count: 15 }, { quizId: 'quiz-b', count: 15 }]);
+      mockLockedRooms(['room-small', 'room-big']);
+      mockSeatCounts({ 'room-small': 15, 'room-big': 24 }); // Best-Fit alone would give one subject per room
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftLikeSession, status: ExamSessionStatus.SEATING_GENERATION, version: 2 });
+      prisma.__tx.examSessionRoom.create.mockImplementation(({ data }: any) => Promise.resolve({ id: `esr-${data.roomId}`, ...data }));
+
+      await service.allocate('s1', { room_ids: ['room-small', 'room-big'] }, admin);
+
+      const breakdown = prisma.__tx.examSessionRoomQuiz.create.mock.calls.map((c: any) => c[0].data);
+      for (const roomId of ['esr-room-small', 'esr-room-big']) {
+        const quizzesInRoom = new Set(breakdown.filter((b: any) => b.examSessionRoomId === roomId).map((b: any) => b.quizId));
+        expect(quizzesInRoom).toEqual(new Set(['quiz-a', 'quiz-b']));
+      }
+    });
+
     it('aggregates multiple groups sharing one room into a single exam_session_rooms row with the summed capacity', async () => {
       examSessionsService.findById.mockResolvedValue(draftLikeSession);
       mockGroups([{ quizId: 'quiz-1', count: 10 }, { quizId: 'quiz-2', count: 5 }]);

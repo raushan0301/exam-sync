@@ -22,9 +22,9 @@ import type { AuditLogEntry } from '@/lib/queries/types';
  * UUIDs, same as before.
  */
 function useFkLabelMaps() {
-  const { data: departments } = useDepartments({ limit: 200 });
-  const { data: programs } = usePrograms({ limit: 200 });
-  const { data: batches } = useBatches({ limit: 200 });
+  const { data: departments } = useDepartments({ all: true });
+  const { data: programs } = usePrograms({ all: true });
+  const { data: batches } = useBatches({ all: true });
 
   const departmentLabels = new Map((departments?.items ?? []).map((d) => [d.id, `${d.code} — ${d.name}`]));
   const programLabels = new Map((programs?.items ?? []).map((p) => [p.id, `${p.code} — ${p.name}`]));

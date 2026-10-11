@@ -3,6 +3,8 @@ import { ExamSessionsController } from './exam-sessions.controller';
 import { ExamSessionsService } from './exam-sessions.service';
 import { ExamSessionsAccessRepository } from './exam-sessions-access.repository';
 import { ExamSessionOwnershipService } from './exam-session-ownership.service';
+import { ExamSessionSuspensionController } from './exam-session-suspension.controller';
+import { ExamSessionSuspensionService } from './exam-session-suspension.service';
 import { ConflictEngineModule } from '../conflict-engine';
 import { FacultyModule } from '../faculty';
 import { QuizModule } from '../quiz';
@@ -18,8 +20,8 @@ import { QuizModule } from '../quiz';
  */
 @Module({
   imports: [ConflictEngineModule, FacultyModule, QuizModule],
-  controllers: [ExamSessionsController],
-  providers: [ExamSessionsService, ExamSessionsAccessRepository, ExamSessionOwnershipService],
+  controllers: [ExamSessionsController, ExamSessionSuspensionController],
+  providers: [ExamSessionsService, ExamSessionsAccessRepository, ExamSessionOwnershipService, ExamSessionSuspensionService],
   exports: [ExamSessionsService, ExamSessionOwnershipService],
 })
 export class ExamSessionModule {}

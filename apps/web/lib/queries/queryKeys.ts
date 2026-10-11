@@ -29,6 +29,7 @@ export const queryKeys = {
 
   examSessions: (params?: Record<string, string | undefined>) => ['exam-sessions', 'list', params ?? {}] as const,
   examSession: (id: string) => ['exam-sessions', 'detail', id] as const,
+  suspensionRequests: (params?: Record<string, string | undefined>) => ['suspension-requests', 'list', params ?? {}] as const,
   examSessionConflicts: (id: string) => ['exam-sessions', 'conflicts', id] as const,
   examSessionRoster: (id: string, params?: Record<string, string | undefined>) =>
     ['exam-sessions', 'roster', id, params ?? {}] as const,
@@ -48,6 +49,7 @@ export const queryKeys = {
     ['faculty-assignments', 'list', facultyId, params ?? {}] as const,
 
   seatingPlan: (id: string) => ['seating-plans', 'detail', id] as const,
+  currentSeatingPlan: (sessionId: string, roomId: string) => ['seating-plans', 'current', sessionId, roomId] as const,
   seatingJob: (id: string) => ['seating-jobs', 'detail', id] as const,
 
   invigilationDuties: (facultyId: string, params?: Record<string, string | undefined>) =>

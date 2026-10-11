@@ -61,14 +61,13 @@ export const ADMIN_NAV: NavEntry[] = [
   // (that page is gone) — this now points at the read-only "all scheduled
   // sessions" list instead of the old create form.
   { label: 'Exam Sessions', href: '/admin/exam-sessions' },
+  { label: 'Suspension Requests', href: '/admin/suspension-requests' },
   { label: 'Rooms', href: '/admin/rooms' },
-  { label: 'Invigilation' },
-  { label: 'Attendance' },
   { label: 'Incidents', href: '/admin/incidents' },
   { label: 'Reports', href: '/admin/reports' },
   { label: 'Notifications', href: '/admin/notifications' },
   { label: 'Audit Log', href: '/admin/audit-log' },
-  { label: 'System Health' },
+  { label: 'System Health', href: '/admin/system-health' },
 ];
 
 export const FACULTY_NAV: NavEntry[] = [
@@ -89,9 +88,7 @@ export const FACULTY_NAV: NavEntry[] = [
 
 export const STUDENT_NAV: NavEntry[] = [
   { label: 'Dashboard', href: '/student/dashboard' },
-  { label: 'My Schedule' },
   { label: 'Notifications', href: '/student/notifications' },
-  { label: 'Attendance History' },
 ];
 
 export const NAV_BY_ROLE: Record<PrimaryRole, NavEntry[]> = {

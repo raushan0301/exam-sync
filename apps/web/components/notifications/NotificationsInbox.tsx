@@ -7,17 +7,13 @@ import { cn } from '@/components/ui/utils';
 import { useNotifications } from '@/lib/queries/useNotifications';
 import { useMarkNotificationRead } from '@/lib/mutations/useNotificationMutations';
 import { mapError } from '@/lib/error-mapping';
+import { describeNotification } from '@/lib/notification-text';
 import type { Notification } from '@/lib/queries/types';
-
-/** Humanizes a NotificationEventType-shaped string, e.g. QUIZ_APPROVED -> "Quiz approved". */
-function humanizeEventType(eventType: string): string {
-  const lower = eventType.toLowerCase().replace(/_/g, ' ');
-  return lower.charAt(0).toUpperCase() + lower.slice(1);
-}
 
 function NotificationRow({ notification }: { notification: Notification }) {
   const markRead = useMarkNotificationRead();
   const unread = !notification.readAt;
+  const { title, body } = describeNotification(notification.eventType, notification.payload);
 
   return (
     <li
@@ -29,12 +25,8 @@ function NotificationRow({ notification }: { notification: Notification }) {
       <div className="flex min-w-0 flex-1 items-start gap-2">
         {unread && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary-600" aria-label="unread" />}
         <div className={cn('flex min-w-0 flex-col', !unread && 'pl-4')}>
-          <span className={cn('text-sm text-text', unread && 'font-semibold')}>
-            {humanizeEventType(notification.eventType)}
-          </span>
-          {typeof notification.payload?.message === 'string' && (
-            <span className="mt-0.5 text-sm text-text-muted">{notification.payload.message as string}</span>
-          )}
+          <span className={cn('text-sm text-text', unread && 'font-semibold')}>{title}</span>
+          {body && <span className="mt-0.5 text-sm text-text-muted">{body}</span>}
           <span className="mt-1 text-xs text-text-subtle">{new Date(notification.createdAt).toLocaleString()}</span>
         </div>
       </div>

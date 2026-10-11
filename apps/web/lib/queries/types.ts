@@ -565,13 +565,11 @@ export interface StudentSubjectEnrollment {
 // reassignment endpoint (the controller's own header comment discloses
 // this as a deferral, not an oversight) — nothing here models one.
 
-export type SeatingStrategyName =
-  | 'SEQUENTIAL'
-  | 'RANDOMIZED'
-  | 'ALTERNATE_SUBJECT'
-  | 'ALTERNATE_BATCH'
-  | 'SUBJECT_BATCH_MIX'
-  | 'ANTI_CHEATING';
+/** Strategies a new plan can use. */
+export type SeatingStrategyName = 'SEQUENTIAL' | 'ALTERNATE_SUBJECT' | 'ALTERNATE_BATCH' | 'SUBJECT_BATCH_MIX';
+
+/** A stored plan may be from before RANDOMIZED / ANTI_CHEATING were removed. */
+export type StoredSeatingStrategyName = SeatingStrategyName | 'RANDOMIZED' | 'ANTI_CHEATING';
 
 export type SeatingPlanStatus = 'DRAFT' | 'VALIDATED' | 'FAILED' | 'FINALIZED' | 'SUPERSEDED';
 
@@ -581,10 +579,8 @@ export type SeatingPlanStatus = 'DRAFT' | 'VALIDATED' | 'FAILED' | 'FINALIZED' |
  * `GET /seating-jobs/{id}` — verified against
  * `SeatingEngineService.toSummary`/`toSummaryWithViolations`.
  * `hard_violations` is only populated when `status === 'FAILED'`;
- * `soft_violations` only when `status === 'VALIDATED'`. `disclaimer` is
- * present only for the `ANTI_CHEATING` strategy and MUST be rendered
- * verbatim, never re-worded. `fallback_reason` is present only when the
- * ANTI_CHEATING single-subject fallback fired.
+ * `soft_violations` only when `status === 'VALIDATED'`. `fallback_reason` is
+ * present only when the one-subject roll-number spread replaced the strategy.
  */
 export interface SeatingGenerationSummary {
   job_id: string;
@@ -593,7 +589,6 @@ export interface SeatingGenerationSummary {
   soft_constraint_score: number | null;
   hard_violations: unknown[];
   soft_violations: unknown[];
-  disclaimer?: string;
   fallback_reason?: string;
 }
 
@@ -615,7 +610,7 @@ export interface SeatingPlan {
   id: string;
   examSessionId: string;
   roomId: string;
-  strategy: SeatingStrategyName;
+  strategy: StoredSeatingStrategyName;
   status: SeatingPlanStatus;
   softConstraintScore: number | null;
   violationReport: unknown[] | null;
@@ -712,6 +707,34 @@ export interface Notification {
   createdAt: string;
   sentAt: string | null;
   readAt: string | null;
+}
+
+// -- Exam session suspension requests --------------------------------------
+// Verified against apps/api/src/modules/exam-session/exam-session-suspension.service.ts
+// (`SuspensionRequestView`). Approving a request cancels the session (History,
+// status CANCELLED); rejecting leaves it untouched.
+export type SuspensionRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+export interface SuspensionRequest {
+  id: string;
+  examSessionId: string;
+  requestedByFacultyId: string;
+  /** The faculty's written justification. */
+  reason: string;
+  status: SuspensionRequestStatus;
+  reviewedByAdminId: string | null;
+  /** Admin's note — required when rejecting, optional when approving. */
+  reviewNote: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  examSessionName: string;
+  examSessionDate: string;
+  examSessionStartTime: string;
+  examSessionEndTime: string;
+  examSessionStatus: string;
+  facultyName: string;
+  facultyEmployeeCode: string;
 }
 
 // -- Reports (Milestone 11) ----------------------------------------------

@@ -4,8 +4,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Card, ConfirmationDialog, EmptyState, ErrorState, Select, SkeletonText, StatusBadge } from '@/components/ui';
 import { SeatMap } from '@/components/seating/SeatMap';
 import { useRoomSeats } from '@/lib/queries/useRoomSeats';
+import { useCurrentSeatingPlan } from '@/lib/queries/useCurrentSeatingPlan';
 import { useSeatingPlan } from '@/lib/queries/useSeatingPlan';
-import { useSeatingJob } from '@/lib/queries/useSeatingJob';
 import { useSubjects } from '@/lib/queries/useSubjects';
 import { useBatches } from '@/lib/queries/useBatches';
 import {
@@ -14,18 +14,43 @@ import {
   useFinalizeSeatingPlan,
   isFinalizeHardViolations409,
 } from '@/lib/mutations/useSeatingMutations';
-import { apiFetch } from '@/lib/api-client';
 import { mapError } from '@/lib/error-mapping';
-import type { ExamSessionDetail, ExamSessionRoom, SeatingAssignment, SeatingGenerationSummary, SeatingStrategyName } from '@/lib/queries/types';
+import type { ExamSessionDetail, ExamSessionRoom, SeatingAssignment, SeatingStrategyName } from '@/lib/queries/types';
 
 const STRATEGY_OPTIONS: { value: SeatingStrategyName; label: string; description: string }[] = [
-  { value: 'SEQUENTIAL', label: 'Sequential', description: 'Fills seats row by row, in roster order.' },
-  { value: 'RANDOMIZED', label: 'Randomized', description: 'Assigns seats in a random, reproducible order.' },
-  { value: 'ALTERNATE_SUBJECT', label: 'Alternate Subject', description: 'Alternates neighboring seats between different subjects where possible.' },
-  { value: 'ALTERNATE_BATCH', label: 'Alternate Batch', description: 'Alternates neighboring seats between different student batches where possible.' },
-  { value: 'SUBJECT_BATCH_MIX', label: 'Subject + Batch Mix', description: 'Balances both subject and batch diversity between neighbors.' },
-  { value: 'ANTI_CHEATING', label: 'Anti-Cheating', description: 'Maximizes neighbor diversity to reduce opportunistic copying risk.' },
+  { value: 'SEQUENTIAL', label: 'Sequential', description: 'Fills seats row by row in roster order — no mixing.' },
+  { value: 'ALTERNATE_SUBJECT', label: 'Alternate Subject', description: 'Takes one student from each subject in turn so neighbouring seats get different subjects (one subject only: spread by roll number and batch).' },
+  { value: 'ALTERNATE_BATCH', label: 'Alternate Batch', description: 'Takes one student from each batch in turn so neighbours come from different batches (one batch only: spread by roll number).' },
+  { value: 'SUBJECT_BATCH_MIX', label: 'Subject + Batch Mix', description: 'Takes one student from each subject-and-batch combination in turn, so neighbours differ in both where possible.' },
 ];
+
+/** Label for a stored plan's strategy, including plans made before RANDOMIZED / ANTI_CHEATING were removed. */
+function strategyLabel(strategy: string): string {
+  const legacy: Record<string, string> = { RANDOMIZED: 'Randomized (retired)', ANTI_CHEATING: 'Anti-Cheating (retired)' };
+  return STRATEGY_OPTIONS.find((s) => s.value === strategy)?.label ?? legacy[strategy] ?? strategy;
+}
+
+/** One line per strategy, the chosen one highlighted — so nobody has to guess what a name does. */
+function StrategyHelp({ selected }: { selected: SeatingStrategyName }) {
+  return (
+    <ul className="flex flex-col gap-1 rounded border border-border p-2 text-xs">
+      {STRATEGY_OPTIONS.map((o) => (
+        <li key={o.value} className={o.value === selected ? 'text-text' : 'text-text-muted'}>
+          <span className="font-medium">{o.label}:</span> {o.description}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+type ColumnChoice = 'unset' | 'keep' | 'skip';
+
+/** Seats in every second column (1st, 3rd, 5th... are kept) — mirrors `keepAlternateColumns` in domain-logic. */
+function withoutAlternateColumns<T extends { colIndex: number; isActive: boolean }>(seats: T[]): T[] {
+  const columns = [...new Set(seats.filter((s) => s.isActive).map((s) => s.colIndex))].sort((a, b) => a - b);
+  const kept = new Set(columns.filter((_, i) => i % 2 === 0));
+  return seats.map((s) => (kept.has(s.colIndex) ? s : { ...s, isActive: false }));
+}
 
 const READ_ONLY_STATUSES = new Set(['FINALIZED', 'SUPERSEDED']);
 // A room's plan can still be changed (regenerated with a different
@@ -80,66 +105,37 @@ function RoomSeatingCard({
   const [newStrategy, setNewStrategy] = useState<SeatingStrategyName>('SEQUENTIAL');
   const [view, setView] = useState<'grid' | 'list'>('grid');
   const [finalizeOpen, setFinalizeOpen] = useState(false);
+  // Asked before generating: leave every second column empty? Must be answered — no silent default.
+  const [columnChoice, setColumnChoice] = useState<ColumnChoice>('unset');
+  const [newColumnChoice, setNewColumnChoice] = useState<ColumnChoice>('unset');
 
   const generateMutation = useGenerateSeating(session.id);
   const regenerateMutation = useRegenerateSeating(session.id);
   const finalizeMutation = useFinalizeSeatingPlan(session.id);
   const planQuery = useSeatingPlan(planId ?? undefined);
-  const seatsQuery = useRoomSeats(planId ? room.id : undefined);
-  // `GET /seating-jobs/{id}` returns the same summary shape the generate
-  // response did (job_id === seating_plan_id, verified against
-  // `SeatingEngineService.toSummary`) — used here purely to source the
-  // ANTI_CHEATING `disclaimer` field verbatim, since `GET
-  // /seating-plans/{id}` itself does not include it (findByIdScoped
-  // returns the plan row + assignments only).
-  const jobQuery = useSeatingJob(planId ?? undefined);
+  const seatsQuery = useRoomSeats(room.id); // always loaded: the layout is shown before AND after generating
   // Best-effort id->label maps to translate the raw UUIDs baked into
   // domain-logic's violation `message` strings (that package is pure and
   // has no DB access, so it can only ever know ids) into names a faculty
   // can actually recognize. Same "fetch up to 200, look up client-side"
   // pattern already used elsewhere in this codebase (e.g. RosterPanel).
-  const subjectsQuery = useSubjects({ limit: 200 });
-  const batchesQuery = useBatches({ limit: 200 });
+  const subjectsQuery = useSubjects({ all: true });
+  const batchesQuery = useBatches({ all: true });
 
   const canGenerate = session.status === 'SEATING_GENERATION' && !readOnly;
 
-  // Recovery for the case this screenshot showed: the plan was already
-  // generated earlier (that's WHY the session could advance past
-  // SEATING_GENERATION), but its id only ever lived in this component's
-  // local state — a page reload loses it, and the session status now
-  // correctly blocks the "Generate Seating" button, leaving no way back
-  // to the plan that already exists. Safe to auto-probe here specifically
-  // BECAUSE `canGenerate` is false: `generate` checks EC-032 idempotency
-  // (an existing plan) before it ever checks session status, so this call
-  // can only ever return an already-existing plan or 409 — it can never
-  // create a new one while `!canGenerate` (the status check happens after
-  // the idempotency check and would reject before any create). Uses a
-  // bare apiFetch, not `useGenerateSeating`, so a genuine "nothing exists
-  // yet" 409 here doesn't light up the explicit Generate button's own
-  // error banner.
+  // A plan generated earlier (before a page reload, or by someone else) is found again from the server, so
+  // this card never offers a fresh "Generate" for a room that already has seating — which would only hand
+  // back the old plan and ignore the strategy / empty-column choice just made.
+  const currentPlanQuery = useCurrentSeatingPlan(session.id, room.id);
+  const currentPlanId = currentPlanQuery.data?.seating_plan_id ?? null;
   useEffect(() => {
-    if (planId || canGenerate) return;
-    let cancelled = false;
-    apiFetch<SeatingGenerationSummary>(`/exam-sessions/${session.id}/seating/generate`, {
-      method: 'POST',
-      body: { room_id: room.id, strategy: 'SEQUENTIAL' },
-    })
-      .then((result) => {
-        if (!cancelled) setPlanId(result.seating_plan_id);
-      })
-      .catch(() => {
-        // No plan exists for this room and generation is no longer
-        // allowed either — genuinely nothing to recover, fall through to
-        // the normal "cannot be generated right now" messaging below.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [planId, canGenerate, session.id, room.id]);
+    if (!planId && currentPlanId) setPlanId(currentPlanId);
+  }, [planId, currentPlanId]);
 
   async function onGenerate() {
     try {
-      const result = await generateMutation.mutateAsync({ room_id: room.id, strategy });
+      const result = await generateMutation.mutateAsync({ room_id: room.id, strategy, skip_alternate_columns: columnChoice === 'skip' });
       setPlanId(result.seating_plan_id);
     } catch {
       // surfaced below via generateMutation.error
@@ -148,9 +144,14 @@ function RoomSeatingCard({
 
   async function onRegenerate() {
     try {
-      const result = await regenerateMutation.mutateAsync({ room_id: room.id, strategy: newStrategy });
+      const result = await regenerateMutation.mutateAsync({
+        room_id: room.id,
+        strategy: newStrategy,
+        skip_alternate_columns: newColumnChoice === 'skip',
+      });
       setPlanId(result.seating_plan_id);
       setChangingStrategy(false);
+      setNewColumnChoice('unset');
     } catch {
       // surfaced below via regenerateMutation.error
     }
@@ -173,6 +174,15 @@ function RoomSeatingCard({
   const isReadOnly = plan ? READ_ONLY_STATUSES.has(plan.status) : false;
   const canFinalize = plan?.status === 'VALIDATED' && !readOnly;
   const canChangeStrategy = plan ? CAN_CHANGE_STRATEGY_STATUSES.has(plan.status) && !readOnly : false;
+
+  // The "one subject — spread by roll number" notice is stored as a violation-report entry; show it as
+  // information, not as a violation.
+  const spreadNotice = (plan?.violationReport ?? []).some(
+    (v) => (v as { type?: string } | null)?.type === 'SINGLE_SUBJECT_FALLBACK',
+  );
+  const reportedViolations = (plan?.violationReport ?? []).filter(
+    (v) => (v as { type?: string } | null)?.type !== 'SINGLE_SUBJECT_FALLBACK',
+  );
 
   const finalizeErr = finalizeMutation.error;
   const finalizeIsHardViolations = finalizeErr ? isFinalizeHardViolations409(finalizeErr) : false;
@@ -206,19 +216,23 @@ function RoomSeatingCard({
     <Card
       header={
         <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-text">
-            {room.building} · Floor {room.floor} · Room {room.roomNumber}
-          </h3>
+          <div>
+            <h3 className="text-sm font-semibold text-text">Room {room.roomNumber}</h3>
+            <p className="text-xs text-text-muted">
+              Building {room.building} · Floor {room.floor} · {room.allocatedCapacity} students allocated
+            </p>
+          </div>
           {plan && <StatusBadge status={plan.status} />}
         </div>
       }
       padding="dense"
     >
       <div className="flex flex-col gap-3">
-        {!planId && readOnly && (
+        {!planId && currentPlanQuery.isLoading && <SkeletonText lines={3} />}
+        {!planId && !currentPlanQuery.isLoading && readOnly && (
           <EmptyState title="Seating not generated yet" description="This is a read-only view — seating generation is driven by the owning faculty." />
         )}
-        {!planId && !readOnly && (
+        {!planId && !currentPlanQuery.isLoading && !readOnly && (
           <div className="flex flex-col gap-3">
             {!canGenerate && (
               <Alert color="warning" title="Seating cannot be generated right now">
@@ -232,16 +246,28 @@ function RoomSeatingCard({
               options={STRATEGY_OPTIONS.map((s) => ({ value: s.value, label: s.label }))}
               disabled={!canGenerate}
             />
-            <p className="text-xs text-text-muted">
-              {STRATEGY_OPTIONS.find((s) => s.value === strategy)?.description}
-            </p>
+            <StrategyHelp selected={strategy} />
+            <ColumnGapQuestion
+              name={`gap-${room.id}`}
+              value={columnChoice}
+              onChange={setColumnChoice}
+              seats={seatsQuery.data ?? []}
+              students={room.allocatedCapacity}
+              disabled={!canGenerate}
+            />
+            <RoomLayoutPreview
+              roomLabel={`Room ${room.roomNumber}`}
+              seats={seatsQuery.data ?? []}
+              loading={seatsQuery.isLoading}
+              skipColumns={columnChoice === 'skip'}
+            />
             {generateMutation.isError && (
               <Alert color="danger" title="Couldn't generate seating">
                 {mapError(generateMutation.error).description}
               </Alert>
             )}
             <div className="flex justify-end">
-              <Button onClick={onGenerate} loading={generateMutation.isPending} disabled={!canGenerate}>
+              <Button onClick={onGenerate} loading={generateMutation.isPending} disabled={!canGenerate || columnChoice === 'unset'}>
                 Generate Seating
               </Button>
             </div>
@@ -266,16 +292,10 @@ function RoomSeatingCard({
               </p>
             )}
 
-            {plan.strategy === 'ANTI_CHEATING' && (generateMutation.data?.disclaimer ?? jobQuery.data?.disclaimer) && (
-              <Alert color="info" title="Anti-cheating disclaimer">
-                {generateMutation.data?.disclaimer ?? jobQuery.data?.disclaimer}
-              </Alert>
-            )}
-
             <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
               <div>
                 <dt className="text-text-muted">Strategy</dt>
-                <dd className="text-text">{STRATEGY_OPTIONS.find((s) => s.value === plan.strategy)?.label ?? plan.strategy}</dd>
+                <dd className="text-text">{strategyLabel(plan.strategy)}</dd>
               </div>
               <div>
                 <dt className="text-text-muted">Soft Constraint Score</dt>
@@ -284,21 +304,28 @@ function RoomSeatingCard({
                 </dd>
               </div>
             </div>
+            <ScoreExplanation score={plan.softConstraintScore} />
 
-            {plan.status === 'FAILED' && plan.violationReport && plan.violationReport.length > 0 && (
+            {spreadNotice && (
+              <Alert color="info" title="One subject in this room">
+                Everyone here sits the same subject, so seats were spread by roll number and batch instead — consecutive roll numbers are kept apart and rows are staggered.
+              </Alert>
+            )}
+
+            {plan.status === 'FAILED' && reportedViolations.length > 0 && (
               <Alert color="danger" title="Hard constraint violations">
                 <ul className="list-disc pl-4 text-xs">
-                  {plan.violationReport.map((v, i) => (
+                  {reportedViolations.map((v, i) => (
                     <li key={i}>{describeViolation(v)}</li>
                   ))}
                 </ul>
               </Alert>
             )}
 
-            {plan.status === 'VALIDATED' && plan.violationReport && plan.violationReport.length > 0 && (
+            {plan.status === 'VALIDATED' && reportedViolations.length > 0 && (
               <Alert color="warning" title="Soft constraint violations">
                 <ul className="list-disc pl-4 text-xs">
-                  {plan.violationReport.map((v, i) => (
+                  {reportedViolations.map((v, i) => (
                     <li key={i}>{describeViolation(v)}</li>
                   ))}
                 </ul>
@@ -310,7 +337,7 @@ function RoomSeatingCard({
                 {!changingStrategy ? (
                   <div className="flex items-center justify-between">
                     <p className="text-xs text-text-muted">Not happy with this arrangement? You can try a different strategy before finalizing.</p>
-                    <Button variant="secondary" size="sm" onClick={() => { setNewStrategy(plan.strategy); setChangingStrategy(true); }}>
+                    <Button variant="secondary" size="sm" onClick={() => { setNewStrategy(STRATEGY_OPTIONS.some((o) => o.value === plan.strategy) ? (plan.strategy as SeatingStrategyName) : 'SEQUENTIAL'); setNewColumnChoice('unset'); setChangingStrategy(true); }}>
                       Change Strategy
                     </Button>
                   </div>
@@ -322,9 +349,14 @@ function RoomSeatingCard({
                       onChange={(e) => setNewStrategy(e.target.value as SeatingStrategyName)}
                       options={STRATEGY_OPTIONS.map((s) => ({ value: s.value, label: s.label }))}
                     />
-                    <p className="text-xs text-text-muted">
-                      {STRATEGY_OPTIONS.find((s) => s.value === newStrategy)?.description}
-                    </p>
+                    <StrategyHelp selected={newStrategy} />
+                    <ColumnGapQuestion
+                      name={`regap-${room.id}`}
+                      value={newColumnChoice}
+                      onChange={setNewColumnChoice}
+                      seats={seatsQuery.data ?? []}
+                      students={room.allocatedCapacity}
+                    />
                     {regenerateMutation.isError && (
                       <Alert color="danger" title="Couldn't regenerate seating">
                         {mapError(regenerateMutation.error).description}
@@ -334,7 +366,7 @@ function RoomSeatingCard({
                       <Button variant="secondary" size="sm" onClick={() => setChangingStrategy(false)} disabled={regenerateMutation.isPending}>
                         Cancel
                       </Button>
-                      <Button size="sm" onClick={onRegenerate} loading={regenerateMutation.isPending}>
+                      <Button size="sm" onClick={onRegenerate} loading={regenerateMutation.isPending} disabled={newColumnChoice === 'unset'}>
                         Regenerate
                       </Button>
                     </div>
@@ -358,7 +390,10 @@ function RoomSeatingCard({
             {seatsQuery.isLoading ? (
               <SkeletonText lines={4} />
             ) : view === 'grid' ? (
-              <SeatMap seats={seatsQuery.data ?? []} assignments={plan.assignments} coloring="subject" />
+              <div className="flex flex-col gap-1">
+                <p className="text-xs text-text-muted">Room {room.roomNumber} · Building {room.building} — front of the room at the top</p>
+                <SeatMap seats={seatsQuery.data ?? []} assignments={plan.assignments} coloring="subject" />
+              </div>
             ) : (
               <SeatingListView assignments={plan.assignments} />
             )}
@@ -402,6 +437,91 @@ function RoomSeatingCard({
         onConfirm={onFinalize}
       />
     </Card>
+  );
+}
+
+/** What the Soft Constraint Score means, in plain words — and what this plan's value says. */
+function ScoreExplanation({ score }: { score: number | null }) {
+  const percent = score == null ? null : Math.round(score * 100);
+  const verdict =
+    percent == null
+      ? null
+      : percent >= 100
+        ? 'No two neighbours share a subject, batch or quiz — the best possible result.'
+        : percent >= 70
+          ? 'Most neighbours differ; a few still share a subject, batch or quiz (listed below).'
+          : 'Many neighbours share a subject, batch or quiz. Try another strategy or room mix.';
+  return (
+    <p className="text-xs text-text-muted" data-testid="score-explanation">
+      <span className="font-medium text-text">What this score means:</span> how well students sitting side by side, or one behind the
+      other, differ in subject, batch and quiz (for a one-subject room: batch and roll number). 100% = nobody has a matching neighbour; lower =
+      more matching neighbours. It is advice only — a low score never blocks finalizing.
+      {verdict && <span className="mt-1 block text-text">{verdict}</span>}
+    </p>
+  );
+}
+
+/** The question asked before every generation: leave an empty column between students? */
+function ColumnGapQuestion({
+  name,
+  value,
+  onChange,
+  seats,
+  students,
+  disabled,
+}: {
+  name: string;
+  value: ColumnChoice;
+  onChange: (next: ColumnChoice) => void;
+  seats: { colIndex: number; isActive: boolean }[];
+  students: number;
+  disabled?: boolean;
+}) {
+  const usable = withoutAlternateColumns(seats).filter((s) => s.isActive).length;
+  const total = seats.filter((s) => s.isActive).length;
+  const fits = usable >= students;
+  return (
+    <fieldset className="flex flex-col gap-2 rounded border border-border p-3" disabled={disabled}>
+      <legend className="px-1 text-sm font-medium text-text">Leave an empty seat column between students?</legend>
+      <p className="text-xs text-text-muted">
+        Skipping every second column means nobody has a side neighbour, which is the strongest seating-only way to reduce copying — but it uses fewer seats.
+        This room has {total} seats for {students} students; with empty columns {usable} seats stay usable.
+      </p>
+      <label className="flex items-center gap-2 text-sm">
+        <input type="radio" name={name} checked={value === 'keep'} onChange={() => onChange('keep')} />
+        No — use every column
+      </label>
+      <label className="flex items-center gap-2 text-sm">
+        <input type="radio" name={name} checked={value === 'skip'} onChange={() => onChange('skip')} disabled={!fits} />
+        Yes — leave every second column empty
+        {!fits && <span className="text-xs text-text-muted">(not enough seats: {usable} usable for {students} students)</span>}
+      </label>
+      {value === 'unset' && <p className="text-xs text-warning">Choose one to continue.</p>}
+    </fieldset>
+  );
+}
+
+/** Empty-room layout shown before seating is generated: the seats that will be used, with the room's name. */
+function RoomLayoutPreview({
+  roomLabel,
+  seats,
+  loading,
+  skipColumns,
+}: {
+  roomLabel: string;
+  seats: { id: string; rowIndex: number; colIndex: number; seatLabel: string; isActive: boolean; isAccessible: boolean }[];
+  loading: boolean;
+  skipColumns: boolean;
+}) {
+  if (loading) return <SkeletonText lines={3} />;
+  const shown = skipColumns ? withoutAlternateColumns(seats) : seats;
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="text-xs font-medium text-text">
+        {roomLabel} layout{skipColumns ? ' — blank columns stay empty' : ''}
+      </p>
+      <SeatMap seats={shown} assignments={[]} coloring="subject" />
+    </div>
   );
 }
 

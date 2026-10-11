@@ -1,10 +1,10 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { PaginatedResult, Subject } from './types';
+import { fetchList } from './fetch-list';
+import type { Subject } from './types';
 
 export interface UseSubjectsParams {
   /** Subjects use `is_active: boolean`, not a `status` enum (confirmed in subjects.controller.ts). */
@@ -14,6 +14,8 @@ export interface UseSubjectsParams {
   programId?: string;
   cursor?: string;
   limit?: number;
+  /** Fetch EVERY page (follows `next_cursor`) instead of one page — for pick-lists that must show all rows. */
+  all?: boolean;
 }
 
 /** GET /subjects — confirmed query params: cursor, limit, search, isActive, department_id, program_id. */
@@ -25,11 +27,12 @@ export function useSubjects(params: UseSubjectsParams = {}) {
     program_id: params.programId,
     cursor: params.cursor,
     limit: params.limit ? String(params.limit) : undefined,
+    all: params.all ? 'true' : undefined,
   };
 
   return useQuery({
     queryKey: queryKeys.subjects(query),
-    queryFn: () => apiFetch<PaginatedResult<Subject>>('/subjects', { query }),
+    queryFn: () => fetchList<Subject>('/subjects', query),
     enabled: hasStoredSession(),
     staleTime: 30_000,
   });

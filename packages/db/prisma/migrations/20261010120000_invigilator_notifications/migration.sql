@@ -1,0 +1,3 @@
+-- AlterEnum
+ALTER TYPE "NotificationEventType" ADD VALUE 'INVIGILATOR_ASSIGNED';
+ALTER TYPE "NotificationEventType" ADD VALUE 'INVIGILATOR_REMOVED';

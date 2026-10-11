@@ -11,7 +11,9 @@ import { useStartExamSession, useCompleteExamSession } from '@/lib/mutations/use
 import { SessionStatusProgress } from './SessionStatusProgress';
 import { QuizAttachPanel } from './QuizAttachPanel';
 import { RescheduleModal } from './RescheduleModal';
-import { CancelDialog } from './CancelDialog';
+import { SuspensionRequestDialog } from './SuspensionRequestDialog';
+import { SuspensionStatusBanner } from './SuspensionStatusBanner';
+import { useSuspensionRequests } from '@/lib/queries/useSuspensionRequests';
 import { ConflictResultDisplay } from './ConflictResultDisplay';
 import { RoomRequestPanel } from './RoomRequestPanel';
 import { RoomApprovalPanel } from './RoomApprovalPanel';
@@ -49,13 +51,16 @@ export function ExamSessionDetailView({ sessionId, role = 'FACULTY' }: ExamSessi
   // Shares InvigilatorPanel's own cached query (same key) — no extra
   // request, just reads the same data to drive the progress stepper's
   // "Assign Invigilator" step below.
-  const invigilatorsForProgress = useSessionInvigilators(sessionId, { limit: 200 });
+  const invigilatorsForProgress = useSessionInvigilators(sessionId, { all: true });
   const conflictsMutation = useCheckExamSessionConflicts(sessionId);
   const startMutation = useStartExamSession(sessionId);
   const completeMutation = useCompleteExamSession(sessionId);
 
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
-  const [cancelOpen, setCancelOpen] = useState(false);
+  const [suspendOpen, setSuspendOpen] = useState(false);
+  // Newest request first — drives the banner and whether "Request Suspension" is still available.
+  const latestSuspension = useSuspensionRequests({ examSessionId: sessionId, limit: 1 }).data?.items[0];
+  const suspensionPending = latestSuspension?.status === 'PENDING';
   const [startOpen, setStartOpen] = useState(false);
   const [completeOpen, setCompleteOpen] = useState(false);
 
@@ -130,8 +135,8 @@ export function ExamSessionDetailView({ sessionId, role = 'FACULTY' }: ExamSessi
               </Button>
             )}
             {!readOnly && canCancel && (
-              <Button variant="destructive" onClick={() => setCancelOpen(true)}>
-                Cancel Session
+              <Button variant="destructive" onClick={() => setSuspendOpen(true)} disabled={suspensionPending}>
+                {suspensionPending ? 'Suspension Requested' : 'Request Suspension'}
               </Button>
             )}
           </div>
@@ -150,6 +155,8 @@ export function ExamSessionDetailView({ sessionId, role = 'FACULTY' }: ExamSessi
           </div>
         </dl>
       </Card>
+
+      <SuspensionStatusBanner request={latestSuspension} isAdmin={readOnly} />
 
       <Card
         header={<h2 className="text-sm font-semibold text-text">Progress</h2>}
@@ -242,7 +249,7 @@ export function ExamSessionDetailView({ sessionId, role = 'FACULTY' }: ExamSessi
       </Card>
 
       <RescheduleModal open={rescheduleOpen} onOpenChange={setRescheduleOpen} session={session} />
-      <CancelDialog open={cancelOpen} onOpenChange={setCancelOpen} sessionId={session.id} sessionName={session.name} />
+      <SuspensionRequestDialog open={suspendOpen} onOpenChange={setSuspendOpen} sessionId={session.id} sessionName={session.name} />
 
       <ConfirmationDialog
         open={startOpen}

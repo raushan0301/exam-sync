@@ -98,4 +98,32 @@ describe('AuditHookService', () => {
     const data = prisma.auditLog.create.mock.calls[0][0].data;
     expect(data.oldValue).not.toBeUndefined();
   });
+
+  describe('recordMany', () => {
+    it('writes one audit row per event with a SINGLE createMany through the passed tx', async () => {
+      const prisma = buildPrismaMock();
+      const tx = { auditLog: { create: jest.fn(), createMany: jest.fn().mockResolvedValue({ count: 2 }) } } as any;
+      const service = new AuditHookService(prisma);
+
+      await service.recordMany(
+        [
+          { actor, action: 'CREATE', entityType: 'Thing', entityId: 'a', newValue: { id: 'a' } },
+          { actor, action: 'CREATE', entityType: 'Thing', entityId: 'b', newValue: { id: 'b', passwordHash: 'secret' } },
+        ],
+        tx,
+      );
+
+      expect(tx.auditLog.createMany).toHaveBeenCalledTimes(1);
+      expect(tx.auditLog.create).not.toHaveBeenCalled();
+      const data = tx.auditLog.createMany.mock.calls[0][0].data;
+      expect(data.map((d: any) => d.entityId)).toEqual(['a', 'b']);
+      expect(JSON.stringify(data[1].newValue)).not.toContain('secret'); // same redaction as record()
+    });
+
+    it('is a no-op for an empty list', async () => {
+      const tx = { auditLog: { createMany: jest.fn() } } as any;
+      await new AuditHookService(buildPrismaMock()).recordMany([], tx);
+      expect(tx.auditLog.createMany).not.toHaveBeenCalled();
+    });
+  });
 });

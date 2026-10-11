@@ -35,7 +35,7 @@ export interface QuizDetailViewProps {
 export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
   const quizQuery = useQuiz(quizId);
   const historyQuery = useQuizApprovalHistory(quizId);
-  const { data: subjectsData } = useSubjects({ limit: 200 });
+  const { data: subjectsData } = useSubjects({ all: true });
   const subjectById = new Map((subjectsData?.items ?? []).map((s) => [s.id, s]));
 
   const [editing, setEditing] = useState(false);

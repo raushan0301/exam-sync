@@ -8,6 +8,8 @@ import type { SeatingGenerationSummary, SeatingPlan, SeatingStrategyName } from 
 export interface GenerateSeatingInput {
   room_id: string;
   strategy: SeatingStrategyName;
+  /** Leave every second column of the room empty (no side neighbours). Asked before generating. */
+  skip_alternate_columns?: boolean;
 }
 
 /**

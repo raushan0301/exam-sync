@@ -18,7 +18,7 @@ function buildPrismaMock() {
     student: { findMany: jest.fn().mockResolvedValue([]) },
     examSessionRoom: { findMany: jest.fn().mockResolvedValue([]), deleteMany: jest.fn() },
     examSessionRoomQuiz: { deleteMany: jest.fn() },
-    examInvigilator: { deleteMany: jest.fn() },
+    examInvigilator: { findMany: jest.fn().mockResolvedValue([]), deleteMany: jest.fn() },
     seatingPlan: { updateMany: jest.fn() },
   };
   return {
@@ -414,26 +414,59 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     });
   });
 
-  describe('cancel — reason required, releases all active attachments (ADR-006)', () => {
+  describe('reschedule — invigilators are told the new time too', () => {
+    const draftSession = { id: 's1', status: ExamSessionStatus.DRAFT, sessionDate: new Date('2026-05-01'), startTime: new Date('1970-01-01T09:00:00Z'), endTime: new Date('1970-01-01T10:00:00Z') };
+    it('sends ONE message per invigilator listing every room they cover, in the same transaction', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSessionQuiz.findMany.mockResolvedValue([]);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, name: 'Finals', version: 3 });
+      prisma.__tx.quizStudentAssignment.findMany.mockResolvedValue([]);
+      prisma.__tx.student.findMany.mockResolvedValue([]);
+      prisma.__tx.examInvigilator.findMany.mockResolvedValue([
+        { faculty: { userId: 'user-fac-1' }, room: { building: 'B', roomNumber: '107' } },
+        { faculty: { userId: 'user-fac-1' }, room: { building: 'B', roomNumber: '108' } },
+        { faculty: { userId: 'user-fac-2' }, room: { building: 'B', roomNumber: '107' } },
+      ]);
+
+      await service.reschedule('s1', { session_date: '2026-06-01', start_time: '09:00', end_time: '10:00' }, admin);
+
+      expect(notificationsOutbox.queue).toHaveBeenCalledTimes(2);
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        prisma.__tx,
+        expect.objectContaining({
+          recipientType: 'FACULTY',
+          recipientId: 'user-fac-1',
+          eventType: 'EXAM_SESSION_RESCHEDULED',
+          payload: expect.objectContaining({ as_invigilator: true, room_label: 'B-107, B-108', session_date: '2026-06-01', start_time: '09:00', end_time: '10:00' }),
+        }),
+      );
+      expect(notificationsOutbox.queue).toHaveBeenCalledWith(
+        prisma.__tx,
+        expect.objectContaining({ recipientId: 'user-fac-2', payload: expect.objectContaining({ room_label: 'B-107' }) }),
+      );
+    });
+  });
+
+  describe('cancelSession — reason required, releases all active attachments (ADR-006)', () => {
     const draftSession = { id: 's1', status: ExamSessionStatus.DRAFT };
 
     it('rejects cancelling an already-CANCELLED session with 409', async () => {
       prisma.examSession.findUnique.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED });
 
-      await expect(service.cancel('s1', { reason: 'x' }, admin)).rejects.toThrow(ConflictException);
+      await expect(service.cancelSession('s1', 'x', admin)).rejects.toThrow(ConflictException);
     });
 
     it('rejects cancelling a COMPLETED session with 409', async () => {
       prisma.examSession.findUnique.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.COMPLETED });
 
-      await expect(service.cancel('s1', { reason: 'x' }, admin)).rejects.toThrow(ConflictException);
+      await expect(service.cancelSession('s1', 'x', admin)).rejects.toThrow(ConflictException);
     });
 
     it('cancels a DRAFT session, releasing all its active quiz attachments in the same transaction', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
 
-      const result = await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+      const result = await service.cancelSession('s1', 'Room unavailable', admin);
 
       expect(result.status).toBe(ExamSessionStatus.CANCELLED);
       expect(prisma.__tx.examSessionQuiz.updateMany).toHaveBeenCalledWith({
@@ -451,7 +484,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
       prisma.__tx.examSessionRoom.findMany.mockResolvedValue([{ id: 'esr-1' }, { id: 'esr-2' }]);
 
-      await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+      await service.cancelSession('s1', 'Room unavailable', admin);
 
       expect(prisma.__tx.examSessionRoomQuiz.deleteMany).toHaveBeenCalledWith({
         where: { examSessionRoomId: { in: ['esr-1', 'esr-2'] } },
@@ -464,7 +497,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
       prisma.__tx.examSessionRoom.findMany.mockResolvedValue([]);
 
-      await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+      await service.cancelSession('s1', 'Room unavailable', admin);
 
       expect(prisma.__tx.examSessionRoomQuiz.deleteMany).not.toHaveBeenCalled();
       expect(prisma.__tx.examSessionRoom.deleteMany).not.toHaveBeenCalled();
@@ -474,7 +507,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
 
-      await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+      await service.cancelSession('s1', 'Room unavailable', admin);
 
       expect(prisma.__tx.examInvigilator.deleteMany).toHaveBeenCalledWith({ where: { examSessionId: 's1' } });
       expect(prisma.__tx.seatingPlan.updateMany).toHaveBeenCalledWith({
@@ -483,13 +516,40 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       });
     });
 
+    it('tells every invigilator their duty is cancelled with the session (read before the rows are deleted), in the SAME transaction', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, name: 'Finals', status: ExamSessionStatus.CANCELLED, version: 2 });
+      prisma.__tx.examInvigilator.findMany.mockResolvedValue([
+        { id: 'inv-1', faculty: { userId: 'user-fac-1' }, room: { building: 'B', roomNumber: '107' } },
+        { id: 'inv-2', faculty: { userId: 'user-fac-2' }, room: { building: 'B', roomNumber: '108' } },
+      ]);
+
+      await service.cancelSession('s1', 'Venue unavailable', admin);
+
+      const order = [
+        prisma.__tx.examInvigilator.findMany.mock.invocationCallOrder[0],
+        prisma.__tx.examInvigilator.deleteMany.mock.invocationCallOrder[0],
+      ];
+      expect(order[0]).toBeLessThan(order[1]); // fetched before deleted
+      const invigilatorNotes = notificationsOutbox.queue.mock.calls.filter((c: any[]) => c[1].eventType === 'INVIGILATOR_REMOVED');
+      expect(invigilatorNotes).toHaveLength(2);
+      expect(invigilatorNotes[0][0]).toBe(prisma.__tx);
+      expect(invigilatorNotes[0][1]).toMatchObject({
+        recipientType: 'FACULTY',
+        recipientId: 'user-fac-1',
+        entityId: 'inv-1',
+        payload: { session_name: 'Finals', room_label: 'B-107', cause: 'SESSION_CANCELLED', reason: 'Venue unavailable' },
+      });
+      expect(invigilatorNotes[1][1].recipientId).toBe('user-fac-2');
+    });
+
     it('fans out EXAM_SESSION_CANCELLED notifications to every currently-ASSIGNED student, in the SAME transaction (BR-042)', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
       prisma.__tx.quizStudentAssignment.findMany.mockResolvedValue([{ studentId: 'stu-1' }]);
       prisma.__tx.student.findMany.mockResolvedValue([{ userId: 'user-stu-1' }]);
 
-      await service.cancel('s1', { reason: 'Room unavailable' }, admin);
+      await service.cancelSession('s1', 'Room unavailable', admin);
 
       expect(notificationsOutbox.queue).toHaveBeenCalledWith(
         prisma.__tx,
@@ -501,12 +561,52 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       );
     });
 
+    it('runs the caller\'s hook INSIDE the cancellation transaction, after the status change', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+      const hook = jest.fn().mockResolvedValue(undefined);
+
+      await service.cancelSession('s1', 'Venue flooded', admin, hook);
+
+      expect(hook).toHaveBeenCalledWith(prisma.__tx);
+      expect(prisma.__tx.examSession.update.mock.invocationCallOrder[0]).toBeLessThan(hook.mock.invocationCallOrder[0]);
+    });
+
+    it('runs in a transaction with a generous explicit time limit — it measured 2.4-3.2 s live, too close to Prisma\'s 5 s default', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+
+      await service.cancelSession('s1', 'x', admin);
+
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), { maxWait: 10_000, timeout: 30_000 });
+    });
+
+    it('a failing hook aborts the whole cancellation (the transaction rejects)', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+
+      await expect(
+        service.cancelSession('s1', 'x', admin, async () => {
+          throw new ConflictException('already reviewed');
+        }),
+      ).rejects.toThrow('already reviewed');
+    });
+
+    it('does NOT check ownership — admin approval is what authorises it (faculty request via the suspension service)', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+
+      await service.cancelSession('s1', 'x', admin);
+
+      expect(examSessionOwnershipService.isOwnerOrCoInstructor).not.toHaveBeenCalled();
+    });
+
     it('queues no notifications when no student is currently ASSIGNED (e.g. cancelling a still-DRAFT session)', async () => {
       prisma.examSession.findUnique.mockResolvedValue(draftSession);
       prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
       prisma.__tx.quizStudentAssignment.findMany.mockResolvedValue([]);
 
-      await service.cancel('s1', { reason: 'x' }, admin);
+      await service.cancelSession('s1', 'x', admin);
 
       expect(notificationsOutbox.queue).not.toHaveBeenCalled();
     });
@@ -592,13 +692,6 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       await expect(
         service.reschedule('s1', { session_date: '2026-06-01', start_time: '09:00', end_time: '10:00' }, faculty),
       ).rejects.toThrow(NotFoundException);
-    });
-
-    it('cancel: 404s a faculty who owns/co-instructs none of the session\'s attached quizzes', async () => {
-      prisma.examSession.findUnique.mockResolvedValue(draftSession);
-      examSessionOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
-
-      await expect(service.cancel('s1', { reason: 'x' }, faculty)).rejects.toThrow(NotFoundException);
     });
   });
 

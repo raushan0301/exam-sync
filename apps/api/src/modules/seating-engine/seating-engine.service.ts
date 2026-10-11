@@ -11,6 +11,7 @@ import {
 } from '@exam-sync/db';
 import {
   generateSeating,
+  keepAlternateColumns,
   SeatAssignment,
   SeatInput,
   StudentToSeatInput,
@@ -32,15 +33,9 @@ export interface SeatingGenerationSummary {
   soft_constraint_score: number | null;
   hard_violations: unknown[];
   soft_violations: unknown[];
-  /** Only set for `ANTI_CHEATING` plans — FR-034, IMPLEMENTATION_PLAN.md Phase 14: "must be present in both API response and UI copy," treated as a testable acceptance criterion, not just doc prose. */
-  disclaimer?: string;
-  /** ARCHITECTURE.md §U step 6 / §Q "Seating under-constrained ... WARNING" — set when the single-subject fallback chain fired instead of real graph-coloring; `undefined` for every other outcome, including a normal ANTI_CHEATING run that had subject diversity to work with. */
+  /** Set (to `SINGLE_SUBJECT_SPREAD`) when the strategy had nothing to mix in this room and seats were spread by roll number and batch instead. */
   fallback_reason?: string;
 }
-
-/** ARCHITECTURE.md §U's exact required wording (IMPLEMENTATION_PLAN.md Phase 14 backend-work: the disclaimer "must be present in both API response and UI copy"). */
-const ANTI_CHEATING_DISCLAIMER =
-  'Seating adjacency rules reduce opportunistic copying risk between neighbors; they are not a guarantee against all forms of cheating and must be combined with active invigilation.';
 
 /**
  * A fallback notice is stored inside the SAME `violation_report` JSON
@@ -57,11 +52,8 @@ const FALLBACK_NOTICE_TYPE = 'SINGLE_SUBJECT_FALLBACK';
  * IMPLEMENTATION_PLAN.md Phase 13). The actual generation and validation
  * algorithms live in `@exam-sync/domain-logic` as pure functions — this
  * service is thin NestJS wiring: resolve inputs from the DB, call the
- * pure functions, persist the result. Phase 14 adds the `ANTI_CHEATING`
- * strategy (§U) entirely inside `@exam-sync/domain-logic`'s
- * `generateSeating` — no schema or workflow change here beyond
- * surfacing its disclaimer/fallback-reason in the response, per this
- * file's own `ANTI_CHEATING_DISCLAIMER`/`FALLBACK_NOTICE_TYPE` constants.
+ * pure functions, persist the result, and surface the one-subject
+ * fallback reason (`FALLBACK_NOTICE_TYPE`) in the response.
  *
  * Cohort resolution (which specific students belong to a given room) is
  * the one genuinely non-trivial piece owned here: Phase 12's Best-Fit
@@ -132,7 +124,7 @@ export class SeatingEngineService {
       throw new NotFoundException('This room is not allocated to this exam session.');
     }
 
-    return this.createPlan(examSessionId, examSessionRoom.id, dto.room_id, dto.strategy, actor);
+    return this.createPlan(examSessionId, examSessionRoom.id, dto.room_id, dto.strategy, actor, dto.skip_alternate_columns === true);
   }
 
   /**
@@ -195,7 +187,7 @@ export class SeatingEngineService {
       );
     });
 
-    return this.createPlan(examSessionId, examSessionRoom.id, dto.room_id, dto.strategy, actor);
+    return this.createPlan(examSessionId, examSessionRoom.id, dto.room_id, dto.strategy, actor, dto.skip_alternate_columns === true);
   }
 
   /** Shared by `generate` and `regenerate`: build the cohort, run the pure generator, persist + validate the result, and advance the session if this was the last room needed. */
@@ -205,14 +197,25 @@ export class SeatingEngineService {
     roomId: string,
     strategy: GenerateSeatingDto['strategy'],
     actor: AuthenticatedUser,
+    skipAlternateColumns = false,
   ): Promise<SeatingGenerationSummary> {
     const { students, seats } = await this.resolveCohort(examSessionId, examSessionRoomId, roomId);
+
+    if (skipAlternateColumns) {
+      const usable = keepAlternateColumns(seats.filter((s) => s.isActive)).length;
+      if (students.length > usable) {
+        throw new ConflictException(
+          `Leaving every second column empty leaves ${usable} usable seats, but ${students.length} students need seating in this room. Turn the empty-column option off, or allocate another room.`,
+        );
+      }
+    }
 
     const generated = generateSeating({
       seats,
       students,
       strategy,
       seed: `${examSessionId}:${roomId}`,
+      skipAlternateColumns,
     });
 
     const plan = await this.prisma
@@ -245,7 +248,7 @@ export class SeatingEngineService {
           ? [
               {
                 type: FALLBACK_NOTICE_TYPE,
-                message: `Single-subject fallback used (${generated.fallbackReason}) — this room's roster had no subject diversity for ANTI_CHEATING to exploit (ARCHITECTURE.md §U step 6).`,
+                message: `Everyone in this room sits the same subject, so seats were spread by roll number and batch instead (${generated.fallbackReason}).`,
                 seatIdA: '',
                 seatIdB: '',
                 fallback_reason: generated.fallbackReason,
@@ -291,6 +294,21 @@ export class SeatingEngineService {
     }
 
     return this.toSummaryWithViolations(plan.plan, plan.validation, generated.fallbackReason);
+  }
+
+  /** `GET /exam-sessions/{id}/seating/current?room_id=` — the room's latest non-superseded plan id (or null), scoped like `GET /exam-sessions/{id}`. */
+  async currentPlan(
+    examSessionId: string,
+    roomId: string,
+    actor: AuthenticatedUser,
+  ): Promise<{ seating_plan_id: string | null }> {
+    await this.examSessionsService.findByIdScoped(examSessionId, actor);
+    const plan = await this.prisma.seatingPlan.findFirst({
+      where: { examSessionId, roomId, status: { not: SeatingPlanStatus.SUPERSEDED } },
+      orderBy: { generatedAt: 'desc' },
+      select: { id: true },
+    });
+    return { seating_plan_id: plan?.id ?? null };
   }
 
   /**
@@ -363,6 +381,8 @@ export class SeatingEngineService {
 
     const room = await this.prisma.room.findUniqueOrThrow({ where: { id: plan.roomId } });
     const roomLabel = `${room.building}-${room.roomNumber}`;
+    // Exam name/date/time go into the SEAT_ASSIGNED notification so a student sees WHICH exam the seat is for.
+    const session = await this.examSessionsService.findById(plan.examSessionId);
     const seatLabels = new Map(
       (
         await this.prisma.roomSeat.findMany({
@@ -415,6 +435,9 @@ export class SeatingEngineService {
             room_label: roomLabel,
             seat_label: seatLabels.get(assignment.seatId) ?? assignment.seatId,
             quiz_id: assignment.quizId,
+            session_name: session?.name ?? null,
+            session_date: session?.sessionDate ? new Date(session.sessionDate).toISOString().slice(0, 10) : null,
+            start_time: session?.startTime ?? null,
           },
         });
       }
@@ -519,11 +542,12 @@ export class SeatingEngineService {
     if (students.length > 0) {
       const studentRows = await this.prisma.student.findMany({
         where: { id: { in: students.map((s) => s.studentId) } },
-        select: { id: true, batchId: true },
+        select: { id: true, batchId: true, rollNumber: true },
       });
-      const batchById = new Map(studentRows.map((s) => [s.id, s.batchId]));
+      const rowById = new Map(studentRows.map((s) => [s.id, s]));
       for (const s of students) {
-        s.batchId = batchById.get(s.studentId) ?? '';
+        s.batchId = rowById.get(s.studentId)?.batchId ?? '';
+        s.rollNumber = rowById.get(s.studentId)?.rollNumber;
       }
     }
 
@@ -565,7 +589,6 @@ export class SeatingEngineService {
       soft_constraint_score: plan.softConstraintScore ? Number(plan.softConstraintScore) : null,
       hard_violations: plan.status === SeatingPlanStatus.FAILED ? stripFallbackNotice(stored) : [],
       soft_violations: plan.status === SeatingPlanStatus.VALIDATED ? stripFallbackNotice(stored) : [],
-      disclaimer: plan.strategy === 'ANTI_CHEATING' ? ANTI_CHEATING_DISCLAIMER : undefined,
       fallback_reason: fallbackNotice ? (fallbackNotice.fallback_reason as string) : undefined,
     };
   }
@@ -582,7 +605,6 @@ export class SeatingEngineService {
       soft_constraint_score: plan.status === SeatingPlanStatus.VALIDATED ? validation.softConstraintScore : null,
       hard_violations: validation.hardViolations,
       soft_violations: validation.softViolations,
-      disclaimer: plan.strategy === 'ANTI_CHEATING' ? ANTI_CHEATING_DISCLAIMER : undefined,
       fallback_reason: fallbackReason,
     };
   }

@@ -30,8 +30,8 @@ const QUIZ_STATUS_ORDER: QuizStatus[] = ['DRAFT', 'SUBMITTED', 'APPROVED', 'REJE
  * see this app's other faculty pages for those.
  */
 export default function FacultyDashboardPage() {
-  const myQuizzes = useQuizzes({ limit: 200 });
-  const myIncidents = useIncidents({ limit: 200 });
+  const myQuizzes = useQuizzes({ all: true });
+  const myIncidents = useIncidents({ all: true });
   const myFaculty = useMyFaculty();
   const myDuties = useInvigilationDuties(myFaculty.data?.id, { limit: 5 });
 

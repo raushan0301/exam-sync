@@ -29,10 +29,18 @@ import { ExamSessionsAccessRepository } from './exam-sessions-access.repository'
 import { ExamSessionOwnershipService } from './exam-session-ownership.service';
 import { CreateExamSessionDto } from './dto/create-exam-session.dto';
 import { RescheduleExamSessionDto } from './dto/reschedule-exam-session.dto';
-import { CancelExamSessionDto } from './dto/cancel-exam-session.dto';
 import { UpdateSessionQuizzesDto } from './dto/update-session-quizzes.dto';
 
-const NON_CANCELLABLE_STATUSES: ExamSessionStatus[] = [
+/**
+ * Cancelling releases quizzes, rooms, invigilators and seating plans, notifies
+ * students and (on a suspension approval) runs the caller's own writes — about
+ * 15 sequential queries. Against the remote database that measured 2.4-3.2 s,
+ * uncomfortably close to Prisma's 5 s default interactive-transaction limit:
+ * one slow moment would roll back a perfectly valid approval with a 500.
+ */
+const CANCEL_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
+
+export const NON_CANCELLABLE_STATUSES: ExamSessionStatus[] = [
   ExamSessionStatus.IN_PROGRESS,
   ExamSessionStatus.COMPLETED,
   ExamSessionStatus.CANCELLED,
@@ -566,6 +574,36 @@ export class ExamSessionsService {
         });
       }
 
+      // Invigilators need the new time too — one message per faculty member, listing every room they cover.
+      const duties = await tx.examInvigilator.findMany({
+        where: { examSessionId: id },
+        include: { faculty: { select: { userId: true } }, room: { select: { building: true, roomNumber: true } } },
+      });
+      const roomsByInvigilator = new Map<string, string[]>();
+      for (const duty of duties) {
+        const rooms = roomsByInvigilator.get(duty.faculty.userId) ?? [];
+        rooms.push(`${duty.room.building}-${duty.room.roomNumber}`);
+        roomsByInvigilator.set(duty.faculty.userId, rooms);
+      }
+      for (const [recipientId, rooms] of roomsByInvigilator) {
+        await this.notificationsOutbox.queue(tx, {
+          recipientType: NotificationRecipientType.FACULTY,
+          recipientId,
+          eventType: NotificationEventType.EXAM_SESSION_RESCHEDULED,
+          entityId: rescheduled.id,
+          entityVersion: rescheduled.version,
+          payload: {
+            session_id: rescheduled.id,
+            session_name: rescheduled.name,
+            session_date: dto.session_date,
+            start_time: dto.start_time,
+            end_time: dto.end_time,
+            as_invigilator: true,
+            room_label: rooms.join(', '),
+          },
+        });
+      }
+
       await this.auditHook.record(
         {
           actor,
@@ -597,11 +635,21 @@ export class ExamSessionsService {
    * `critical` priority lane (ARCHITECTURE.md §AN: "session cancellations"
    * — see `common/queue/queue.constants.ts`).
    */
-  async cancel(id: string, dto: CancelExamSessionDto, actor: AuthenticatedUser): Promise<ExamSession> {
+  async cancelSession(
+    id: string,
+    reason: string,
+    actor: AuthenticatedUser,
+    /**
+     * Runs INSIDE the cancellation's transaction, so the caller's own writes
+     * (e.g. marking a suspension request APPROVED) commit or roll back together
+     * with the status change. Throw to abort the whole cancellation.
+     */
+    withinTransaction?: (tx: Prisma.TransactionClient) => Promise<void>,
+  ): Promise<ExamSession> {
+    // No ownership check here on purpose: cancellation is no longer a direct
+    // faculty action. Faculty ask for a suspension (`ExamSessionSuspensionService.request`,
+    // ownership-checked there) and an ADMIN's approval is what calls this.
     const session = await this.findById(id);
-    if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(id, actor))) {
-      throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
-    }
     if (NON_CANCELLABLE_STATUSES.includes(session.status)) {
       throw new ConflictException(
         `Exam session is in status "${session.status}" and cannot be cancelled.`,
@@ -643,6 +691,11 @@ export class ExamSessionsService {
       //   are audit-relevant history (soft_constraint_score, violation
       //   reports) the same way a regenerated plan is superseded rather
       //   than removed, not silently discarded.
+      // Tell each invigilator their duty is gone with the session — read BEFORE the rows are deleted.
+      const dutiesEnding = await tx.examInvigilator.findMany({
+        where: { examSessionId: id },
+        include: { faculty: { select: { userId: true } }, room: { select: { building: true, roomNumber: true } } },
+      });
       await tx.examInvigilator.deleteMany({ where: { examSessionId: id } });
       await tx.seatingPlan.updateMany({
         where: { examSessionId: id, status: { notIn: [SeatingPlanStatus.SUPERSEDED] } },
@@ -662,7 +715,24 @@ export class ExamSessionsService {
           eventType: NotificationEventType.EXAM_SESSION_CANCELLED,
           entityId: cancelled.id,
           entityVersion: cancelled.version,
-          payload: { session_id: cancelled.id, session_name: cancelled.name, reason: dto.reason },
+          payload: { session_id: cancelled.id, session_name: cancelled.name, reason },
+        });
+      }
+
+      for (const duty of dutiesEnding) {
+        await this.notificationsOutbox.queue(tx, {
+          recipientType: NotificationRecipientType.FACULTY,
+          recipientId: duty.faculty.userId,
+          eventType: NotificationEventType.INVIGILATOR_REMOVED,
+          entityId: duty.id,
+          entityVersion: 'SESSION_CANCELLED',
+          payload: {
+            exam_session_id: cancelled.id,
+            session_name: cancelled.name,
+            room_label: `${duty.room.building}-${duty.room.roomNumber}`,
+            cause: 'SESSION_CANCELLED',
+            reason,
+          },
         });
       }
 
@@ -674,13 +744,15 @@ export class ExamSessionsService {
           entityId: id,
           oldValue: session,
           newValue: cancelled,
-          reason: dto.reason,
+          reason,
         },
         tx,
       );
 
+      if (withinTransaction) await withinTransaction(tx);
+
       return cancelled;
-    });
+    }, CANCEL_TRANSACTION_OPTIONS);
 
     return updated;
   }

@@ -1,14 +1,16 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { ExamSession, PaginatedResult } from './types';
+import { fetchList } from './fetch-list';
+import type { ExamSession } from './types';
 
 export interface UseExamSessionsParams {
   cursor?: string;
   limit?: number;
+  /** Fetch EVERY page (follows `next_cursor`) instead of one page — for pick-lists that must show all rows. */
+  all?: boolean;
 }
 
 /**
@@ -22,11 +24,12 @@ export function useExamSessions(params: UseExamSessionsParams = {}) {
   const query: Record<string, string | undefined> = {
     cursor: params.cursor,
     limit: params.limit ? String(params.limit) : undefined,
+    all: params.all ? 'true' : undefined,
   };
 
   return useQuery({
     queryKey: queryKeys.examSessions(query),
-    queryFn: () => apiFetch<PaginatedResult<ExamSession>>('/exam-sessions', { query }),
+    queryFn: () => fetchList<ExamSession>('/exam-sessions', query),
     enabled: hasStoredSession(),
   });
 }

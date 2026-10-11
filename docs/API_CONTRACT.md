@@ -87,10 +87,23 @@ REST, JSON, `/api/v1` prefix, bearer JWT auth. This is a **contract**, not an im
 |---|---|---|---|---|
 | POST | `/exam-sessions` | ADMIN | `{name, session_date, start_time, end_time}` | — |
 | PATCH | `/exam-sessions/{id}/quizzes` | ADMIN | `{add: [quiz_id...], remove: [quiz_id...]}` | `409` with structured `details[]` on HARD conflict (student/room/faculty overlap, unapproved quiz — BR-011, BR-017–020) |
-| POST | `/exam-sessions/{id}/reschedule` | ADMIN | `{session_date, start_time, end_time}` | `409` on new conflicts (EC-021) |
-| POST | `/exam-sessions/{id}/cancel` | ADMIN | `{reason}` | — status→CANCELLED, cascades notifications |
+| POST | `/exam-sessions/{id}/reschedule` | ADMIN | `{session_date, start_time, end_time}` | `409` on new conflicts (EC-021). Notifies assigned students and, once per faculty member, every invigilator (`EXAM_SESSION_RESCHEDULED`, `as_invigilator: true`, rooms listed) |
+| ~~POST~~ | ~~`/exam-sessions/{id}/cancel`~~ | — | **Removed.** Sessions are no longer cancelled directly; faculty request a suspension and an admin approves it (see *Suspension Requests* below). | — |
 | GET | `/exam-sessions/{id}` | scoped | full detail incl. quizzes, rooms, status | — |
 | GET | `/exam-sessions/{id}/conflicts` | ADMIN | dry-run check without committing | returns HARD/WARNING list |
+
+### Suspension Requests
+
+A faculty owner/co-instructor asks to suspend (cancel) a session they no longer need to conduct; an admin decides. **Approval** runs the cancellation that `/cancel` used to do — in the same transaction it marks the request APPROVED — so the session becomes `CANCELLED` (shown under History), its quizzes/rooms/invigilators are released, seating plans are superseded, and assigned students and invigilators are notified. **Rejection** leaves the session untouched. At most one `PENDING` request per session (partial unique index).
+
+| Method | Endpoint | Auth | Request | Errors |
+|---|---|---|---|---|
+| POST | `/exam-sessions/{id}/suspension-request` | FACULTY (owner/co-instructor) | `{reason}` — 10–2000 chars | `404` not your session, `403` no faculty record, `409` session already IN_PROGRESS/COMPLETED/CANCELLED or a request is already pending |
+| GET | `/suspension-requests` | scoped | query: `status`, `exam_session_id`, `cursor`, `limit` — ADMIN sees all, FACULTY only their own; newest first | — |
+| POST | `/suspension-requests/{id}/approve` | ADMIN | `{note?}` | `409` already reviewed, or the session has since started/finished (nothing changes) |
+| POST | `/suspension-requests/{id}/reject` | ADMIN | `{note}` — required, shown to the faculty | `400` missing note, `409` already reviewed |
+
+Notifications: `SUSPENSION_REQUESTED` → every ADMIN; `SUSPENSION_APPROVED` / `SUSPENSION_REJECTED` → the requesting faculty (with the admin's note).
 
 ## Student Assignment
 
@@ -113,13 +126,13 @@ REST, JSON, `/api/v1` prefix, bearer JWT auth. This is a **contract**, not an im
 
 | Method | Endpoint | Auth | Errors |
 |---|---|---|---|
-| POST | `/exam-sessions/{id}/rooms/allocate` | ADMIN | body `{room_ids[]}` or `{auto: true, candidate_room_ids[]}` for algorithmic best-fit | `409` capacity shortfall (EC-011), room conflict (BR-018) |
+| POST | `/exam-sessions/{id}/rooms/allocate` | ADMIN | body `{room_ids[]}` or `{auto: true, candidate_room_ids[]}` for algorithmic best-fit. With 2+ subjects in 2+ rooms, students are split so every room used holds a mix of every subject (rooms loaded in proportion to size, fewest rooms that fit); one subject or one room uses Best-Fit Decreasing | `409` capacity shortfall (EC-011), room conflict (BR-018) |
 
 ## Seating
 
 | Method | Endpoint | Auth | Notes |
 |---|---|---|---|
-| POST | `/exam-sessions/{id}/seating/generate` | ADMIN | body `{room_id, strategy, constraints: {...}}`; **async**, `202 {job_id}`; idempotency-key required (EC-032) |
+| POST | `/exam-sessions/{id}/seating/generate` | ADMIN | body `{room_id, strategy, skip_alternate_columns?, constraints: {...}}` (`skip_alternate_columns: true` leaves every second column empty; 409 if the students no longer fit; same field on `/seating/regenerate`). One-subject rooms get a roll-number/batch/staggered-row spread, reported as `fallback_reason: SINGLE_SUBJECT_SPREAD`; **async**, `202 {job_id}`; idempotency-key required (EC-032) |
 | GET | `/seating-jobs/{id}` | ADMIN | status + result summary (soft_constraint_score, violations) |
 | GET | `/seating-plans/{id}` | ADMIN, FACULTY (invigilating that room), STUDENT (own seat only, via `/students/{id}/schedule`) | full plan; student-facing view is filtered to their own row only |
 | POST | `/seating-plans/{id}/finalize` | ADMIN | `409` if HARD violations remain (BR-026) |
@@ -129,7 +142,7 @@ REST, JSON, `/api/v1` prefix, bearer JWT auth. This is a **contract**, not an im
 
 | Method | Endpoint | Auth | Errors |
 |---|---|---|---|
-| POST | `/exam-sessions/{id}/invigilators` | ADMIN | `{room_id, faculty_id, role}` | `409` overlap (BR-031) |
+| POST | `/exam-sessions/{id}/invigilators` | ADMIN | `{room_id, faculty_id, role}` | `409` overlap (BR-031). Notifies the assigned faculty (`INVIGILATOR_ASSIGNED`); removing the assignment sends `INVIGILATOR_REMOVED`; cancelling the session sends `INVIGILATOR_REMOVED` (cause `SESSION_CANCELLED`) to every invigilator |
 | GET | `/faculty/{id}/invigilation-duties` | self/ADMIN | — |
 
 ## Attendance

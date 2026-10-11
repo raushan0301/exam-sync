@@ -40,30 +40,6 @@ describe('generateSeating — pure, deterministic (Phase 13)', () => {
     });
   });
 
-  describe('RANDOMIZED — reproducibility via seed', () => {
-    const students = Array.from({ length: 6 }, (_, i) => student(`s${i}`, 'q1', 'DBMS', 'A'));
-
-    it('produces the SAME assignment for the SAME seed, every time', () => {
-      const r1 = generateSeating({ seats: grid2x3, students, strategy: 'RANDOMIZED', seed: 'session-1:room-1' });
-      const r2 = generateSeating({ seats: grid2x3, students, strategy: 'RANDOMIZED', seed: 'session-1:room-1' });
-      expect(r1).toEqual(r2);
-    });
-
-    it('produces a DIFFERENT (or at least not guaranteed-identical) placement for a different seed', () => {
-      const r1 = generateSeating({ seats: grid2x3, students, strategy: 'RANDOMIZED', seed: 'seed-a' });
-      const r2 = generateSeating({ seats: grid2x3, students, strategy: 'RANDOMIZED', seed: 'seed-b' });
-      // Not a strict guarantee for any PRNG, but for these seeds+inputs the orders differ — pins actual behavior.
-      expect(r1.assignments).not.toEqual(r2.assignments);
-    });
-
-    it('still seats every student — a shuffle, not a lossy operation', () => {
-      const result = generateSeating({ seats: grid2x3, students, strategy: 'RANDOMIZED', seed: 'x' });
-      expect(result.assignments).toHaveLength(6);
-      expect(result.unseated).toEqual([]);
-      expect(new Set(result.assignments.map((a) => a.seatId)).size).toBe(6);
-    });
-  });
-
   describe('ALTERNATE_SUBJECT — round-robin by quiz', () => {
     it('interleaves two quiz groups rather than placing them in contiguous blocks', () => {
       const students = [
@@ -121,58 +97,30 @@ describe('generateSeating — pure, deterministic (Phase 13)', () => {
     });
   });
 
-  describe('ANTI_CHEATING — dispatch integration (Phase 14)', () => {
-    it('is routed to the anti-cheating placement, not the orderStudents+zip pipeline (interleaves subjects, unlike SEQUENTIAL)', () => {
-      const students = [
-        student('dbms-1', 'q-dbms', 'DBMS', 'A'),
-        student('dbms-2', 'q-dbms', 'DBMS', 'A'),
-        student('os-1', 'q-os', 'OS', 'A'),
-        student('os-2', 'q-os', 'OS', 'A'),
-      ];
-      const row4 = [seat('A1', 0, 0), seat('A2', 0, 1), seat('A3', 0, 2), seat('A4', 0, 3)];
-
-      const result = generateSeating({ seats: row4, students, strategy: 'ANTI_CHEATING', seed: 'x' });
-
-      expect(result.assignments).toHaveLength(4);
-      expect(result.fallbackReason).toBeUndefined();
-      const subjectByStudentId = new Map(students.map((s) => [s.studentId, s.subjectId]));
-      const sequence = result.assignments
-        .slice()
-        .sort((a, b) => a.seatId.localeCompare(b.seatId))
-        .map((a) => subjectByStudentId.get(a.studentId));
-      expect(sequence).toEqual(['DBMS', 'OS', 'DBMS', 'OS']); // alternating — the achievable optimum on a 4-seat line
-    });
-
-    it('still respects the accessibility pre-pass (BR-028) ahead of anti-cheating placement', () => {
+  describe('one-subject room — spread dispatch', () => {
+    it('still respects the accessibility pre-pass (BR-028) ahead of the spread', () => {
       const seatsWithOneAccessible = [seat('A1', 0, 0), seat('A2', 0, 1, { isAccessible: true }), seat('A3', 0, 2)];
       const students = [
         student('needs-access', 'q1', 'DBMS', 'A', { requiresAccessibleSeat: true }),
-        student('other-1', 'q2', 'OS', 'A'),
+        student('other-1', 'q1', 'DBMS', 'A'),
         student('other-2', 'q1', 'DBMS', 'A'),
       ];
 
-      const result = generateSeating({ seats: seatsWithOneAccessible, students, strategy: 'ANTI_CHEATING', seed: 'x' });
+      const result = generateSeating({ seats: seatsWithOneAccessible, students, strategy: 'ALTERNATE_SUBJECT', seed: 'x' });
 
-      const accessRow = result.assignments.find((a) => a.studentId === 'needs-access');
-      expect(accessRow?.seatId).toBe('A2');
+      expect(result.assignments.find((a) => a.studentId === 'needs-access')?.seatId).toBe('A2');
+      expect(result.fallbackReason).toBe('SINGLE_SUBJECT_SPREAD');
     });
 
-    it('surfaces the single-subject fallback reason through the top-level generateSeating call', () => {
-      const students = [
-        student('s1', 'q1', 'DBMS', 'A'),
-        student('s2', 'q1', 'DBMS', 'A'),
-        student('s3', 'q1', 'DBMS', 'A'),
-      ];
-      const row3 = [seat('A1', 0, 0), seat('A2', 0, 1), seat('A3', 0, 2)]; // no room to checkerboard
-
-      const result = generateSeating({ seats: row3, students, strategy: 'ANTI_CHEATING', seed: 'x' });
-
-      expect(result.fallbackReason).toBe('SINGLE_SUBJECT_RANDOMIZED');
+    it('does not use the spread when the room really has several subjects', () => {
+      const students = [student('d1', 'q-d', 'DBMS', 'A'), student('o1', 'q-o', 'OS', 'A')];
+      const result = generateSeating({ seats: grid2x3, students, strategy: 'ALTERNATE_SUBJECT' });
+      expect(result.fallbackReason).toBeUndefined();
     });
   });
 
   describe('every strategy, shared invariants', () => {
-    const strategies: SeatingStrategyName[] = ['SEQUENTIAL', 'RANDOMIZED', 'ALTERNATE_SUBJECT', 'ALTERNATE_BATCH', 'SUBJECT_BATCH_MIX', 'ANTI_CHEATING'];
+    const strategies: SeatingStrategyName[] = ['SEQUENTIAL', 'ALTERNATE_SUBJECT', 'ALTERNATE_BATCH', 'SUBJECT_BATCH_MIX'];
 
     it.each(strategies)('%s never assigns two students to the same seat', (strategy) => {
       const students = Array.from({ length: 6 }, (_, i) => student(`s${i}`, `q${i % 2}`, `subj${i % 3}`, `batch${i % 2}`));
@@ -258,6 +206,152 @@ describe('generateSeating — pure, deterministic (Phase 13)', () => {
     it('returns empty assignments and no unseated students for an empty roster', () => {
       const result = generateSeating({ seats: grid2x3, students: [], strategy: 'SEQUENTIAL' });
       expect(result).toEqual({ assignments: [], unseated: [] });
+    });
+  });
+
+  describe('skipAlternateColumns', () => {
+    const grid = Array.from({ length: 12 }, (_, i) => seat(`S${i}`, Math.floor(i / 4), i % 4)); // 3 rows x 4 cols
+    const roster = (n: number) => Array.from({ length: n }, (_, i) => student(`s${i}`, 'q1', 'DBMS', 'A'));
+
+    it('uses only the 1st and 3rd columns', () => {
+      const result = generateSeating({ seats: grid, students: roster(6), strategy: 'SEQUENTIAL', skipAlternateColumns: true });
+      const cols = result.assignments.map((a) => Number(a.seatId.slice(1)) % 4);
+      expect(new Set(cols)).toEqual(new Set([0, 2]));
+      expect(result.unseated).toHaveLength(0);
+    });
+
+    it('reports the students that no longer fit as unseated, never drops them', () => {
+      const result = generateSeating({ seats: grid, students: roster(8), strategy: 'SEQUENTIAL', skipAlternateColumns: true });
+      expect(result.assignments).toHaveLength(6);
+      expect(result.unseated).toHaveLength(2);
+    });
+  });
+
+  describe('mixing strategy with nothing to mix', () => {
+    it('ALTERNATE_SUBJECT on a one-subject room uses the roll-number spread', () => {
+      const seats = [seat('A1', 0, 0), seat('A2', 0, 1), seat('A3', 0, 2), seat('A4', 0, 3)];
+      const students = [1, 2, 3, 4].map((n) => student(`s${n}`, 'q1', 'DBMS', 'A'));
+      const result = generateSeating({ seats, students, strategy: 'ALTERNATE_SUBJECT', seed: 'x' });
+      expect(result.fallbackReason).toBe('SINGLE_SUBJECT_SPREAD');
+    });
+
+    it('SEQUENTIAL is never replaced', () => {
+      const seats = [seat('A1', 0, 0), seat('A2', 0, 1)];
+      const students = [student('s1', 'q1', 'DBMS', 'A'), student('s2', 'q1', 'DBMS', 'A')];
+      expect(generateSeating({ seats, students, strategy: 'SEQUENTIAL' }).fallbackReason).toBeUndefined();
+    });
+  });
+
+  describe('mixing strategies — rows flip, uneven groups are spread', () => {
+    function room(rows: number, cols: number): SeatInput[] {
+      return Array.from({ length: rows * cols }, (_, i) => seat(`S${i}`, Math.floor(i / cols), i % cols));
+    }
+    function roster(counts: number[]): StudentToSeatInput[] {
+      return counts.flatMap((n, g) =>
+        Array.from({ length: n }, (_, i) => student(`g${g}-${String(i).padStart(3, '0')}`, `q${g}`, `sub${g}`, 'A')),
+      );
+    }
+    /** Group (quiz) sitting at each "row:col". */
+    function layout(seats: SeatInput[], students: StudentToSeatInput[], assignments: { seatId: string; studentId: string }[]) {
+      const quizOf = new Map(students.map((s) => [s.studentId, s.quizId]));
+      const seatOf = new Map(seats.map((s) => [s.id, s]));
+      const at = new Map<string, string>();
+      for (const a of assignments) {
+        const s = seatOf.get(a.seatId)!;
+        at.set(`${s.rowIndex}:${s.colIndex}`, quizOf.get(a.studentId)!);
+      }
+      return at;
+    }
+
+    it('two subjects with empty columns (4 seats per row): front/back neighbours differ, not just side ones', () => {
+      const seats = room(4, 7);
+      const students = roster([6, 6]);
+      const result = generateSeating({ seats, students, strategy: 'ALTERNATE_SUBJECT', skipAlternateColumns: true });
+      const at = layout(seats, students, result.assignments);
+
+      expect(result.unseated).toHaveLength(0);
+      for (const [key, quiz] of at) {
+        const [r, c] = key.split(':').map(Number);
+        const behind = at.get(`${r + 1}:${c}`);
+        if (behind) expect(behind).not.toBe(quiz);
+      }
+    });
+
+    it('three subjects with 6 seats per row: rows rotate so nobody has the same subject in front', () => {
+      const seats = room(3, 6);
+      const students = roster([6, 6, 6]);
+      const result = generateSeating({ seats, students, strategy: 'ALTERNATE_SUBJECT' });
+      const at = layout(seats, students, result.assignments);
+
+      for (const [key, quiz] of at) {
+        const [r, c] = key.split(':').map(Number);
+        const behind = at.get(`${r + 1}:${c}`);
+        if (behind) expect(behind).not.toBe(quiz);
+      }
+    });
+
+    it('uneven groups with spare seats: the big group is spaced out with empty seats, never touching itself', () => {
+      const seats = room(6, 7);
+      const students = roster([10, 4]);
+      const result = generateSeating({ seats, students, strategy: 'ALTERNATE_SUBJECT' });
+      const at = layout(seats, students, result.assignments);
+
+      expect(result.unseated).toHaveLength(0);
+      expect(result.assignments).toHaveLength(14);
+      for (const [key, quiz] of at) {
+        const [r, c] = key.split(':').map(Number);
+        expect(at.get(`${r}:${c + 1}`)).not.toBe(quiz);
+        expect(at.get(`${r + 1}:${c}`)).not.toBe(quiz);
+      }
+    });
+
+    it('uneven groups with NO spare seats: everyone is still seated (best effort, never dropped)', () => {
+      const seats = room(2, 7);
+      const result = generateSeating({ seats, students: roster([10, 4]), strategy: 'ALTERNATE_SUBJECT' });
+      expect(result.assignments).toHaveLength(14);
+      expect(result.unseated).toHaveLength(0);
+    });
+  });
+
+  describe('mixing strategies — small groups are spread, clashes are minimised', () => {
+    function layoutOf(rows: number, cols: number, counts: number[], skip = false) {
+      const seats = Array.from({ length: rows * cols }, (_, i) => seat(`S${i}`, Math.floor(i / cols), i % cols));
+      const students = counts.flatMap((n, g) =>
+        Array.from({ length: n }, (_, i) => student(`g${g}-${String(i).padStart(3, '0')}`, `q${g}`, `sub${g}`, 'A')),
+      );
+      const result = generateSeating({ seats, students, strategy: 'ALTERNATE_SUBJECT', skipAlternateColumns: skip });
+      const quizOf = new Map(students.map((s) => [s.studentId, s.quizId]));
+      const at = new Map<string, string>();
+      for (const a of result.assignments) {
+        const s = seats.find((x) => x.id === a.seatId)!;
+        at.set(`${s.rowIndex}:${s.colIndex}`, quizOf.get(a.studentId)!);
+      }
+      let clashes = 0;
+      for (const [key, quiz] of at) {
+        const [r, c] = key.split(':').map(Number);
+        if (at.get(`${r}:${c + 1}`) === quiz) clashes += 1;
+        if (at.get(`${r + 1}:${c}`) === quiz) clashes += 1;
+      }
+      return { result, clashes, at };
+    }
+
+    it('12 + 4: the small group is spread so no student has a same-subject neighbour', () => {
+      const { clashes, result } = layoutOf(4, 6, [12, 4]);
+      expect(result.unseated).toHaveLength(0);
+      expect(clashes).toBe(0);
+    });
+
+    it('14 + 2 in a 4x6 room: the clashes the room forces are kept to a minimum (no long same-subject strings)', () => {
+      const { clashes, result } = layoutOf(4, 6, [14, 2]);
+      expect(result.assignments).toHaveLength(16);
+      expect(clashes).toBeLessThanOrEqual(4);
+    });
+
+    it('9 + 3 with empty columns: the three small-group students end up in different rows, one clash per column at most', () => {
+      const { clashes, result, at } = layoutOf(4, 6, [9, 3], true);
+      expect(result.unseated).toHaveLength(0);
+      expect(clashes).toBeLessThanOrEqual(3);
+      expect([...at.values()].filter((q) => q === 'q1')).toHaveLength(3);
     });
   });
 });

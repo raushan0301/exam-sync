@@ -175,24 +175,6 @@ export class DepartmentsService {
   }
 
   /** `GET /departments/bulk-import/template` (ADMIN). */
-  /**
-   * The example row is a REAL existing department (falls back to a
-   * plainly-fictional placeholder only when the table is genuinely empty)
-   * — a real code always resolves against the real FK targets downstream
-   * bulk imports validate against, so the example is never accidentally
-   * invalid, and an admin who forgets to delete it before uploading gets
-   * a clean "already exists" failure instead of a confusing FK error.
-   *
-   * `status: ACTIVE` + newest-first: a stale/deactivated/inconsistently-
-   * coded row (e.g. an early duplicate created before a real catalog
-   * import, with a different naming convention than everything since)
-   * must never be the one picked — a real incident this exact template
-   * hit: an old duplicate Program row ("BECOE", no hyphen, unused) was
-   * `findFirst({orderBy: 'asc'})`'s pick over the real, hyphenated
-   * "BE-COE" every other program/batch/student actually uses. Every
-   * `generateBulkImportTemplate` in this codebase now filters the same
-   * way for the same reason (see each one's own reference to this note).
-   */
   async generateBulkImportTemplate(): Promise<Buffer> {
     return generateExcelTemplate({
       entityName: 'Department',

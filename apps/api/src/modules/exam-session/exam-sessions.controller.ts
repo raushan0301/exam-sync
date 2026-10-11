@@ -2,7 +2,6 @@ import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common
 import { ExamSessionsService } from './exam-sessions.service';
 import { CreateExamSessionDto } from './dto/create-exam-session.dto';
 import { RescheduleExamSessionDto } from './dto/reschedule-exam-session.dto';
-import { CancelExamSessionDto } from './dto/cancel-exam-session.dto';
 import { UpdateSessionQuizzesDto } from './dto/update-session-quizzes.dto';
 import { Roles } from '../../common/auth/roles.decorator';
 import { CurrentUser } from '../../common/auth/current-user.decorator';
@@ -84,17 +83,6 @@ export class ExamSessionsController {
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.examSessionsService.reschedule(id, dto, actor);
-  }
-
-  /** FACULTY only, ownership-gated inside the service. */
-  @Roles(ROLE.FACULTY)
-  @Post(':id/cancel')
-  cancel(
-    @Param('id') id: string,
-    @Body() dto: CancelExamSessionDto,
-    @CurrentUser() actor: AuthenticatedUser,
-  ) {
-    return this.examSessionsService.cancel(id, dto, actor);
   }
 
   /** Same scoping as `GET :id` (ADMIN unscoped, FACULTY owner/co-instructor only) — previously ADMIN-only with no scoping at all. */

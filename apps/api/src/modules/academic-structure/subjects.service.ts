@@ -172,7 +172,6 @@ export class SubjectsService {
   }
 
   /** `GET /subjects/bulk-import/template` (ADMIN). */
-  /** Example row is a real existing subject (+ its department's/program's real codes) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
     return generateExcelTemplate({
       entityName: 'Subject',

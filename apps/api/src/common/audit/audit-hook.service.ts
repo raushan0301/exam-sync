@@ -52,9 +52,26 @@ export class AuditHookService {
     event: AuditWriteEvent,
     tx: Prisma.TransactionClient | PrismaService = this.prisma,
   ): Promise<void> {
-    const oldValue = redactSensitiveFields(event.oldValue);
-    const newValue = redactSensitiveFields(event.newValue);
+    this.logEvent(event);
+    await tx.auditLog.create({ data: this.toRow(event) });
+  }
 
+  /**
+   * Batched counterpart to `record` for bulk operations: same redaction,
+   * same per-entity audit rows (BR-048 — one row per changed entity, not
+   * one per request), written with ONE `createMany` instead of one INSERT
+   * round trip per row. Pass the enclosing transaction's `tx` like `record`.
+   */
+  async recordMany(
+    events: AuditWriteEvent[],
+    tx: Prisma.TransactionClient | PrismaService = this.prisma,
+  ): Promise<void> {
+    if (events.length === 0) return;
+    for (const event of events) this.logEvent(event);
+    await tx.auditLog.createMany({ data: events.map((e) => this.toRow(e)) });
+  }
+
+  private logEvent(event: AuditWriteEvent): void {
     this.logger.log(
       JSON.stringify({
         actorId: event.actor.id,
@@ -66,19 +83,21 @@ export class AuditHookService {
         requestId: getCurrentRequestId() ?? null,
       }),
     );
+  }
 
-    await tx.auditLog.create({
-      data: {
-        actorId: event.actor.id,
-        action: event.action,
-        entityType: event.entityType,
-        entityId: event.entityId,
-        oldValue: oldValue === undefined ? Prisma.JsonNull : (oldValue as Prisma.InputJsonValue),
-        newValue: newValue === undefined ? Prisma.JsonNull : (newValue as Prisma.InputJsonValue),
-        reason: event.reason ?? null,
-        requestId: getCurrentRequestId() ?? null,
-        academicYear: deriveAcademicYear(event.newValue) ?? deriveAcademicYear(event.oldValue),
-      },
-    });
+  private toRow(event: AuditWriteEvent) {
+    const oldValue = redactSensitiveFields(event.oldValue);
+    const newValue = redactSensitiveFields(event.newValue);
+    return {
+      actorId: event.actor.id,
+      action: event.action,
+      entityType: event.entityType,
+      entityId: event.entityId,
+      oldValue: oldValue === undefined ? Prisma.JsonNull : (oldValue as Prisma.InputJsonValue),
+      newValue: newValue === undefined ? Prisma.JsonNull : (newValue as Prisma.InputJsonValue),
+      reason: event.reason ?? null,
+      requestId: getCurrentRequestId() ?? null,
+      academicYear: deriveAcademicYear(event.newValue) ?? deriveAcademicYear(event.oldValue),
+    };
   }
 }

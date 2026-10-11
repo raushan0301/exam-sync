@@ -164,7 +164,6 @@ export class ProgramsService {
   }
 
   /** `GET /programs/bulk-import/template` (ADMIN). */
-  /** Example row is a real existing program (+ its department's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
     return generateExcelTemplate({
       entityName: 'Program',

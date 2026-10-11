@@ -200,7 +200,7 @@ function IncidentSeatPicker({
  */
 export function IncidentForm({ form, onSubmit, submitLabel, submitting, rootError }: IncidentFormProps) {
   const myFacultyQuery = useMyFaculty();
-  const dutiesQuery = useInvigilationDuties(myFacultyQuery.data?.id, { limit: 100 });
+  const dutiesQuery = useInvigilationDuties(myFacultyQuery.data?.id, { all: true });
   const [selectedDutyId, setSelectedDutyId] = useState<string>('');
 
   // Only sessions still active/in-process are reportable — a COMPLETED

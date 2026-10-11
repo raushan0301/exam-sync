@@ -4,7 +4,8 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { PaginatedResult, Quiz, QuizDetail, QuizApprovalHistoryEntry, QuizStatus } from './types';
+import { fetchList } from './fetch-list';
+import type { Quiz, QuizDetail, QuizApprovalHistoryEntry, QuizStatus } from './types';
 
 export interface UseQuizzesParams {
   status?: QuizStatus;
@@ -12,6 +13,8 @@ export interface UseQuizzesParams {
   facultyId?: string;
   cursor?: string;
   limit?: number;
+  /** Fetch EVERY page (follows `next_cursor`) instead of one page — for views that must show/count all rows. */
+  all?: boolean;
 }
 
 /**
@@ -26,11 +29,12 @@ export function useQuizzes(params: UseQuizzesParams = {}) {
     faculty_id: params.facultyId,
     cursor: params.cursor,
     limit: params.limit ? String(params.limit) : undefined,
+    all: params.all ? 'true' : undefined,
   };
 
   return useQuery({
     queryKey: queryKeys.quizzes(query),
-    queryFn: () => apiFetch<PaginatedResult<Quiz>>('/quizzes', { query }),
+    queryFn: () => fetchList<Quiz>('/quizzes', query),
     enabled: hasStoredSession(),
     staleTime: 30_000,
   });

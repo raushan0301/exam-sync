@@ -1,15 +1,8 @@
-import { IsIn, IsObject, IsOptional, IsUUID } from 'class-validator';
+import { IsBoolean, IsIn, IsObject, IsOptional, IsUUID } from 'class-validator';
 import { SeatingStrategyName } from '@exam-sync/domain-logic';
 
-/** All 6 strategies (ARCHITECTURE.md §T) — Phase 13 implemented the first 5; Phase 14 adds `ANTI_CHEATING` (§U), lifting the restriction Phase 13's own DTO comment disclosed as temporary. */
-const SUPPORTED_STRATEGIES: SeatingStrategyName[] = [
-  'SEQUENTIAL',
-  'RANDOMIZED',
-  'ALTERNATE_SUBJECT',
-  'ALTERNATE_BATCH',
-  'SUBJECT_BATCH_MIX',
-  'ANTI_CHEATING',
-];
+/** The four supported strategies. Older plans may still carry RANDOMIZED / ANTI_CHEATING (the DB enum keeps them) but new ones cannot be created. */
+const SUPPORTED_STRATEGIES: SeatingStrategyName[] = ['SEQUENTIAL', 'ALTERNATE_SUBJECT', 'ALTERNATE_BATCH', 'SUBJECT_BATCH_MIX'];
 
 /** `POST /exam-sessions/{id}/seating/generate` — API_CONTRACT.md: body `{room_id, strategy, constraints: {...}}`. */
 export class GenerateSeatingDto {
@@ -18,6 +11,11 @@ export class GenerateSeatingDto {
 
   @IsIn(SUPPORTED_STRATEGIES)
   strategy!: SeatingStrategyName;
+
+  /** Leave every second column of the room empty (1st, 3rd, 5th... used) so nobody has a side neighbour. Asked before generating; default off. */
+  @IsOptional()
+  @IsBoolean()
+  skip_alternate_columns?: boolean;
 
   /** Undocumented shape anywhere in the docs — accepted but currently unused; reserved for future per-generation tuning. */
   @IsOptional()

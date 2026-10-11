@@ -2,7 +2,8 @@
 
 import { useMutation } from '@tanstack/react-query';
 import { apiFetch } from '../api-client';
-import type { StudentSubjectEnrollment } from '../queries/types';
+import { downloadBulkImportTemplate, uploadBulkImportFile } from './bulk-import-helpers';
+import type { ImportJob, StudentSubjectEnrollment } from '../queries/types';
 
 export interface CreateEnrollmentInput {
   student_id: string;
@@ -23,5 +24,36 @@ export function useCreateEnrollment() {
   return useMutation({
     mutationFn: (input: CreateEnrollmentInput) =>
       apiFetch<StudentSubjectEnrollment>('/enrollments', { method: 'POST', body: input }),
+  });
+}
+
+/** POST /enrollments/bulk-import — ADMIN only, multipart/form-data, field name `file`. */
+export function useBulkImportEnrollments() {
+  return useMutation({
+    mutationFn: (file: File) => uploadBulkImportFile('enrollments', file),
+  });
+}
+
+/** GET /enrollments/bulk-import/template — downloads the .xlsx template via the browser. */
+export function downloadEnrollmentTemplate() {
+  return downloadBulkImportTemplate('enrollments', 'enrollment-bulk-import-template.xlsx');
+}
+
+/**
+ * POST /enrollments/bulk — ADMIN only, one request for the whole batch
+ * (`students × subjects` rows) instead of one request each, which would
+ * trip the API's 100 req/min rate limit. Processing is synchronous
+ * server-side, so the import job is already final when the id comes back;
+ * it's fetched once to read the per-row results.
+ */
+export function useBulkEnroll() {
+  return useMutation({
+    mutationFn: async (enrollments: CreateEnrollmentInput[]): Promise<ImportJob> => {
+      const { job_id } = await apiFetch<{ job_id: string }>('/enrollments/bulk', {
+        method: 'POST',
+        body: { enrollments },
+      });
+      return apiFetch<ImportJob>(`/import-jobs/${job_id}`);
+    },
   });
 }

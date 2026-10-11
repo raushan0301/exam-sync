@@ -1,18 +1,8 @@
 /**
- * Phase 13 built the first five (IMPLEMENTATION_PLAN.md: "seat map +
- * strategies ... this phase's engine work should be built as pure,
- * framework-independent functions in packages/domain-logic"). Phase 14
- * adds `ANTI_CHEATING` (ARCHITECTURE.md §U) — the NestJS DTO layer
- * (apps/api) rejected it through Phase 13; that restriction is lifted
- * now that its algorithm exists here.
+ * The four supported strategies. Sequential fills in roster order; the other three round-robin by
+ * subject, by batch, or by both so neighbouring seats differ.
  */
-export type SeatingStrategyName =
-  | 'SEQUENTIAL'
-  | 'RANDOMIZED'
-  | 'ALTERNATE_SUBJECT'
-  | 'ALTERNATE_BATCH'
-  | 'SUBJECT_BATCH_MIX'
-  | 'ANTI_CHEATING';
+export type SeatingStrategyName = 'SEQUENTIAL' | 'ALTERNATE_SUBJECT' | 'ALTERNATE_BATCH' | 'SUBJECT_BATCH_MIX';
 
 export interface SeatInput {
   id: string;
@@ -27,6 +17,8 @@ export interface StudentToSeatInput {
   quizId: string;
   subjectId: string;
   batchId: string;
+  /** Roll number (any format, compared "naturally": R2 < R10). Optional — used only to keep consecutive roll numbers apart. */
+  rollNumber?: string;
   /**
    * BR-028 (accessibility HARD constraint). No source of truth for this
    * flag exists anywhere in the current schema (`Student` has no such
@@ -48,25 +40,21 @@ export interface GenerateSeatingInput {
   students: StudentToSeatInput[];
   strategy: SeatingStrategyName;
   /**
-   * Deterministic seed for RANDOMIZED (e.g. `${examSessionId}:${roomId}:${version}`)
-   * — same seed + same inputs ⇒ byte-identical output (reproducibility).
-   * Ignored by every other strategy, which are deterministic by
-   * construction and need no seed.
+   * Seed for the roll-number spread's tie-breaking — same seed + same inputs ⇒ identical output.
    */
   seed?: string;
+  /**
+   * Leave every second COLUMN of the room empty (columns 1st, 3rd, 5th... are used) so no student has a
+   * side neighbour. Capacity permitting — students that no longer fit come back in `unseated`.
+   */
+  skipAlternateColumns?: boolean;
 }
 
 /**
- * ARCHITECTURE.md §U step 6, "Single-subject fallback": when a room's
- * roster has no subject diversity to exploit at all, ANTI_CHEATING falls
- * back down this chain — "called out explicitly to the Admin ... never
- * silently." `undefined` means the room DID have subject diversity and
- * the real greedy-graph-coloring + repair algorithm ran normally.
+ * Set when a mixing strategy had nothing to mix in this room (one subject, or one batch) and the
+ * roll-number / batch / staggered-row spread was used instead — told to the caller, never silent.
  */
-export type AntiCheatingFallbackReason =
-  | 'SINGLE_SUBJECT_ALTERNATE_BATCH'
-  | 'SINGLE_SUBJECT_CHECKERBOARD_SPACING'
-  | 'SINGLE_SUBJECT_RANDOMIZED';
+export type SeatingFallbackReason = 'SINGLE_SUBJECT_SPREAD';
 
 export interface GenerateSeatingResult {
   assignments: SeatAssignment[];
@@ -77,8 +65,8 @@ export interface GenerateSeatingResult {
    * non-empty list here into a HARD `UNSEATED_STUDENT` violation.
    */
   unseated: StudentToSeatInput[];
-  /** Only ever set for `ANTI_CHEATING` when the single-subject fallback chain fired — see `AntiCheatingFallbackReason`. */
-  fallbackReason?: AntiCheatingFallbackReason;
+  /** Only set when the spread replaced a mixing strategy — see `SeatingFallbackReason`. */
+  fallbackReason?: SeatingFallbackReason;
 }
 
 export type HardViolationType =
@@ -98,7 +86,7 @@ export interface HardViolation {
   studentId?: string;
 }
 
-export type SoftViolationType = 'SUBJECT_ADJACENCY' | 'BATCH_ADJACENCY' | 'QUIZ_ADJACENCY';
+export type SoftViolationType = 'SUBJECT_ADJACENCY' | 'BATCH_ADJACENCY' | 'QUIZ_ADJACENCY' | 'ROLL_ADJACENCY';
 
 export interface SoftViolation {
   type: SoftViolationType;

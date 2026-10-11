@@ -55,30 +55,16 @@ describe('StudentsService', () => {
   });
 
   describe('generateBulkImportTemplate', () => {
-    it('uses a real existing student (+ their program\'s/batch\'s real codes) as the example row', async () => {
-      prisma.student.findFirst.mockResolvedValue({
-        name: 'Real Student', rollNumber: 'ECE2025042',
-        program: { code: 'BTECH-ECE' }, batch: { year: '2025-2029', section: '1E1', subsection: '1E12' },
-        user: { email: 'real.student@example.edu' },
-      });
+
+    it('uses a fixed example row, independent of existing data', async () => {
 
       const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
 
-      expect(row.name).toBe('Real Student');
-      expect(row.email).toBe('real.student@example.edu');
-      expect(row.program_code).toBe('BTECH-ECE');
-      expect(row.batch_year).toBe('2025-2029');
-      expect(row.batch_subsection).toBe('1E12');
-      expect(row.roll_number).toBe('ECE2025042');
+
+      expect(row.program_code).toBe('BE-COE');
+
     });
 
-    it('falls back to a fictional placeholder when the table is genuinely empty', async () => {
-      prisma.student.findFirst.mockResolvedValue(null);
-
-      const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
-
-      expect(row.roll_number).toBe('CSE2026001');
-    });
   });
 
   describe('create', () => {

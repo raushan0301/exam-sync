@@ -20,8 +20,8 @@ export default function FacultyAssignmentsPage() {
   const myFacultyQuery = useMyFaculty();
   const pager = useCursorPager();
   const assignmentsQuery = useFacultyAssignments(myFacultyQuery.data?.id, { cursor: pager.cursor, limit: 25 });
-  const subjectsQuery = useSubjects({ limit: 200 });
-  const batchesQuery = useBatches({ limit: 200 });
+  const subjectsQuery = useSubjects({ all: true });
+  const batchesQuery = useBatches({ all: true });
 
   const subjectById = new Map((subjectsQuery.data?.items ?? []).map((s) => [s.id, s]));
   const batchById = new Map((batchesQuery.data?.items ?? []).map((b) => [b.id, b]));

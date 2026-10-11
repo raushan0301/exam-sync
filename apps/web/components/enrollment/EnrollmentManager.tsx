@@ -1,11 +1,14 @@
 'use client';
 
 import { useState } from 'react';
-import { Card, Select, Input, Checkbox, Button, Alert, LoadingState, EmptyState } from '@/components/ui';
+import { Upload } from 'lucide-react';
+import { Card, Input, Checkbox, Button, Alert, LoadingState, EmptyState } from '@/components/ui';
 import { useSubjects } from '@/lib/queries/useSubjects';
 import { useBatches } from '@/lib/queries/useBatches';
 import { useStudentsForBatches } from '@/lib/queries/useStudents';
-import { useCreateEnrollment } from '@/lib/mutations/useEnrollmentMutations';
+import { useCreateEnrollment, useBulkEnroll, useBulkImportEnrollments, downloadEnrollmentTemplate } from '@/lib/mutations/useEnrollmentMutations';
+import { fetchImportJob } from '@/lib/mutations/useStudentMutations';
+import { BulkImportModal } from '@/components/bulk-import/BulkImportModal';
 import { mapError } from '@/lib/error-mapping';
 
 /**
@@ -18,21 +21,39 @@ import { mapError } from '@/lib/error-mapping';
  * one `POST /enrollments` per selected student, fired in parallel, with a
  * success/failure summary — same shape as RosterPanel's multi-add.
  */
-export function EnrollmentManager() {
-  const [subjectId, setSubjectId] = useState('');
+export interface EnrollmentManagerProps {
+  /**
+   * ADMIN mode: shows the Excel bulk-import button and enrolls through the single-request
+   * `POST /enrollments/bulk` (both ADMIN-gated). Without it (FACULTY) enrollment is one
+   * `POST /enrollments` per row.
+   */
+  allowBulkImport?: boolean;
+}
+
+export function EnrollmentManager({ allowBulkImport = false }: EnrollmentManagerProps) {
+  const [bulkImportOpen, setBulkImportOpen] = useState(false);
+  const bulkImportMutation = useBulkImportEnrollments();
+  const [subjectIds, setSubjectIds] = useState<Set<string>>(new Set());
+  const [subjectSearch, setSubjectSearch] = useState('');
   const [academicYear, setAcademicYear] = useState('');
   const [semester, setSemester] = useState<number | ''>('');
   const [batchIds, setBatchIds] = useState<Set<string>>(new Set());
   const [studentIds, setStudentIds] = useState<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
-  const [summary, setSummary] = useState<{ success: number; failure: number; error?: string } | null>(null);
+  const [summary, setSummary] = useState<{ success: number; failure: number; reasons: { message: string; count: number }[] } | null>(null);
 
-  const subjectsQuery = useSubjects({ isActive: true, limit: 200 });
-  const batchesQuery = useBatches({ status: 'ACTIVE', limit: 200 });
+  const subjectsQuery = useSubjects({ isActive: true, all: true });
+  const batchesQuery = useBatches({ status: 'ACTIVE', all: true });
   const studentsQuery = useStudentsForBatches(Array.from(batchIds));
   const createMutation = useCreateEnrollment();
+  const bulkEnrollMutation = useBulkEnroll();
 
-  const canSubmit = !!subjectId && academicYear.trim().length > 0 && semester !== '' && studentIds.size > 0;
+  const allSubjects = subjectsQuery.data?.items ?? [];
+  const visibleSubjects = allSubjects.filter((s) =>
+    `${s.code} ${s.name}`.toLowerCase().includes(subjectSearch.trim().toLowerCase()),
+  );
+
+  const canSubmit = subjectIds.size > 0 && academicYear.trim().length > 0 && semester !== '' && studentIds.size > 0;
 
   function toggleBatch(batchId: string) {
     setBatchIds((prev) => {
@@ -42,6 +63,15 @@ export function EnrollmentManager() {
       return next;
     });
     setStudentIds(new Set());
+  }
+
+  function toggleSubject(subjectId: string) {
+    setSubjectIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(subjectId)) next.delete(subjectId);
+      else next.add(subjectId);
+      return next;
+    });
   }
 
   function toggleStudent(studentId: string) {
@@ -66,54 +96,122 @@ export function EnrollmentManager() {
     setSummary(null);
 
     const targets = studentsQuery.items.filter((s) => studentIds.has(s.id));
-    const results = await Promise.allSettled(
-      targets.map((s) =>
-        createMutation.mutateAsync({
-          student_id: s.id,
-          subject_id: subjectId,
-          batch_id: s.batchId,
-          academic_year: academicYear,
-          semester: Number(semester),
-        }),
-      ),
+    const rows = targets.flatMap((s) =>
+      Array.from(subjectIds).map((subjectId) => ({
+        student_id: s.id,
+        subject_id: subjectId,
+        batch_id: s.batchId,
+        academic_year: academicYear,
+        semester: Number(semester),
+      })),
     );
 
-    setSubmitting(false);
-    const success = results.filter((r) => r.status === 'fulfilled').length;
-    const failure = results.length - success;
-    if (failure > 0) {
-      const firstFailure = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
-      setSummary({ success, failure, error: firstFailure ? mapError(firstFailure.reason).description : undefined });
-    } else {
-      setSummary({ success, failure });
-      setStudentIds(new Set());
+    const errors: string[] = [];
+    let success = 0;
+    try {
+      if (allowBulkImport) {
+        const job = await bulkEnrollMutation.mutateAsync(rows);
+        success = job.successCount;
+        for (const r of job.results) if (r.status === 'FAILURE') errors.push(r.error ?? 'Unknown error');
+      } else {
+        // FACULTY can't call /enrollments/bulk — one request per row, a few at a time.
+        const CONCURRENCY = 5;
+        for (let i = 0; i < rows.length; i += CONCURRENCY) {
+          const settled = await Promise.allSettled(rows.slice(i, i + CONCURRENCY).map((r) => createMutation.mutateAsync(r)));
+          for (const r of settled) {
+            if (r.status === 'fulfilled') success++;
+            else errors.push(mapError(r.reason).description);
+          }
+        }
+      }
+    } catch (err) {
+      errors.push(...Array(rows.length - success).fill(mapError(err).description));
     }
+
+    const counts = new Map<string, number>();
+    for (const e of errors) counts.set(e, (counts.get(e) ?? 0) + 1);
+    setSubmitting(false);
+    setSummary({
+      success,
+      failure: errors.length,
+      reasons: Array.from(counts, ([message, count]) => ({ message, count })),
+    });
+    if (errors.length === 0) setStudentIds(new Set());
   }
 
   return (
     <div className="flex flex-col gap-4">
-      <div>
-        <h1 className="text-xl font-semibold text-text">Enrollments</h1>
-        <p className="text-sm text-text-muted">Enroll students in a subject for a given academic year/semester.</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold text-text">Enrollments</h1>
+          <p className="text-sm text-text-muted">Enroll students in one or more subjects for a given academic year/semester.</p>
+        </div>
+        {allowBulkImport && (
+          <Button variant="secondary" leadingIcon={<Upload size={16} aria-hidden="true" />} onClick={() => setBulkImportOpen(true)}>
+            Bulk Import
+          </Button>
+        )}
       </div>
 
       <Card>
         <div className="flex flex-col gap-4">
           {summary && (
             <Alert color={summary.failure > 0 ? 'warning' : 'success'} title="Enrollment complete" dismissible>
-              {summary.success} student(s) enrolled successfully.
-              {summary.failure > 0 && ` ${summary.failure} failed${summary.error ? ` (${summary.error})` : ''}.`}
+              {summary.success} enrollment(s) created.
+              {summary.failure > 0 && ` ${summary.failure} failed:`}
+              {summary.reasons.length > 0 && (
+                <ul className="mt-1 list-disc pl-4 text-xs">
+                  {summary.reasons.map((r) => (
+                    <li key={r.message}>
+                      {r.message} ({r.count})
+                    </li>
+                  ))}
+                </ul>
+              )}
             </Alert>
           )}
 
-          <Select
-            label="Subject"
-            required
-            value={subjectId}
-            onChange={(e) => setSubjectId(e.target.value)}
-            options={(subjectsQuery.data?.items ?? []).map((s) => ({ value: s.id, label: `${s.code} — ${s.name}` }))}
-            placeholder={subjectsQuery.isLoading ? 'Loading subjects…' : 'Select a subject'}
-          />
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium text-text">
+                Subject(s) <span className="text-danger-text">*</span>
+              </span>
+              {subjectIds.size > 0 && (
+                <span className="flex items-center gap-2 text-xs text-text-muted">
+                  {subjectIds.size} selected
+                  <button type="button" className="text-primary-700 hover:underline" onClick={() => setSubjectIds(new Set())}>
+                    Clear
+                  </button>
+                </span>
+              )}
+            </div>
+            {subjectsQuery.isLoading ? (
+              <LoadingState label="Loading subjects…" />
+            ) : (
+              <>
+                <Input
+                  aria-label="Search subjects"
+                  placeholder="Search by code or name…"
+                  value={subjectSearch}
+                  onChange={(e) => setSubjectSearch(e.target.value)}
+                />
+                <div className="flex max-h-48 flex-col gap-1 overflow-y-auto rounded border border-border p-2">
+                  {visibleSubjects.length === 0 ? (
+                    <p className="px-1 py-2 text-sm text-text-muted">No subjects match.</p>
+                  ) : (
+                    visibleSubjects.map((s) => (
+                      <Checkbox
+                        key={s.id}
+                        label={`${s.code} — ${s.name}`}
+                        checked={subjectIds.has(s.id)}
+                        onChange={() => toggleSubject(s.id)}
+                      />
+                    ))
+                  )}
+                </div>
+              </>
+            )}
+          </div>
 
           <div className="grid grid-cols-2 gap-4">
             <Input
@@ -185,11 +283,24 @@ export function EnrollmentManager() {
 
           <div className="flex justify-end">
             <Button onClick={onEnroll} disabled={!canSubmit} loading={submitting}>
-              Enroll {studentIds.size > 0 ? `${studentIds.size} ` : ''}Selected
+              {studentIds.size > 0 && subjectIds.size > 0
+                ? `Enroll ${studentIds.size} student(s) in ${subjectIds.size} subject(s)`
+                : 'Enroll Selected'}
             </Button>
           </div>
         </div>
       </Card>
+
+      {allowBulkImport && (
+        <BulkImportModal
+          open={bulkImportOpen}
+          onClose={() => setBulkImportOpen(false)}
+          entityLabel="Enrollment"
+          onDownloadTemplate={downloadEnrollmentTemplate}
+          onUpload={(file) => bulkImportMutation.mutateAsync(file)}
+          onPollJob={fetchImportJob}
+        />
+      )}
     </div>
   );
 }

@@ -58,8 +58,8 @@ export default function SubjectsPage() {
     cursor: pager.cursor,
     limit: 25,
   });
-  const { data: departmentsData } = useDepartments({ limit: 200, status: 'ACTIVE' });
-  const { data: programsData } = usePrograms({ limit: 200, status: 'ACTIVE' });
+  const { data: departmentsData } = useDepartments({ all: true, status: 'ACTIVE' });
+  const { data: programsData } = usePrograms({ all: true, status: 'ACTIVE' });
   const departmentOptions = (departmentsData?.items ?? []).map((d) => ({ value: d.id, label: `${d.code} — ${d.name}` }));
   const programOptions = (programsData?.items ?? []).map((p) => ({ value: p.id, label: `${p.code} — ${p.name}` }));
   const departmentById = new Map((departmentsData?.items ?? []).map((d) => [d.id, d]));

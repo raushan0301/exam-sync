@@ -1,14 +1,16 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { apiFetch } from '../api-client';
 import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
-import type { AttendanceOverviewRow, PaginatedResult } from './types';
+import { fetchList } from './fetch-list';
+import type { AttendanceOverviewRow } from './types';
 
 export interface UseSessionAttendanceParams {
   cursor?: string;
   limit?: number;
+  /** Fetch EVERY page (follows `next_cursor`) instead of one page — for views that must show/count all rows. */
+  all?: boolean;
 }
 
 /**
@@ -25,11 +27,12 @@ export function useSessionAttendance(examSessionId: string | undefined, params: 
   const query: Record<string, string | undefined> = {
     cursor: params.cursor,
     limit: params.limit ? String(params.limit) : undefined,
+    all: params.all ? 'true' : undefined,
   };
 
   return useQuery({
     queryKey: queryKeys.sessionAttendance(examSessionId ?? '', query),
-    queryFn: () => apiFetch<PaginatedResult<AttendanceOverviewRow>>(`/exam-sessions/${examSessionId}/attendance`, { query }),
+    queryFn: () => fetchList<AttendanceOverviewRow>(`/exam-sessions/${examSessionId}/attendance`, query),
     enabled: hasStoredSession() && !!examSessionId,
     staleTime: 10_000,
   });

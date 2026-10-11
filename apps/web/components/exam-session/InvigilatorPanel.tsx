@@ -33,8 +33,8 @@ export function InvigilatorPanel({ session, readOnly = false }: InvigilatorPanel
   const [role, setRole] = useState<InvigilatorRole>('LEAD_INVIGILATOR');
   const [removing, setRemoving] = useState<Invigilator | null>(null);
 
-  const facultyQuery = useFaculty({ limit: 200, status: 'ACTIVE' });
-  const invigilatorsQuery = useSessionInvigilators(session.id, { limit: 200 });
+  const facultyQuery = useFaculty({ all: true, status: 'ACTIVE' });
+  const invigilatorsQuery = useSessionInvigilators(session.id, { all: true });
   const assignMutation = useAssignInvigilator(session.id);
   const removeMutation = useRemoveInvigilator(session.id);
 

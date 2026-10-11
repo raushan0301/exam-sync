@@ -166,10 +166,15 @@ describe('validateSeating — pure, independent re-scan (ADR-004)', () => {
 
   describe('soft constraints — adjacency diversity, reported not blocking', () => {
     it('reports SUBJECT_ADJACENCY for two adjacent seats holding the same subject', () => {
-      const students = [student('s1', 'q1', 'DBMS', 'batch-A'), student('s2', 'q2', 'DBMS', 'batch-B')];
+      const students = [
+        student('s1', 'q1', 'DBMS', 'batch-A'),
+        student('s2', 'q2', 'DBMS', 'batch-B'),
+        student('s3', 'q3', 'OS', 'batch-C'),
+      ];
       const assignments = [
         { seatId: 'A1', studentId: 's1', quizId: 'q1' },
         { seatId: 'A2', studentId: 's2', quizId: 'q2' }, // adjacent, same subject (DBMS), different quiz/batch
+        { seatId: 'B1', studentId: 's3', quizId: 'q3' }, // next to A1 but a different subject/quiz/batch
       ];
 
       const result = validateSeating({ seats: grid2x2, assignments, students });
@@ -178,7 +183,7 @@ describe('validateSeating — pure, independent re-scan (ADR-004)', () => {
       expect(result.softViolations).toEqual([
         expect.objectContaining({ type: 'SUBJECT_ADJACENCY', seatIdA: 'A1', seatIdB: 'A2' }),
       ]);
-      expect(result.softConstraintScore).toBe(0); // the only adjacent pair, and it violates
+      expect(result.softConstraintScore).toBe(0.5); // 2 adjacent pairs, 1 violates
     });
 
     it('reports BATCH_ADJACENCY and QUIZ_ADJACENCY independently from SUBJECT_ADJACENCY', () => {
@@ -220,16 +225,50 @@ describe('validateSeating — pure, independent re-scan (ADR-004)', () => {
     });
 
     it('never affects hardViolations regardless of how many soft constraints are violated', () => {
-      const students = [student('s1', 'q1', 'DBMS', 'batch-A'), student('s2', 'q1', 'DBMS', 'batch-A')];
+      const students = [
+        student('s1', 'q1', 'DBMS', 'batch-A'),
+        student('s2', 'q1', 'DBMS', 'batch-A'),
+        student('s3', 'q3', 'OS', 'batch-C'),
+      ];
       const assignments = [
         { seatId: 'A1', studentId: 's1', quizId: 'q1' },
         { seatId: 'A2', studentId: 's2', quizId: 'q1' }, // same subject, batch, AND quiz — triple soft violation
+        { seatId: 'B2', studentId: 's3', quizId: 'q3' },
       ];
 
       const result = validateSeating({ seats: grid2x2, assignments, students });
 
       expect(result.hardViolations).toEqual([]);
       expect(result.softViolations.length).toBeGreaterThanOrEqual(3);
+    });
+  });
+
+  describe('single-subject room — judged on batch and roll-number spread', () => {
+    it('does not report subject/quiz adjacency when the whole room sits one subject', () => {
+      // 10 on the roster; two far-apart roll numbers sit side by side (the rest are not placed here — only soft output matters).
+      const students = Array.from({ length: 10 }, (_, i) => student(`s${i + 1}`, 'q1', 'DBMS', 'A', { rollNumber: String(i + 1) }));
+      const assignments = [
+        { seatId: 'A1', studentId: 's1', quizId: 'q1' },
+        { seatId: 'A2', studentId: 's10', quizId: 'q1' },
+      ];
+
+      const result = validateSeating({ seats: grid2x2, assignments, students });
+
+      expect(result.softViolations).toEqual([]);
+      expect(result.softConstraintScore).toBe(1);
+    });
+
+    it('reports ROLL_ADJACENCY for neighbours with consecutive roll numbers', () => {
+      const students = [student('s1', 'q1', 'DBMS', 'A', { rollNumber: '7' }), student('s2', 'q1', 'DBMS', 'A', { rollNumber: '8' })];
+      const assignments = [
+        { seatId: 'A1', studentId: 's1', quizId: 'q1' },
+        { seatId: 'A2', studentId: 's2', quizId: 'q1' },
+      ];
+
+      const result = validateSeating({ seats: grid2x2, assignments, students });
+
+      expect(result.softViolations).toEqual([expect.objectContaining({ type: 'ROLL_ADJACENCY', seatIdA: 'A1', seatIdB: 'A2' })]);
+      expect(result.softConstraintScore).toBe(0);
     });
   });
 

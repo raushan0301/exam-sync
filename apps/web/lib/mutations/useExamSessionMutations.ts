@@ -84,24 +84,6 @@ export function useRescheduleExamSession(id: string) {
 }
 
 /**
- * POST /exam-sessions/{id}/cancel — ADMIN only. `reason` required
- * (non-empty, 422 if missing — mirrored client-side too). Not permitted
- * once IN_PROGRESS/COMPLETED/CANCELLED (`NON_CANCELLABLE_STATUSES` in
- * exam-sessions.service.ts) — the 409 that produces is surfaced as-is.
- */
-export function useCancelExamSession(id: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (reason: string) =>
-      apiFetch<ExamSession>(`/exam-sessions/${id}/cancel`, { method: 'POST', body: { reason } }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.examSession(id) });
-      queryClient.invalidateQueries({ queryKey: ['exam-sessions', 'list'] });
-    },
-  });
-}
-
-/**
  * GET /exam-sessions/{id}/conflicts — ADMIN-only dry run, no commit.
  * Modeled as a manual-trigger `useMutation` (not a `useQuery` with
  * `enabled: false`) — there is no existing "check now" action pattern

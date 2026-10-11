@@ -1,6 +1,7 @@
 'use client';
 
-import { ClipboardList, AlertTriangle } from 'lucide-react';
+import Link from 'next/link';
+import { ClipboardList, AlertTriangle, PauseCircle } from 'lucide-react';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { KpiTile, KpiTileSkeleton } from '@/components/dashboard/KpiTile';
 import { StatusBreakdown } from '@/components/dashboard/StatusBreakdown';
@@ -9,6 +10,7 @@ import { Card } from '@/components/ui/Card';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { useQuizzes } from '@/lib/queries/useQuizzes';
 import { useIncidents } from '@/lib/queries/useIncidents';
+import { useSuspensionRequests } from '@/lib/queries/useSuspensionRequests';
 import { mapError } from '@/lib/error-mapping';
 
 const SEVERITY_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const;
@@ -25,8 +27,9 @@ const SEVERITY_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const;
  * the full gap writeup.
  */
 export default function AdminDashboardPage() {
-  const pendingQuizzes = useQuizzes({ status: 'SUBMITTED', limit: 50 });
-  const openIncidents = useIncidents({ status: 'OPEN', limit: 200 });
+  const pendingQuizzes = useQuizzes({ status: 'SUBMITTED', all: true });
+  const openIncidents = useIncidents({ status: 'OPEN', all: true });
+  const pendingSuspensions = useSuspensionRequests({ status: 'PENDING', all: true });
 
   const pendingCount = pendingQuizzes.data?.items.length ?? 0;
 
@@ -88,6 +91,29 @@ export default function AdminDashboardPage() {
                   : 'None critical or high'
             }
           />
+        )}
+
+        {pendingSuspensions.isLoading ? (
+          <KpiTileSkeleton />
+        ) : pendingSuspensions.isError ? (
+          <Card padding="dense">
+            <ErrorState
+              title="Couldn't load suspension requests"
+              description={mapError(pendingSuspensions.error).description}
+              onRetry={() => pendingSuspensions.refetch()}
+              retrying={pendingSuspensions.isFetching}
+            />
+          </Card>
+        ) : (
+          <Link href="/admin/suspension-requests" className="block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
+            <KpiTile
+              label="Suspension Requests"
+              value={pendingSuspensions.data?.items.length ?? 0}
+              icon={<PauseCircle size={18} />}
+              tone={(pendingSuspensions.data?.items.length ?? 0) > 0 ? 'warning' : 'success'}
+              description={(pendingSuspensions.data?.items.length ?? 0) > 0 ? 'Awaiting your decision' : 'Nothing waiting on you'}
+            />
+          </Link>
         )}
       </div>
 

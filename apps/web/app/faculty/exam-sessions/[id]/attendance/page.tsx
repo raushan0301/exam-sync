@@ -128,7 +128,7 @@ function RoomAttendanceCard({ examSessionId, room }: { examSessionId: string; ro
 
   const planQuery = useSeatingPlan(planId);
   const seatsQuery = useRoomSeats(planId ? room.id : undefined);
-  const attendanceQuery = useSessionAttendance(examSessionId, { limit: 200 });
+  const attendanceQuery = useSessionAttendance(examSessionId, { all: true });
 
   const attendanceBySeatId = useMemo(() => {
     const map = new Map<string, Attendance>();

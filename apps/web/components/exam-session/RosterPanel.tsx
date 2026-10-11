@@ -70,7 +70,7 @@ export function RosterPanel({ session, readOnly = false }: RosterPanelProps) {
     cursor: pager.cursor,
     limit: 25,
   });
-  const batchesQuery = useBatches({ status: 'ACTIVE', limit: 200 });
+  const batchesQuery = useBatches({ status: 'ACTIVE', all: true });
   // Section/subsection roster picker: students are only fetched (and only
   // selectable) once at least one batch/section is chosen, scoped
   // server-side per batch — picking one student at a time out of every

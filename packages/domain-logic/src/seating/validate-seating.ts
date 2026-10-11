@@ -163,6 +163,25 @@ function computeSoftViolations(
   const softViolations: SoftViolation[] = [];
   let totalAdjacentPairs = 0;
 
+  // One subject in the room: "same subject / same quiz neighbour" is unavoidable and says nothing about
+  // the arrangement, so judge it on batch and roll-number spread instead.
+  const roster = [...rosterByStudentId.values()];
+  const singleSubject = new Set(roster.map((s) => s.subjectId)).size <= 1;
+  const rankById = new Map<string, number>();
+  const perBatch = new Map<string, number>();
+  [...roster]
+    .sort(
+      (a, b) =>
+        a.batchId.localeCompare(b.batchId) ||
+        (a.rollNumber ?? '').localeCompare(b.rollNumber ?? '', undefined, { numeric: true }) ||
+        a.studentId.localeCompare(b.studentId),
+    )
+    .forEach((s) => {
+      const rank = perBatch.get(s.batchId) ?? 0;
+      rankById.set(s.studentId, rank);
+      perBatch.set(s.batchId, rank + 1);
+    });
+
   for (let i = 0; i < assignments.length; i++) {
     for (let j = i + 1; j < assignments.length; j++) {
       const seatA = seatsById.get(assignments[i].seatId);
@@ -180,6 +199,26 @@ function computeSoftViolations(
 
       const seatIdA = assignments[i].seatId;
       const seatIdB = assignments[j].seatId;
+
+      if (singleSubject) {
+        const gap = Math.abs((rankById.get(studentA.studentId) ?? 0) - (rankById.get(studentB.studentId) ?? 0));
+        if (studentA.batchId === studentB.batchId && studentA.rollNumber && studentB.rollNumber && gap <= 2) {
+          softViolations.push({
+            type: 'ROLL_ADJACENCY',
+            seatIdA,
+            seatIdB,
+            message: `Adjacent seats "${seatIdA}" and "${seatIdB}" hold students with near-consecutive roll numbers ("${studentA.rollNumber}" and "${studentB.rollNumber}").`,
+          });
+        } else if (studentA.batchId === studentB.batchId && roster.some((s) => s.batchId !== studentA.batchId)) {
+          softViolations.push({
+            type: 'BATCH_ADJACENCY',
+            seatIdA,
+            seatIdB,
+            message: `Adjacent seats "${seatIdA}" and "${seatIdB}" both hold students of batch "${studentA.batchId}".`,
+          });
+        }
+        continue;
+      }
 
       if (studentA.subjectId === studentB.subjectId) {
         softViolations.push({

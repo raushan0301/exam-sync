@@ -7,6 +7,7 @@ import { FacultyAssignmentsService } from '../faculty-assignment';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { buildXlsxBuffer, readTemplateExampleRow } from '../../common/bulk-import/test-utils';
 
 function buildPrismaMock() {
   const tx = {
@@ -14,11 +15,15 @@ function buildPrismaMock() {
       create: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      createManyAndReturn: jest.fn(),
       update: jest.fn(),
     },
   };
   return {
     ...tx,
+    student: { findMany: jest.fn().mockResolvedValue([]) },
+    subject: { findMany: jest.fn().mockResolvedValue([]) },
+    batch: { findMany: jest.fn().mockResolvedValue([]) },
     $transaction: jest.fn((cb: any) => cb(tx)),
   } as any;
 }
@@ -28,7 +33,7 @@ const faculty: AuthenticatedUser = { id: 'faculty-user-1', email: 'f@example.com
 
 describe('EnrollmentsService — BR-004/005/006 (the highest-leverage correctness surface in this phase)', () => {
   let prisma: ReturnType<typeof buildPrismaMock>;
-  let auditHook: { record: jest.Mock };
+  let auditHook: { record: jest.Mock; recordMany: jest.Mock };
   let studentsService: { findById: jest.Mock };
   let subjectsService: { findById: jest.Mock };
   let batchesService: { findById: jest.Mock };
@@ -46,7 +51,7 @@ describe('EnrollmentsService — BR-004/005/006 (the highest-leverage correctnes
 
   beforeEach(() => {
     prisma = buildPrismaMock();
-    auditHook = { record: jest.fn() };
+    auditHook = { record: jest.fn(), recordMany: jest.fn() };
     studentsService = { findById: jest.fn() };
     subjectsService = { findById: jest.fn() };
     batchesService = { findById: jest.fn() };
@@ -340,35 +345,169 @@ describe('EnrollmentsService — BR-004/005/006 (the highest-leverage correctnes
     });
   });
 
-  describe('bulkCreate (EC-044 partial failure)', () => {
-    it('processes each row independently — a bad row never blocks the rest', async () => {
-      studentsService.findById.mockResolvedValue({ id: 'student-1' });
-      subjectsService.findById.mockImplementation((id: string) =>
-        id === 'subject-DBMS' ? Promise.resolve({ id }) : Promise.reject(new NotFoundException()),
+  describe('bulk paths — batched (constant query count, EC-044 partial failure)', () => {
+    const insertEcho = () =>
+      prisma.studentSubjectEnrollment.createManyAndReturn.mockImplementation(({ data }: any) =>
+        Promise.resolve(data.map((d: any, i: number) => ({ id: `enr-${i + 1}`, ...d }))),
       );
-      batchesService.findById.mockResolvedValue({ id: 'batch-A' });
-      prisma.studentSubjectEnrollment.findUnique.mockResolvedValue(null);
-      prisma.studentSubjectEnrollment.create.mockResolvedValue({ id: 'e1' });
+    const jobResult = () => importJobsService.create.mock.calls[0][0];
 
-      let captured: any;
-      importJobsService.create.mockImplementation((input: any) => {
-        captured = input;
-        return Promise.resolve({ id: 'job-1', ...input });
+    beforeEach(() => {
+      prisma.studentSubjectEnrollment.findMany.mockResolvedValue([]); // no existing enrollments
+      insertEcho();
+    });
+
+    describe('bulkCreate (form)', () => {
+      beforeEach(() => {
+        prisma.student.findMany.mockResolvedValue([{ id: 'student-1' }, { id: 'student-2' }]);
+        prisma.subject.findMany.mockResolvedValue([{ id: 'subject-DBMS' }]);
+        prisma.batch.findMany.mockResolvedValue([{ id: 'batch-A' }]);
       });
 
-      const rows = [
-        { ...dto, subject_id: 'subject-DBMS' },
-        { ...dto, subject_id: 'MISSING-SUBJECT' },
-      ];
+      it('a bad row never blocks the rest, with a specific message', async () => {
+        await service.bulkCreate(
+          [
+            { ...dto, subject_id: 'subject-DBMS' },
+            { ...dto, subject_id: 'MISSING-SUBJECT' },
+            { ...dto, student_id: 'MISSING-STUDENT', subject_id: 'subject-DBMS' },
+          ],
+          admin,
+        );
 
-      const job = await service.bulkCreate(rows, admin);
+        const { totalRows, successCount, failureCount, results } = jobResult();
+        expect([totalRows, successCount, failureCount]).toEqual([3, 1, 2]);
+        expect(results[0]).toEqual({ row: 1, status: 'SUCCESS', id: 'enr-1' });
+        expect(results[1]).toEqual({ row: 2, status: 'FAILURE', error: 'Subject not found' });
+        expect(results[2]).toEqual({ row: 3, status: 'FAILURE', error: 'Student not found' });
+      });
 
-      expect(job.id).toBe('job-1');
-      expect(captured.totalRows).toBe(2);
-      expect(captured.successCount).toBe(1);
-      expect(captured.failureCount).toBe(1);
-      expect(captured.results[0]).toEqual(expect.objectContaining({ row: 1, status: 'SUCCESS' }));
-      expect(captured.results[1]).toEqual(expect.objectContaining({ row: 2, status: 'FAILURE' }));
+      it('an existing enrollment fails that row, and a repeat inside the same request counts as already enrolled', async () => {
+        prisma.studentSubjectEnrollment.findMany.mockResolvedValue([
+          { studentId: 'student-1', subjectId: 'subject-DBMS', academicYear: '2026', semester: 1 },
+        ]);
+
+        await service.bulkCreate(
+          [
+            { ...dto, subject_id: 'subject-DBMS' }, // exists in DB
+            { ...dto, student_id: 'student-2', subject_id: 'subject-DBMS' }, // new
+            { ...dto, student_id: 'student-2', subject_id: 'subject-DBMS' }, // repeat of the new one
+          ],
+          admin,
+        );
+
+        const { results } = jobResult();
+        expect(results.map((r: any) => r.status)).toEqual(['FAILURE', 'SUCCESS', 'FAILURE']);
+        expect(results[0].error).toContain('already enrolled');
+        expect(results[2].error).toContain('already enrolled');
+      });
+
+      it('uses a FIXED number of queries for 50 rows: one duplicate lookup, one insert, one audit write', async () => {
+        const many = Array.from({ length: 50 }, (_, i) => ({ ...dto, semester: i + 1, subject_id: 'subject-DBMS' }));
+
+        await service.bulkCreate(many, admin);
+
+        expect(jobResult().successCount).toBe(50);
+        expect(prisma.studentSubjectEnrollment.findMany).toHaveBeenCalledTimes(1);
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(prisma.studentSubjectEnrollment.createManyAndReturn).toHaveBeenCalledTimes(1);
+        expect(auditHook.recordMany).toHaveBeenCalledTimes(1);
+        expect(auditHook.recordMany.mock.calls[0][0]).toHaveLength(50); // still one audit row per enrollment
+        // none of the old per-row calls
+        expect(prisma.studentSubjectEnrollment.create).not.toHaveBeenCalled();
+        expect(prisma.studentSubjectEnrollment.findUnique).not.toHaveBeenCalled();
+        expect(studentsService.findById).not.toHaveBeenCalled();
+        expect(auditHook.record).not.toHaveBeenCalled();
+      });
+
+      it('falls back to row-by-row when the batched insert fails (e.g. a concurrent duplicate), so only the offender fails', async () => {
+        prisma.studentSubjectEnrollment.createManyAndReturn.mockRejectedValue(new Error('unique violation'));
+        studentsService.findById.mockResolvedValue({});
+        subjectsService.findById.mockResolvedValue({});
+        batchesService.findById.mockResolvedValue({});
+        prisma.studentSubjectEnrollment.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'raced' });
+        prisma.studentSubjectEnrollment.create.mockResolvedValue({ id: 'enr-fallback' });
+
+        await service.bulkCreate(
+          [
+            { ...dto, subject_id: 'subject-DBMS' },
+            { ...dto, student_id: 'student-2', subject_id: 'subject-DBMS' },
+          ],
+          admin,
+        );
+
+        const { results } = jobResult();
+        expect(results[0]).toEqual({ row: 1, status: 'SUCCESS', id: 'enr-fallback' });
+        expect(results[1]).toEqual(expect.objectContaining({ row: 2, status: 'FAILURE', error: expect.stringContaining('already enrolled') }));
+      });
+    });
+
+    describe('bulk import (Excel)', () => {
+      const headers = ['roll_number', 'subject_code', 'academic_year', 'semester'];
+
+      beforeEach(() => {
+        prisma.student.findMany.mockResolvedValue([
+          { id: 'student-1', rollNumber: '1001', batchId: 'batch-A' },
+          { id: 'student-2', rollNumber: '1002', batchId: 'batch-B' },
+        ]);
+        prisma.subject.findMany.mockResolvedValue([{ id: 'subject-DBMS', code: 'UCS301' }]);
+      });
+
+      it('template has the four columns with a fixed example row', async () => {
+        const row = await readTemplateExampleRow(await service.generateBulkImportTemplate());
+        expect(Object.keys(row)).toEqual(headers);
+        expect(row.subject_code).toBe('UCS301');
+      });
+
+      it("enrolls a row using the student's current batch", async () => {
+        await service.bulkImport(await buildXlsxBuffer(headers, [['1002', 'UCS301', '2025-2026', 5]]), admin);
+
+        expect(prisma.studentSubjectEnrollment.createManyAndReturn).toHaveBeenCalledWith({
+          data: [{ studentId: 'student-2', subjectId: 'subject-DBMS', batchId: 'batch-B', academicYear: '2025-2026', semester: 5 }],
+        });
+        expect(jobResult()).toEqual(expect.objectContaining({ resourceType: 'enrollments', successCount: 1, failureCount: 0 }));
+      });
+
+      it('reports per-row failures without blocking good rows, with correct sheet row numbers', async () => {
+        await service.bulkImport(
+          await buildXlsxBuffer(headers, [
+            ['1001', 'UCS301', '2025-2026', 5], // row 2 ok
+            ['9999', 'UCS301', '2025-2026', 5], // row 3 unknown student
+            ['1001', 'NOPE', '2025-2026', 5], // row 4 unknown subject
+            ['1001', 'UCS301', '2025-2026', 'x'], // row 5 bad semester
+            ['1001', 'UCS301', '2025-2026', 0], // row 6 semester < 1
+            ['1001', 'UCS301', '', 5], // row 7 blank year
+          ]),
+          admin,
+        );
+
+        const { results, successCount, failureCount } = jobResult();
+        expect([successCount, failureCount]).toEqual([1, 5]);
+        expect(results[0]).toEqual({ row: 2, status: 'SUCCESS', id: 'enr-1' });
+        expect(results[1]).toEqual(expect.objectContaining({ row: 3, status: 'FAILURE', error: expect.stringContaining("'9999' not found") }));
+        expect(results[2]).toEqual(expect.objectContaining({ row: 4, error: expect.stringContaining("'NOPE' not found") }));
+        expect(results[3]).toEqual(expect.objectContaining({ row: 5, error: expect.stringContaining('semester') }));
+        expect(results[4]).toEqual(expect.objectContaining({ row: 6, error: expect.stringContaining('semester') }));
+        expect(results[5]).toEqual(expect.objectContaining({ row: 7, error: expect.stringContaining('academic_year') }));
+      });
+
+      it('treats an already-enrolled row as a per-row FAILURE', async () => {
+        prisma.studentSubjectEnrollment.findMany.mockResolvedValue([
+          { studentId: 'student-1', subjectId: 'subject-DBMS', academicYear: '2025-2026', semester: 5 },
+        ]);
+
+        await service.bulkImport(await buildXlsxBuffer(headers, [['1001', 'UCS301', '2025-2026', 5]]), admin);
+
+        expect(jobResult().results[0]).toEqual(
+          expect.objectContaining({ row: 2, status: 'FAILURE', error: expect.stringContaining('already enrolled') }),
+        );
+        expect(prisma.studentSubjectEnrollment.createManyAndReturn).not.toHaveBeenCalled();
+      });
+
+      it('rejects a file missing required columns outright', async () => {
+        const buffer = await buildXlsxBuffer(['roll_number', 'subject_code'], [['1001', 'UCS301']]);
+        await expect(service.bulkImport(buffer, admin)).rejects.toThrow('missing required column');
+        expect(importJobsService.create).not.toHaveBeenCalled();
+      });
     });
   });
 });

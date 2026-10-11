@@ -36,7 +36,7 @@ export default function FacultyQuizzesPage() {
     cursor: pager.cursor,
     limit: 25,
   });
-  const { data: subjectsData } = useSubjects({ limit: 200 });
+  const { data: subjectsData } = useSubjects({ all: true });
   const subjectById = new Map((subjectsData?.items ?? []).map((s) => [s.id, s]));
 
   const columns: DataTableColumn<Quiz>[] = [

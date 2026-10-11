@@ -222,7 +222,6 @@ export class FacultyService {
   }
 
   /** `GET /faculty/bulk-import/template` (ADMIN). */
-  /** Example row is a real existing faculty member (+ their department's real code) — see DepartmentsService.generateBulkImportTemplate's own comment for why. */
   async generateBulkImportTemplate(): Promise<Buffer> {
     return generateExcelTemplate({
       entityName: 'Faculty',

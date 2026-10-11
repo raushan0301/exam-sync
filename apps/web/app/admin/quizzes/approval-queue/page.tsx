@@ -15,8 +15,8 @@ import type { Quiz } from '@/lib/queries/types';
  */
 export default function ApprovalQueuePage() {
   const router = useRouter();
-  const { data, isLoading, isError, refetch, isFetching } = useQuizzes({ status: 'SUBMITTED', limit: 50 });
-  const { data: subjectsData } = useSubjects({ limit: 200 });
+  const { data, isLoading, isError, refetch, isFetching } = useQuizzes({ status: 'SUBMITTED', all: true });
+  const { data: subjectsData } = useSubjects({ all: true });
   const subjectById = new Map((subjectsData?.items ?? []).map((s) => [s.id, s]));
 
   const columns: DataTableColumn<Quiz>[] = [
