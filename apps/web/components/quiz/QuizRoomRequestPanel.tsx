@@ -1,8 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Card, Badge, Button, Alert, SkeletonText, ErrorState } from '@/components/ui';
+import { Card, Button, Alert, SkeletonText, ErrorState } from '@/components/ui';
 import { RoomPicker } from '@/components/rooms/RoomPicker';
+import { BackupLockChoice, EmptyColumnsQuestion, RoomSuggestionCards } from '@/components/rooms/RoomSuggestionCards';
+import type { EmptyColumnsAnswer, LocationChoice } from '@/components/rooms/RoomSuggestionCards';
 import { useQuizRoomSuggestions, useQuizRoomConflicts } from '@/lib/queries/useQuizRoomSuggestions';
 import { useRequestQuizRooms } from '@/lib/mutations/useQuizMutations';
 import { mapError } from '@/lib/error-mapping';
@@ -25,7 +27,12 @@ export interface QuizRoomRequestPanelProps {
  */
 export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
   const enabled = quiz.status === 'DRAFT' || quiz.status === 'REJECTED';
-  const suggestionsQuery = useQuizRoomSuggestions(quiz.id, enabled);
+  // Asked first: with empty columns only about half of each room's seats are usable, so the rooms suggested differ.
+  const [emptyColumns, setEmptyColumns] = useState<EmptyColumnsAnswer>(
+    quiz.emptyColumnsPlanned === true ? 'yes' : quiz.emptyColumnsPlanned === false ? 'no' : 'unset',
+  );
+  const [locationChoice, setLocationChoice] = useState<LocationChoice | null>(null);
+  const suggestionsQuery = useQuizRoomSuggestions(quiz.id, enabled && emptyColumns !== 'unset', emptyColumns === 'yes');
   // Same BR-019 student-schedule check the admin sees later at approval
   // time — surfaced here too so the faculty finds out about a real
   // conflict (another exam already booking these students at an
@@ -36,6 +43,7 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
   const [selectedStrategy, setSelectedStrategy] = useState<RoomSuggestionStrategy | null>(null);
   const [roomIds, setRoomIds] = useState<string[]>((quiz.requestedRoomIds ?? []));
   const [backupRoomId, setBackupRoomId] = useState<string>(quiz.backupRoomId ?? '');
+  const [backupLocked, setBackupLocked] = useState<boolean>(quiz.backupRoomLocked ?? false);
   const [dirty, setDirty] = useState(false);
 
   const hasExistingRequest = (quiz.requestedRoomIds ?? []).length > 0;
@@ -44,17 +52,35 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
     const first = suggestionsQuery.data.strategies.find((s) => s.roomCount > 0) ?? suggestionsQuery.data.strategies[0];
     if (first) {
       setSelectedStrategy(first.strategy);
-      setRoomIds(first.rooms.map((r) => r.roomId));
+      // Two ways to place the rooms: the person must choose — nothing is picked for them.
+      setLocationChoice(first.alternative ? null : 'together');
+      setRoomIds(first.alternative ? [] : first.rooms.map((r) => r.roomId));
     }
   }, [suggestionsQuery.data, dirty, hasExistingRequest]);
+
+  function applyRooms(rooms: { roomId: string }[]) {
+    setRoomIds(rooms.map((r) => r.roomId));
+    if (rooms.some((r) => r.roomId === backupRoomId)) {
+      setBackupRoomId('');
+    }
+  }
 
   function pickStrategy(result: RoomSuggestionResult) {
     setDirty(true);
     setSelectedStrategy(result.strategy);
-    setRoomIds(result.rooms.map((r) => r.roomId));
-    if (result.rooms.some((r) => r.roomId === backupRoomId)) {
-      setBackupRoomId('');
+    if (result.alternative) {
+      setLocationChoice(null);
+      setRoomIds([]);
+    } else {
+      setLocationChoice('together');
+      applyRooms(result.rooms);
     }
+  }
+
+  function chooseLocation(result: RoomSuggestionResult, choice: LocationChoice) {
+    setDirty(true);
+    setLocationChoice(choice);
+    applyRooms(choice === 'together' || !result.alternative ? result.rooms : result.alternative.rooms);
   }
 
   async function onSubmitRequest() {
@@ -62,6 +88,8 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
       await requestMutation.mutateAsync({
         room_ids: roomIds,
         backup_room_id: backupRoomId || undefined,
+        backup_locked: backupRoomId ? backupLocked : undefined,
+        empty_columns: emptyColumns === 'yes',
         strategy: selectedStrategy ?? undefined,
       });
       setDirty(false);
@@ -102,17 +130,36 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
     );
   }
 
+  const emptyColumnsQuestion = <EmptyColumnsQuestion name={`quiz-empty-columns-${quiz.id}`} value={emptyColumns} onChange={setEmptyColumns} />;
+
+  if (emptyColumns === 'unset') {
+    return (
+      <div className="flex flex-col gap-3">
+        {studentConflictBanner}
+        {emptyColumnsQuestion}
+      </div>
+    );
+  }
+
   if (suggestionsQuery.isLoading) {
     return (
-      <Card padding="dense">
-        <SkeletonText lines={4} />
-      </Card>
+      <div className="flex flex-col gap-3">
+        {emptyColumnsQuestion}
+        <Card padding="dense">
+          <SkeletonText lines={4} />
+        </Card>
+      </div>
     );
   }
 
   if (suggestionsQuery.isError) {
     const mapped = mapError(suggestionsQuery.error);
-    return <ErrorState title="Couldn't load room suggestions" description={mapped.description} onRetry={() => suggestionsQuery.refetch()} />;
+    return (
+      <div className="flex flex-col gap-3">
+        {emptyColumnsQuestion}
+        <ErrorState title="Couldn't load room suggestions" description={mapped.description} onRetry={() => suggestionsQuery.refetch()} />
+      </div>
+    );
   }
 
   const data = suggestionsQuery.data;
@@ -123,6 +170,7 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
   return (
     <div className="flex flex-col gap-4">
       {studentConflictBanner}
+      {emptyColumnsQuestion}
 
       <p className="text-sm text-text-muted">
         {data.totalStudents} expected student{data.totalStudents === 1 ? '' : 's'} · {data.availableRoomCount} room
@@ -141,17 +189,14 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
         </Alert>
       )}
 
-      <div className="grid gap-3 sm:grid-cols-3">
-        {data.strategies.map((s) => (
-          <StrategyCard
-            key={s.strategy}
-            result={s}
-            totalStudents={data.totalStudents}
-            selected={selectedStrategy === s.strategy}
-            onSelect={() => pickStrategy(s)}
-          />
-        ))}
-      </div>
+      <RoomSuggestionCards
+        strategies={data.strategies}
+        totalStudents={data.totalStudents}
+        selectedStrategy={selectedStrategy}
+        locationChoice={locationChoice}
+        onPickStrategy={pickStrategy}
+        onChooseLocation={chooseLocation}
+      />
 
       <RoomPicker
         allRooms={data.allRooms}
@@ -168,6 +213,17 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
         }}
       />
 
+      {backupRoomId && (
+        <BackupLockChoice
+          name={`quiz-backup-lock-${quiz.id}`}
+          value={backupLocked}
+          onChange={(next) => {
+            setDirty(true);
+            setBackupLocked(next);
+          }}
+        />
+      )}
+
       {requestMutation.isError && (
         <Alert color="danger" title="Couldn't submit room request">
           {mapError(requestMutation.error).description}
@@ -180,55 +236,5 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
         </Button>
       </div>
     </div>
-  );
-}
-
-function StrategyCard({
-  result,
-  totalStudents,
-  selected,
-  onSelect,
-}: {
-  result: RoomSuggestionResult;
-  totalStudents: number;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const covers = result.totalCapacity >= totalStudents;
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`flex flex-col gap-2 rounded border p-3 text-left transition-colors ${
-        selected ? 'border-primary-600 bg-primary-50' : 'border-border hover:border-border-strong'
-      }`}
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-semibold text-text">{result.label}</span>
-        {selected && <Badge color="success">Selected</Badge>}
-      </div>
-      <p className="text-xs text-text-muted">{result.description}</p>
-      <div className="flex flex-col gap-1">
-        <div className="flex justify-between text-xs text-text-muted">
-          <span>{result.roomCount} class{result.roomCount === 1 ? '' : 'es'}</span>
-          <span>{result.utilizationPercent}% filled</span>
-        </div>
-        <div className="h-2 w-full overflow-hidden rounded-full bg-surface-muted">
-          <div
-            className={`h-full rounded-full ${covers ? 'bg-primary-600' : 'bg-danger-600'}`}
-            style={{ width: `${Math.min(100, result.utilizationPercent)}%` }}
-          />
-        </div>
-        {!covers && <p className="text-xs text-danger-text">Falls short — only {result.totalCapacity} of {totalStudents} seats.</p>}
-      </div>
-      <ul className="flex flex-col gap-0.5 text-xs text-text-muted">
-        {result.rooms.slice(0, 4).map((r) => (
-          <li key={r.roomId}>
-            {r.building} {r.roomNumber} — {r.allocated}/{r.capacity}
-          </li>
-        ))}
-        {result.rooms.length > 4 && <li>+ {result.rooms.length - 4} more</li>}
-      </ul>
-    </button>
   );
 }

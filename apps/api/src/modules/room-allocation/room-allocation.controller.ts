@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { RoomAllocationService } from './room-allocation.service';
 import { RoomSuggestionService } from './room-suggestion.service';
 import { AllocateRoomsDto } from './dto/allocate-rooms.dto';
@@ -23,8 +23,12 @@ export class RoomAllocationController {
   /** FACULTY only, ownership-gated — three algorithm previews (fewest rooms / sequential / balanced spread) sized against real room capacity + live availability. */
   @Roles(ROLE.FACULTY)
   @Get(':id/rooms/suggest')
-  suggest(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {
-    return this.roomSuggestionService.suggest(id, actor);
+  suggest(
+    @Param('id') id: string,
+    @Query('empty_columns') emptyColumns: string | undefined,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.roomSuggestionService.suggest(id, actor, emptyColumns === 'true');
   }
 
   /** FACULTY only, ownership-gated — submits the faculty's chosen room set + optional backup room for admin review. */

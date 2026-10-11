@@ -27,8 +27,9 @@ export interface PackPlacement {
  *     in each room, using largest remainders so the counts add up exactly and no room overflows.
  *
  * Deterministic. Throws if the seats cannot cover the students (the caller checks capacity first).
+ * `options.useAllRooms` skips step 1 and spreads over every room given.
  */
-export function packMixed(groups: PackGroup[], rooms: PackRoom[]): PackPlacement[] {
+export function packMixed(groups: PackGroup[], rooms: PackRoom[], options: { useAllRooms?: boolean } = {}): PackPlacement[] {
   const total = groups.reduce((sum, g) => sum + g.count, 0);
   const usable = rooms.filter((r) => r.capacity > 0);
   const byCapacity = usable
@@ -36,10 +37,12 @@ export function packMixed(groups: PackGroup[], rooms: PackRoom[]): PackPlacement
     .sort((a, b) => b.room.capacity - a.room.capacity || a.order - b.order)
     .map((x) => x.room);
 
+  // Normally as few rooms as possible; `useAllRooms` keeps every given room in play (rooms that already exist must not be
+  // dropped when more rooms are added), each loaded in proportion to its size.
   const chosen: PackRoom[] = [];
   let seats = 0;
-  for (const room of byCapacity) {
-    if (seats >= total) break;
+  for (const room of options.useAllRooms ? usable : byCapacity) {
+    if (!options.useAllRooms && seats >= total) break;
     chosen.push(room);
     seats += room.capacity;
   }

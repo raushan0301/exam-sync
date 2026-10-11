@@ -38,6 +38,10 @@ export interface Quiz {
   /** Faculty's preliminary room request (RoomSuggestionService.suggestForQuiz), shown to admin as a conflict preview during approval. */
   requestedRoomIds: string[];
   backupRoomId: string | null;
+  /** Lock the backup room's seats too once the quiz is approved (the faculty picks; the admin may change it at approval). */
+  backupRoomLocked?: boolean;
+  /** Answer to "leave every second seat column empty?" given when rooms were requested; null = not asked. */
+  emptyColumnsPlanned?: boolean | null;
   roomAllocationStrategy: string | null;
   /** Set when an ADMIN adjusts this room request (swap, backup removed) while reviewing — shown back to the faculty. Cleared on the faculty's own next request. */
   roomAdjustmentNote: string | null;
@@ -63,8 +67,20 @@ export interface QuizAllocatedRoom {
   allocatedCapacity: number;
 }
 
-/** GET /quizzes/{id} response shape — same fields as Quiz, plus the active exam session (with its finally-allocated rooms, once any exist). */
+/** Seats held for an approved quiz until its rooms are allocated to a session. */
+export interface QuizRoomHold {
+  roomId: string;
+  kind: 'MAIN' | 'BACKUP';
+  seatsHeld: number;
+  holdDate: string;
+  startTime: string;
+  endTime: string;
+}
+
+/** GET /quizzes/{id} response shape — same fields as Quiz, plus the active exam session (with its finally-allocated rooms, once any exist) and the seats held for it. */
 export interface QuizDetail extends Quiz {
+  /** Active holds only — empty once the rooms are allocated, released, or the window has passed. */
+  roomHolds?: QuizRoomHold[];
   examSession: { id: string; status: ExamSessionStatus; rooms: QuizAllocatedRoom[] } | null;
 }
 
@@ -289,6 +305,8 @@ export interface ExamSession {
   roomAllocationStrategy: string | null;
   /** Set when an admin sends a room request back for changes; cleared on the next request/allocate. */
   roomRejectionReason: string | null;
+  /** The "leave every second seat column empty?" answer given with the room request — pre-selected at seating time; null = not asked. */
+  emptyColumnsPlanned?: boolean | null;
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -361,7 +379,20 @@ export interface SuggestedRoom {
   allocated: number;
 }
 
-export type RoomSuggestionStrategy = 'FEWEST_ROOMS' | 'SEQUENTIAL' | 'BALANCED_SPREAD';
+/** SEQUENTIAL was retired; a request saved earlier may still carry it, so labels handle it, but it is never offered. */
+export type RoomSuggestionStrategy = 'FEWEST_ROOMS' | 'BALANCED_SPREAD';
+
+export interface RoomSuggestionAlternative {
+  label: string;
+  description: string;
+  roomCount: number;
+  totalCapacity: number;
+  utilizationPercent: number;
+  rooms: SuggestedRoom[];
+  /** "Building B · floors 0–1" */
+  location: string;
+  spansBuildings: boolean;
+}
 
 export interface RoomSuggestionResult {
   strategy: RoomSuggestionStrategy;
@@ -371,6 +402,11 @@ export interface RoomSuggestionResult {
   totalCapacity: number;
   utilizationPercent: number;
   rooms: SuggestedRoom[];
+  /** Where these rooms are — "Building B · floors 0–1". Default plan: one building if it fits, floor by floor from the ground up. */
+  location: string;
+  spansBuildings: boolean;
+  /** Present only when fewer rooms are possible by giving up "stay together" — the person is asked which they prefer. */
+  alternative?: RoomSuggestionAlternative;
 }
 
 export interface AvailableRoomOption {
@@ -383,6 +419,8 @@ export interface AvailableRoomOption {
 
 export interface RoomSuggestionResponse {
   totalStudents: number;
+  /** True when room sizes count only usable seats (every second column left empty). */
+  emptyColumns: boolean;
   shortfall: boolean;
   availableRoomCount: number;
   strategies: RoomSuggestionResult[];
@@ -787,3 +825,77 @@ export interface AuditLogEntry {
   createdAt: string;
 }
 
+
+// -- "Request more rooms" during seating ----------------------------------
+
+export type RoomRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
+export type RoomRequestTrigger = 'TOO_MANY_STUDENTS' | 'NO_ROOM_FOR_EMPTY_COLUMNS' | 'OTHER';
+
+export interface RequestedRoomView {
+  roomId: string;
+  label: string;
+  capacity: number;
+  /** Seats still free for this session in the exam window. */
+  freeSeats: number;
+  available: boolean;
+  reason?: string;
+}
+
+export interface SessionRoomView {
+  roomId: string;
+  label: string;
+  allocated: number;
+  /** Seating finalized — students were told their seats, so this room is never touched by a re-split. */
+  finalized: boolean;
+}
+
+export interface RoomRequest {
+  id: string;
+  examSessionId: string;
+  requestedByFacultyId: string;
+  reason: string;
+  trigger: RoomRequestTrigger;
+  status: RoomRequestStatus;
+  previousStatus: ExamSessionStatus;
+  emptyColumns: boolean | null;
+  requestedRoomIds: string[];
+  approvedRoomIds: string[];
+  reviewedByAdminId: string | null;
+  reviewNote: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  examSessionName: string;
+  examSessionDate: string;
+  examSessionStartTime: string;
+  examSessionEndTime: string;
+  examSessionStatus: string;
+  facultyName: string;
+  facultyEmployeeCode: string;
+  requestedRooms: RequestedRoomView[];
+  approvedRoomLabels: string[];
+  currentRooms: SessionRoomView[];
+  studentsToPlace: number;
+}
+
+/** `GET /room-requests/{id}` — the request plus the free rooms an admin could swap in. */
+export interface RoomRequestDetail extends RoomRequest {
+  options: AvailableRoomOption[];
+}
+
+/** `GET /exam-sessions/{id}/rooms/extra` — everything the "Request more rooms" dialog needs. */
+export interface ExtraRoomsState {
+  canRequest: boolean;
+  blockedReason: string | null;
+  pending: RoomRequest | null;
+  latestRejected: RoomRequest | null;
+  studentsToPlace: number;
+  fullSeats: number;
+  usableSeats: number;
+  emptyColumns: boolean;
+  seatsNeeded: number;
+  trigger: RoomRequestTrigger;
+  rooms: SessionRoomView[];
+  suggestion: { rooms: SuggestedRoom[]; location: string; spansBuildings: boolean };
+  allRooms: AvailableRoomOption[];
+}

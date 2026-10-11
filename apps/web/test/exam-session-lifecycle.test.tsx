@@ -10,6 +10,7 @@ import {
   setMockExamSessionConflictResult,
   setMockExamSessionRescheduleConflict,
   setMockQuizzes,
+  setMockQuizRoomHolds,
   setMockSubjects,
   VALID_ACCESS_TOKEN,
   VALID_REFRESH_TOKEN,
@@ -120,6 +121,73 @@ describe('New Exam Session', () => {
     await waitFor(() => expect(push).toHaveBeenCalled());
     const [destination] = push.mock.calls[0] as [string];
     expect(destination).toMatch(/^\/faculty\/exam-sessions\/.+/);
+  });
+
+  describe('held rooms vs the approved date and time', () => {
+    const HELD = { 'quiz-1': [{ roomId: 'room-a', kind: 'MAIN' as const, seatsHeld: 60, holdDate: '2026-02-01', startTime: '1970-01-01T10:00:00.000Z', endTime: '1970-01-01T11:00:00.000Z' }] };
+
+    it('asks first when the session is created for a DIFFERENT date or time than the quiz\'s held rooms — and what will happen', async () => {
+      signInAsAdmin();
+      setMockExamSessions([]);
+      setMockQuizzes([makeQuiz({ preferredTime: '1970-01-01T10:00:00.000Z' })]);
+      setMockQuizRoomHolds(HELD);
+      push.mockClear();
+
+      renderWithProviders(<NewExamSessionPage />);
+      await userEvent.click(await screen.findByRole('radio'));
+      await userEvent.clear(screen.getByLabelText(/date/i));
+      await userEvent.type(screen.getByLabelText(/date/i), '2026-04-01');
+      await userEvent.click(screen.getByRole('button', { name: /create.*attach quiz/i }));
+
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByText('Different date or time — held rooms will be released')).toBeInTheDocument();
+      expect(within(dialog).getByText(/held for 2026-02-01, 10:00–11:00/)).toBeInTheDocument();
+      expect(within(dialog).getByText(/checked again for the new time/i)).toBeInTheDocument();
+      expect(within(dialog).getByText(/request rooms again and an admin must approve/i)).toBeInTheDocument();
+      expect(push).not.toHaveBeenCalled(); // nothing is created until they confirm
+
+      await userEvent.click(within(dialog).getByRole('button', { name: /release rooms and continue/i }));
+      await waitFor(() => expect(push).toHaveBeenCalled());
+      setMockQuizRoomHolds({});
+    });
+
+    it('"Keep the approved time" closes the dialog and creates nothing', async () => {
+      signInAsAdmin();
+      setMockExamSessions([]);
+      setMockQuizzes([makeQuiz({ preferredTime: '1970-01-01T10:00:00.000Z' })]);
+      setMockQuizRoomHolds(HELD);
+      push.mockClear();
+
+      renderWithProviders(<NewExamSessionPage />);
+      await userEvent.click(await screen.findByRole('radio'));
+      await userEvent.clear(screen.getByLabelText(/date/i));
+      await userEvent.type(screen.getByLabelText(/date/i), '2026-04-01');
+      await userEvent.click(screen.getByRole('button', { name: /create.*attach quiz/i }));
+
+      await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /keep the approved time/i }));
+
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      expect(push).not.toHaveBeenCalled();
+      setMockQuizRoomHolds({});
+    });
+
+    it('does not ask when the session is at exactly the approved date and time', async () => {
+      signInAsAdmin();
+      setMockExamSessions([]);
+      setMockQuizzes([makeQuiz({ preferredTime: '1970-01-01T10:00:00.000Z' })]);
+      setMockQuizRoomHolds(HELD);
+      push.mockClear();
+
+      renderWithProviders(<NewExamSessionPage />);
+      await userEvent.click(await screen.findByRole('radio')); // the form is pre-filled from the quiz's slot
+      await screen.findByDisplayValue('2026-02-01');
+      await waitFor(() => expect(screen.getByRole('button', { name: /create.*attach quiz/i })).toBeEnabled());
+      await userEvent.click(screen.getByRole('button', { name: /create.*attach quiz/i }));
+
+      await waitFor(() => expect(push).toHaveBeenCalled());
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      setMockQuizRoomHolds({});
+    });
   });
 
   it('excludes an already-scheduled quiz from the picker and lists it under "Already scheduled" instead', async () => {

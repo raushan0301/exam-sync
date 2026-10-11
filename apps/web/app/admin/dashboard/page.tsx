@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { ClipboardList, AlertTriangle, PauseCircle } from 'lucide-react';
+import { ClipboardList, AlertTriangle, PauseCircle, DoorOpen } from 'lucide-react';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { KpiTile, KpiTileSkeleton } from '@/components/dashboard/KpiTile';
 import { StatusBreakdown } from '@/components/dashboard/StatusBreakdown';
@@ -11,6 +11,7 @@ import { ErrorState } from '@/components/ui/ErrorState';
 import { useQuizzes } from '@/lib/queries/useQuizzes';
 import { useIncidents } from '@/lib/queries/useIncidents';
 import { useSuspensionRequests } from '@/lib/queries/useSuspensionRequests';
+import { useRoomRequests } from '@/lib/queries/useRoomRequests';
 import { mapError } from '@/lib/error-mapping';
 
 const SEVERITY_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const;
@@ -30,6 +31,7 @@ export default function AdminDashboardPage() {
   const pendingQuizzes = useQuizzes({ status: 'SUBMITTED', all: true });
   const openIncidents = useIncidents({ status: 'OPEN', all: true });
   const pendingSuspensions = useSuspensionRequests({ status: 'PENDING', all: true });
+  const pendingRoomRequests = useRoomRequests({ status: 'PENDING', all: true });
 
   const pendingCount = pendingQuizzes.data?.items.length ?? 0;
 
@@ -112,6 +114,29 @@ export default function AdminDashboardPage() {
               icon={<PauseCircle size={18} />}
               tone={(pendingSuspensions.data?.items.length ?? 0) > 0 ? 'warning' : 'success'}
               description={(pendingSuspensions.data?.items.length ?? 0) > 0 ? 'Awaiting your decision' : 'Nothing waiting on you'}
+            />
+          </Link>
+        )}
+
+        {pendingRoomRequests.isLoading ? (
+          <KpiTileSkeleton />
+        ) : pendingRoomRequests.isError ? (
+          <Card padding="dense">
+            <ErrorState
+              title="Couldn't load room requests"
+              description={mapError(pendingRoomRequests.error).description}
+              onRetry={() => pendingRoomRequests.refetch()}
+              retrying={pendingRoomRequests.isFetching}
+            />
+          </Card>
+        ) : (
+          <Link href="/admin/room-requests" className="block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
+            <KpiTile
+              label="Room Requests"
+              value={pendingRoomRequests.data?.items.length ?? 0}
+              icon={<DoorOpen size={18} />}
+              tone={(pendingRoomRequests.data?.items.length ?? 0) > 0 ? 'warning' : 'success'}
+              description={(pendingRoomRequests.data?.items.length ?? 0) > 0 ? 'Faculty asking for more rooms' : 'Nothing waiting on you'}
             />
           </Link>
         )}

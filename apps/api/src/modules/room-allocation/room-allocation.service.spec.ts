@@ -7,6 +7,8 @@ import { RoomsService } from '../rooms';
 import { QuizzesService, QuizOwnershipService } from '../quiz';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
+import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
 
 function buildPrismaMock() {
   const tx = {
@@ -15,12 +17,17 @@ function buildPrismaMock() {
     examSessionRoomQuiz: { create: jest.fn() },
     examSession: { update: jest.fn() },
     roomSeat: { groupBy: jest.fn() },
+    quiz: { findMany: jest.fn().mockResolvedValue([]) },
+    room: { findMany: jest.fn().mockResolvedValue([]) },
+    user: { findMany: jest.fn().mockResolvedValue([]) },
+    faculty: { findMany: jest.fn().mockResolvedValue([]) },
   };
   return {
     quizStudentAssignment: { groupBy: jest.fn() },
     room: { findMany: jest.fn() },
     quiz: { update: jest.fn().mockImplementation((args: any) => Promise.resolve({ id: args.where.id, ...args.data })) },
     examSessionQuiz: { findMany: jest.fn(), findFirst: jest.fn() },
+    examSessionRoomRequest: { findFirst: jest.fn().mockResolvedValue(null) },
     $transaction: jest.fn((cb: any) => cb(tx)),
     __tx: tx,
   } as any;
@@ -54,6 +61,8 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
   let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let quizzesService: { findById: jest.Mock };
   let quizOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
+  let roomHolds: { heldSeatsByRoom: jest.Mock; consumeForQuizzes: jest.Mock; roomIssues: jest.Mock };
+  let notificationsOutbox: { queue: jest.Mock };
   let service: RoomAllocationService;
 
   beforeEach(() => {
@@ -68,6 +77,12 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
     examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
     quizzesService = { findById: jest.fn() };
     quizOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
+    roomHolds = {
+      heldSeatsByRoom: jest.fn().mockResolvedValue(new Map()),
+      consumeForQuizzes: jest.fn(),
+      roomIssues: jest.fn().mockResolvedValue([]),
+    };
+    notificationsOutbox = { queue: jest.fn() };
 
     service = new RoomAllocationService(
       prisma,
@@ -78,6 +93,8 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
       examSessionOwnershipService as unknown as ExamSessionOwnershipService,
       quizzesService as unknown as QuizzesService,
       quizOwnershipService as unknown as QuizOwnershipService,
+      roomHolds as unknown as RoomHoldsService,
+      notificationsOutbox as unknown as NotificationsOutboxService,
     );
   });
 
@@ -270,6 +287,114 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
     });
   });
 
+  describe('room holds — seat-based holds from quiz approval', () => {
+    const readySession = () => {
+      examSessionsService.findById.mockResolvedValue(draftLikeSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftLikeSession, status: ExamSessionStatus.SEATING_GENERATION, version: 2 });
+    };
+
+    it('turns the session\'s quizzes\' holds into the real allocation (CONSUMED) in the same transaction', async () => {
+      readySession();
+      mockGroups([{ quizId: 'quiz-a', count: 10 }, { quizId: 'quiz-b', count: 5 }]);
+      mockLockedRooms(['room-1']);
+      mockSeatCounts({ 'room-1': 100 });
+
+      await service.allocate('s1', { room_ids: ['room-1'] }, admin);
+
+      expect(roomHolds.consumeForQuizzes).toHaveBeenCalledWith(prisma.__tx, ['quiz-a', 'quiz-b']);
+    });
+
+    it('counts seats other quizzes hold as unavailable — they are excluded from this session\'s capacity', async () => {
+      readySession();
+      mockGroups([{ quizId: 'quiz-a', count: 30 }]);
+      mockLockedRooms(['room-1']);
+      mockSeatCounts({ 'room-1': 40 });
+      roomHolds.heldSeatsByRoom.mockResolvedValue(new Map([['room-1', 20]])); // another quiz holds 20 of the 40 seats
+
+      await expect(service.allocate('s1', { room_ids: ['room-1'] }, admin)).rejects.toThrow(ConflictException);
+      expect(roomHolds.heldSeatsByRoom).toHaveBeenCalledWith(
+        prisma.__tx,
+        ['room-1'],
+        { date: draftLikeSession.sessionDate, start: draftLikeSession.startTime, end: draftLikeSession.endTime },
+        ['quiz-a'], // this session's own quiz is excluded from "held by others"
+      );
+    });
+
+    it('uses the empty-columns answer given at request time as the session\'s seating default (any yes wins)', async () => {
+      readySession();
+      mockGroups([{ quizId: 'quiz-a', count: 10 }, { quizId: 'quiz-b', count: 5 }]);
+      mockLockedRooms(['room-1']);
+      mockSeatCounts({ 'room-1': 100 });
+      prisma.__tx.quiz.findMany.mockResolvedValue([{ emptyColumnsPlanned: false }, { emptyColumnsPlanned: true }]);
+
+      await service.allocate('s1', { room_ids: ['room-1'] }, admin);
+
+      expect(prisma.__tx.examSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ emptyColumnsPlanned: true }) }),
+      );
+    });
+  });
+
+  describe('allocatePreApproved — a gone main room is replaced by the quiz\'s backup room', () => {
+    const session = { ...draftLikeSession, id: 's1', name: 'Finals', status: ExamSessionStatus.ASSIGNING_STUDENTS };
+    const quizWith = (over: object = {}) => ({
+      id: 'quiz-a',
+      title: 'DBMS',
+      createdByFacultyId: 'fac-1',
+      requestedRoomIds: ['room-main'],
+      backupRoomId: 'room-backup',
+      ...over,
+    });
+
+    beforeEach(() => {
+      examSessionsService.findById.mockResolvedValue(session);
+      prisma.examSessionQuiz.findMany.mockResolvedValue([{ quiz: quizWith() }]);
+      mockGroups([{ quizId: 'quiz-a', count: 10 }]);
+      mockSeatCounts({ 'room-main': 40, 'room-backup': 40 });
+      prisma.__tx.examSession.update.mockResolvedValue({ ...session, status: ExamSessionStatus.SEATING_GENERATION, version: 2 });
+    });
+
+    it('allocates the held rooms untouched when they are all fine', async () => {
+      roomHolds.roomIssues.mockResolvedValue([]);
+      mockLockedRooms(['room-main']);
+
+      await service.allocatePreApproved('s1', admin);
+
+      expect(prisma.__tx.examSessionRoom.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ roomId: 'room-main' }) }));
+      expect(notificationsOutbox.queue).not.toHaveBeenCalled();
+    });
+
+    it('swaps in the backup when the main room is unavailable, and tells the faculty and every admin', async () => {
+      roomHolds.roomIssues.mockImplementation((_c: unknown, ids: string[]) =>
+        Promise.resolve(ids.includes('room-main') ? [{ roomId: 'room-main', message: 'blocked' }] : []),
+      );
+      mockLockedRooms(['room-backup']);
+      prisma.__tx.room.findMany.mockResolvedValue([
+        { id: 'room-main', building: 'B', roomNumber: '105' },
+        { id: 'room-backup', building: 'B', roomNumber: '204' },
+      ]);
+      prisma.__tx.user.findMany.mockResolvedValue([{ id: 'admin-1' }]);
+      prisma.__tx.faculty.findMany.mockResolvedValue([{ id: 'fac-1', userId: 'user-fac-1' }]);
+
+      await service.allocatePreApproved('s1', admin);
+
+      expect(prisma.__tx.examSessionRoom.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ roomId: 'room-backup' }) }));
+      const sent = notificationsOutbox.queue.mock.calls.map((c: any[]) => c[1]);
+      expect(sent).toHaveLength(2);
+      expect(sent.map((n: any) => n.recipientId).sort()).toEqual(['admin-1', 'user-fac-1']);
+      expect(sent[0]).toMatchObject({ eventType: 'BACKUP_ROOM_USED', payload: { unavailable_room: 'B-105', backup_room: 'B-204', session_name: 'Finals' } });
+    });
+
+    it('does not swap when the backup is gone too — allocation fails with the clear conflict', async () => {
+      roomHolds.roomIssues.mockResolvedValue([{ roomId: 'room-main', message: 'blocked' }, { roomId: 'room-backup', message: 'blocked' }]);
+      mockLockedRooms(['room-main']);
+      conflictEngine.checkRoomAllocation.mockResolvedValue({ hard: [{ type: 'ROOM_UNAVAILABLE', roomId: 'room-main', message: 'blocked' }], warnings: [] });
+
+      await expect(service.allocatePreApproved('s1', admin)).rejects.toThrow(ConflictException);
+      expect(notificationsOutbox.queue).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Best-Fit Decreasing packing (ARCHITECTURE.md §S)', () => {
     it('places a single group that fits entirely in one room, choosing the tightest (best) fit among candidates', async () => {
       examSessionsService.findById.mockResolvedValue(draftLikeSession);
@@ -374,6 +499,7 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
           requestedRoomIds: [],
           backupRoomId: null,
           roomRejectionReason: null,
+          emptyColumnsPlanned: null,
           version: { increment: 1 },
         },
       });
@@ -620,7 +746,7 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
       expect(quizOwnershipService.isOwnerOrCoInstructor).not.toHaveBeenCalled();
       expect(prisma.quiz.update).toHaveBeenCalledWith({
         where: { id: 'q1' },
-        data: { requestedRoomIds: ['room-2'], backupRoomId: null, roomAllocationStrategy: null, roomAdjustmentNote: null },
+        data: { requestedRoomIds: ['room-2'], backupRoomId: null, backupRoomLocked: false, roomAllocationStrategy: null, roomAdjustmentNote: null },
       });
     });
 
@@ -635,6 +761,7 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
         data: {
           requestedRoomIds: ['room-2'],
           backupRoomId: null,
+          backupRoomLocked: false,
           roomAllocationStrategy: null,
           roomAdjustmentNote: 'Backup room removed — it was double-booked.',
         },

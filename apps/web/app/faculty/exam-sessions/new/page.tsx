@@ -6,11 +6,11 @@ import { useForm, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import Link from 'next/link';
-import { Card, Input, DateInput, TimeInput, FormField, Button, Alert, Radio, RadioGroup, StatusBadge, EmptyState, LoadingState } from '@/components/ui';
+import { Card, Input, DateInput, TimeInput, FormField, Button, Alert, ConfirmationDialog, Radio, RadioGroup, StatusBadge, EmptyState, LoadingState } from '@/components/ui';
 import { mapError } from '@/lib/error-mapping';
 import { useCreateExamSession } from '@/lib/mutations/useExamSessionMutations';
 import { apiFetch } from '@/lib/api-client';
-import { useQuizzes } from '@/lib/queries/useQuizzes';
+import { useQuiz, useQuizzes } from '@/lib/queries/useQuizzes';
 import { formatTime } from '@/lib/format-time';
 import type { ExamSessionDetail } from '@/lib/queries/types';
 
@@ -49,6 +49,9 @@ export default function NewExamSessionPage() {
   const approvedQuizzesQuery = useQuizzes({ status: 'APPROVED', all: true });
   const [selectedQuizId, setSelectedQuizId] = useState('');
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // Held rooms are tied to the quiz's approved date and time — creating the session for another slot releases them, so say so first.
+  const [pendingValues, setPendingValues] = useState<CreateExamSessionFormValues | null>(null);
+  const quizDetailQuery = useQuiz(selectedQuizId || undefined);
 
   const allQuizzes = approvedQuizzesQuery.data?.items ?? [];
   // A quiz already actively attached to a session can't be picked again —
@@ -86,7 +89,34 @@ export default function NewExamSessionPage() {
     });
   }
 
+  const holds = quizDetailQuery.data?.roomHolds ?? [];
+  const approvedSlot =
+    selectedQuiz?.preferredDate && selectedQuiz.preferredTime
+      ? {
+          date: selectedQuiz.preferredDate.slice(0, 10),
+          start: selectedQuiz.preferredTime.slice(11, 16),
+          end: addMinutesHHMM(selectedQuiz.preferredTime.slice(11, 16), selectedQuiz.durationMinutes ?? 120),
+        }
+      : null;
+
+  function differsFromApprovedSlot(values: CreateExamSessionFormValues): boolean {
+    if (holds.length === 0 || !approvedSlot) return false;
+    return (
+      values.session_date !== approvedSlot.date ||
+      values.start_time.slice(0, 5) !== approvedSlot.start ||
+      values.end_time.slice(0, 5) !== approvedSlot.end
+    );
+  }
+
   async function onSubmit(values: CreateExamSessionFormValues) {
+    if (differsFromApprovedSlot(values)) {
+      setPendingValues(values); // ask first — see the dialog below
+      return;
+    }
+    await createSession(values);
+  }
+
+  async function createSession(values: CreateExamSessionFormValues) {
     setSubmitError(null);
     try {
       const session = await createMutation.mutateAsync(values);
@@ -181,6 +211,23 @@ export default function NewExamSessionPage() {
           </FormProvider>
         </Card>
       )}
+
+      <ConfirmationDialog
+        open={pendingValues !== null}
+        onOpenChange={(next) => {
+          if (!next) setPendingValues(null);
+        }}
+        title="Different date or time — held rooms will be released"
+        description={`The rooms approved for this quiz are held for ${approvedSlot?.date ?? ''}, ${approvedSlot?.start ?? ''}–${approvedSlot?.end ?? ''}. You are creating the session for a different date or time, so: the held rooms will be released (you will be notified); their availability is checked again for the new time when you request or allocate rooms; and if a room is not free then, you will need to request rooms again and an admin must approve them.`}
+        confirmLabel="Release rooms and continue"
+        cancelLabel="Keep the approved time"
+        loading={createMutation.isPending}
+        onConfirm={async () => {
+          const values = pendingValues;
+          setPendingValues(null);
+          if (values) await createSession(values);
+        }}
+      />
 
       {scheduledQuizzes.length > 0 && (
         <Card header={<h2 className="text-sm font-semibold text-text">Already scheduled</h2>}>

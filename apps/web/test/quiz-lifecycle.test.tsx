@@ -8,6 +8,9 @@ import { renderWithProviders } from './utils/renderWithProviders';
 import {
   API_BASE_URL,
   setMockQuizzes,
+  setMockRoomSuggestionAlternative,
+  setMockQuizRoomHolds,
+  getLastQuizRoomRequestBody,
   setMockQuizApprovalHistory,
   setMockSubjects,
   setMockBatches,
@@ -301,10 +304,56 @@ describe('Quiz-stage room suggestion', () => {
     renderWithProviders(<QuizDetailView quizId="q-rooms" role="FACULTY" />);
 
     await screen.findByText('Midterm');
+    // The empty-column question comes first; no rooms are suggested until it is answered.
+    expect(screen.queryByText(/Fewest Classes/i)).not.toBeInTheDocument();
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
     await screen.findByText(/Fewest Classes/i);
+    expect(screen.queryByText(/Sequential/i)).not.toBeInTheDocument(); // retired
     await userEvent.click(screen.getByRole('button', { name: /save room request/i }));
 
     await waitFor(() => expect(screen.getByText(/room request saved/i)).toBeInTheDocument());
+  });
+
+  it('with empty columns the rooms are sized by usable seats and the question is shown again on every change', async () => {
+    signInAsAdmin();
+    seedSubjectAndBatch();
+    setMockQuizzes([makeQuiz({ id: 'q-rooms-cols', status: 'DRAFT' })]);
+    setMockQuizApprovalHistory([]);
+    setMockRooms([ROOM_A]);
+    renderWithProviders(<QuizDetailView quizId="q-rooms-cols" role="FACULTY" />);
+
+    await screen.findByText('Midterm');
+    await userEvent.click(await screen.findByLabelText(/yes — leave every second column empty/i));
+
+    await screen.findByText(/Fewest Classes/i);
+    expect(screen.getByLabelText(/yes — leave every second column empty/i)).toBeChecked();
+  });
+
+  it('when fewer rooms are possible by leaving the building, it asks — nothing is chosen for the faculty', async () => {
+    setMockRoomSuggestionAlternative(true);
+    try {
+      signInAsAdmin();
+      seedSubjectAndBatch();
+      setMockQuizzes([makeQuiz({ id: 'q-rooms-choice', status: 'DRAFT' })]);
+      setMockQuizApprovalHistory([]);
+      setMockRooms([ROOM_A, { ...ROOM_A, id: 'room-b', roomNumber: '102' }]);
+      renderWithProviders(<QuizDetailView quizId="q-rooms-choice" role="FACULTY" />);
+
+      await screen.findByText('Midterm');
+      await userEvent.click(await screen.findByLabelText(/no — use every column/i));
+
+      const choice = await screen.findByTestId('location-choice');
+      expect(within(choice).getByText(/which do you prefer/i)).toBeInTheDocument();
+      expect(within(choice).getByText(/stay together/i)).toBeInTheDocument();
+      expect(within(choice).getByText(/fewest rooms overall/i)).toBeInTheDocument();
+      expect(within(choice).getByText(/choose one to continue/i)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /save room request/i })).toBeDisabled(); // no rooms picked yet
+
+      await userEvent.click(within(choice).getByLabelText(/stay together/i));
+      expect(screen.getByRole('button', { name: /save room request/i })).toBeEnabled();
+    } finally {
+      setMockRoomSuggestionAlternative(false);
+    }
   });
 
   it('faculty sees a student-schedule conflict banner on a DRAFT quiz, before ever submitting it', async () => {
@@ -347,6 +396,66 @@ describe('Quiz-stage room suggestion', () => {
     await screen.findByText('Midterm');
     expect(await screen.findByText(/Room 101/i)).toBeInTheDocument();
     expect(screen.getByText('Available')).toBeInTheDocument();
+  });
+
+  describe('backup room lock and held seats', () => {
+    const ROOM_B = { id: 'room-b', building: 'A', floor: 1, roomNumber: '102', capacity: 100, rows: 10, columns: 10, status: 'ACTIVE' as const, accessibilityInfo: null, createdAt: NOW, updatedAt: NOW };
+
+    it('faculty chooses whether the backup room is locked too, with each option explained, and the choice is sent', async () => {
+      signInAsAdmin();
+      seedSubjectAndBatch();
+      setMockQuizzes([makeQuiz({ id: 'q-lock', status: 'DRAFT', requestedRoomIds: ['room-a'], backupRoomId: 'room-b' })]);
+      setMockQuizApprovalHistory([]);
+      setMockRooms([ROOM_A, ROOM_B]);
+      renderWithProviders(<QuizDetailView quizId="q-lock" role="FACULTY" />);
+
+      await screen.findByText('Midterm');
+      await userEvent.click(await screen.findByLabelText(/no — use every column/i));
+      const choice = await screen.findByTestId('backup-lock-choice');
+      expect(within(choice).getByText(/no other quiz can use those seats until your rooms are allocated/i)).toBeInTheDocument();
+      expect(within(choice).getByText(/other quizzes may book the backup first/i)).toBeInTheDocument();
+
+      await userEvent.click(within(choice).getByLabelText(/lock it too/i));
+      await userEvent.click(screen.getByRole('button', { name: /update room request/i }));
+
+      await waitFor(() => expect(getLastQuizRoomRequestBody()).toMatchObject({ backup_room_id: 'room-b', backup_locked: true, empty_columns: false }));
+    });
+
+    it('admin sees what approving will hold, can change the backup lock, and sees the held seats once approved', async () => {
+      signInAsAdmin();
+      seedSubjectAndBatch();
+      setMockQuizzes([makeQuiz({ id: 'q-adm-lock', status: 'SUBMITTED', version: 2, requestedRoomIds: ['room-a'], backupRoomId: 'room-b', roomAllocationStrategy: 'FEWEST_ROOMS' })]);
+      setMockQuizApprovalHistory([]);
+      setMockRooms([ROOM_A, ROOM_B]);
+      setMockRoomAllocationConflict(false);
+      renderWithProviders(<QuizDetailView quizId="q-adm-lock" role="ADMIN" />);
+
+      await screen.findByText('Midterm');
+      expect(await screen.findByText(/Approving holds these rooms/i)).toBeInTheDocument();
+      await userEvent.click(within(await screen.findByTestId('backup-lock-choice')).getByLabelText(/lock it too/i));
+      await waitFor(() => expect(getLastQuizRoomRequestBody()).toMatchObject({ backup_room_id: 'room-b', backup_locked: true }));
+    });
+
+    it('once approved, shows which seats are held in which rooms', async () => {
+      signInAsAdmin();
+      seedSubjectAndBatch();
+      setMockQuizzes([makeQuiz({ id: 'q-held', status: 'APPROVED', version: 3, requestedRoomIds: ['room-a'], backupRoomId: 'room-b', backupRoomLocked: true })]);
+      setMockQuizApprovalHistory([]);
+      setMockRooms([ROOM_A, ROOM_B]);
+      setMockQuizRoomHolds({
+        'q-held': [
+          { roomId: 'room-a', kind: 'MAIN', seatsHeld: 30, holdDate: '2026-02-01', startTime: '1970-01-01T09:00:00.000Z', endTime: '1970-01-01T10:00:00.000Z' },
+          { roomId: 'room-b', kind: 'BACKUP', seatsHeld: 30, holdDate: '2026-02-01', startTime: '1970-01-01T09:00:00.000Z', endTime: '1970-01-01T10:00:00.000Z' },
+        ],
+      });
+      renderWithProviders(<QuizDetailView quizId="q-held" role="ADMIN" />);
+
+      await screen.findByText('Midterm');
+      const alert = await screen.findByText(/Seats are held for this quiz/i);
+      expect(alert.closest('div')).toHaveTextContent('30 seats');
+      expect(alert.closest('div')).toHaveTextContent('(backup)');
+      setMockQuizRoomHolds({});
+    });
   });
 
   it('admin can swap in an alternative room when the requested one is unavailable', async () => {

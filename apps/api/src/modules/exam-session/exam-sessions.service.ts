@@ -14,6 +14,7 @@ import { runSerializable } from '../../common/prisma/serializable-transaction';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
+import { RoomHoldsService, sameWindow } from '../../common/room-holds/room-holds.service';
 import {
   PaginatedResult,
   PaginationParams,
@@ -68,6 +69,7 @@ export class ExamSessionsService {
     private readonly examSessionOwnershipService: ExamSessionOwnershipService,
     private readonly quizOwnershipService: QuizOwnershipService,
     private readonly facultyService: FacultyService,
+    private readonly roomHolds: RoomHoldsService,
   ) {}
 
   /**
@@ -465,6 +467,16 @@ export class ExamSessionsService {
         }
       }
 
+      // A quiz approved for one slot but attached to a session at another no longer matches the rooms held for it:
+      // release those holds (the faculty is told) — availability is checked again when rooms are requested for the session.
+      const sessionSlot = { date: session.sessionDate, start: session.startTime, end: session.endTime };
+      const mismatched: string[] = [];
+      for (const quizId of quizzesToActuallyAdd) {
+        const [hold] = await this.roomHolds.activeHoldsForQuiz(tx, quizId);
+        if (hold && !sameWindow({ date: hold.holdDate, start: hold.startTime, end: hold.endTime }, sessionSlot)) mismatched.push(quizId);
+      }
+      await this.roomHolds.releaseForQuizzes(tx, mismatched, 'TIME_CHANGED', { notify: true });
+
       const updatedSession = await tx.examSession.update({
         where: { id },
         data: { version: { increment: 1 } },
@@ -657,6 +669,19 @@ export class ExamSessionsService {
     }
 
     const updated = await this.prisma.$transaction(async (tx) => {
+      // Cancelling frees everything the session held — including seats still held for its quizzes (not yet allocated).
+      const attachedQuizIds = (
+        await tx.examSessionQuiz.findMany({ where: { examSessionId: id, isActiveAttachment: true }, select: { quizId: true } })
+      ).map((a) => a.quizId);
+      await this.roomHolds.releaseForQuizzes(tx, attachedQuizIds, 'SESSION_CANCELLED', { notify: false });
+
+      // A "more rooms" request still waiting is withdrawn with the session, and the rooms it had locked are freed.
+      const waiting = await tx.examSessionRoomRequest.findMany({ where: { examSessionId: id, status: 'PENDING' }, select: { id: true } });
+      for (const request of waiting) await this.roomHolds.releaseForRequest(tx, request.id, 'SESSION_CANCELLED');
+      if (waiting.length > 0) {
+        await tx.examSessionRoomRequest.updateMany({ where: { id: { in: waiting.map((r) => r.id) } }, data: { status: 'CANCELLED' } });
+      }
+
       await tx.examSessionQuiz.updateMany({
         where: { examSessionId: id, isActiveAttachment: true },
         data: { isActiveAttachment: false, detachedAt: new Date() },

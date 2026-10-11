@@ -62,6 +62,7 @@ export const ADMIN_NAV: NavEntry[] = [
   // sessions" list instead of the old create form.
   { label: 'Exam Sessions', href: '/admin/exam-sessions' },
   { label: 'Suspension Requests', href: '/admin/suspension-requests' },
+  { label: 'Room Requests', href: '/admin/room-requests' },
   { label: 'Rooms', href: '/admin/rooms' },
   { label: 'Incidents', href: '/admin/incidents' },
   { label: 'Reports', href: '/admin/reports' },

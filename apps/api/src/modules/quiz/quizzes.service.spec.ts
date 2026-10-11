@@ -16,6 +16,7 @@ import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
 import { EnrollmentsService } from '../enrollment';
+import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
 
 function buildPrismaMock() {
   const tx = {
@@ -48,6 +49,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
   let approvalHistoryService: { record: jest.Mock; listForQuiz: jest.Mock };
   let notificationsOutbox: { queue: jest.Mock };
   let enrollmentsService: { findEligibleStudentIds: jest.Mock };
+  let roomHolds: { placeForApprovedQuiz: jest.Mock; activeHoldsForQuiz: jest.Mock };
   let service: QuizzesService;
 
   const createDto = {
@@ -73,6 +75,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
     approvalHistoryService = { record: jest.fn(), listForQuiz: jest.fn() };
     notificationsOutbox = { queue: jest.fn() };
     enrollmentsService = { findEligibleStudentIds: jest.fn() };
+    roomHolds = { placeForApprovedQuiz: jest.fn().mockResolvedValue([]), activeHoldsForQuiz: jest.fn().mockResolvedValue([]) };
     prisma.quizBatch.findMany.mockResolvedValue([]); // default; overridden per-test where batch ids matter
     facultyService.findById.mockResolvedValue({ id: 'faculty-1', userId: 'user-faculty-1' });
 
@@ -88,6 +91,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       approvalHistoryService as unknown as QuizApprovalHistoryService,
       notificationsOutbox as unknown as NotificationsOutboxService,
       enrollmentsService as unknown as EnrollmentsService,
+      roomHolds as unknown as RoomHoldsService,
     );
   });
 
@@ -199,7 +203,7 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       accessRepository.findScoped.mockResolvedValue({ id: 'q1' });
       prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
 
-      await expect(service.findByIdScoped('q1', facultyActor)).resolves.toEqual({ id: 'q1', examSession: null });
+      await expect(service.findByIdScoped('q1', facultyActor)).resolves.toEqual({ id: 'q1', examSession: null, roomHolds: [] });
       expect(accessRepository.findScoped).toHaveBeenCalledWith('q1', facultyActor);
     });
 
@@ -222,6 +226,24 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
         status: 'SEATING_GENERATION',
         rooms: [{ id: 'room-1', building: 'A', floor: 1, roomNumber: '101', capacity: 40, allocatedCapacity: 30 }],
       });
+    });
+
+    it('lists the seats currently held for the quiz (main rooms and a locked backup)', async () => {
+      accessRepository.findScoped.mockResolvedValue({ id: 'q1' });
+      prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
+      const date = new Date('2027-03-01');
+      const time = new Date('1970-01-01T09:00:00Z');
+      roomHolds.activeHoldsForQuiz.mockResolvedValue([
+        { id: 'h1', roomId: 'room-1', kind: 'MAIN', seatsHeld: 30, holdDate: date, startTime: time, endTime: time, status: 'ACTIVE' },
+        { id: 'h2', roomId: 'room-2', kind: 'BACKUP', seatsHeld: 30, holdDate: date, startTime: time, endTime: time, status: 'ACTIVE' },
+      ]);
+
+      const result = await service.findByIdScoped('q1', facultyActor);
+
+      expect(result.roomHolds).toEqual([
+        { roomId: 'room-1', kind: 'MAIN', seatsHeld: 30, holdDate: date, startTime: time, endTime: time },
+        { roomId: 'room-2', kind: 'BACKUP', seatsHeld: 30, holdDate: date, startTime: time, endTime: time },
+      ]);
     });
   });
 
@@ -552,6 +574,28 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
         expect.objectContaining({ entityType: 'Quiz', action: 'UPDATE' }),
         expect.anything(),
       );
+    });
+
+    it('holds the requested rooms\' seats in the SAME transaction as the approval', async () => {
+      prisma.quiz.findUnique.mockResolvedValue(submittedQuiz);
+      facultyService.findByUserId.mockResolvedValue(null);
+      const approved = { ...submittedQuiz, status: QuizStatus.APPROVED, version: 6 };
+      prisma.__tx.quiz.update.mockResolvedValue(approved);
+
+      await service.approve('q1', 5, adminActor);
+
+      expect(roomHolds.placeForApprovedQuiz).toHaveBeenCalledWith(prisma.__tx, approved);
+    });
+
+    it('rolls the whole approval back (no history, no notification) when the seats cannot be held', async () => {
+      prisma.quiz.findUnique.mockResolvedValue(submittedQuiz);
+      facultyService.findByUserId.mockResolvedValue(null);
+      prisma.__tx.quiz.update.mockResolvedValue({ ...submittedQuiz, status: QuizStatus.APPROVED, version: 6 });
+      roomHolds.placeForApprovedQuiz.mockRejectedValue(new ConflictException('Only 10 free seats'));
+
+      await expect(service.approve('q1', 5, adminActor)).rejects.toThrow(ConflictException);
+      expect(approvalHistoryService.record).not.toHaveBeenCalled();
+      expect(notificationsOutbox.queue).not.toHaveBeenCalled();
     });
   });
 

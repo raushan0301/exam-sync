@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { RoomAllocationService } from './room-allocation.service';
 import { RoomSuggestionService } from './room-suggestion.service';
 import { RequestRoomsDto } from './dto/request-rooms.dto';
@@ -25,8 +25,12 @@ export class QuizRoomRequestController {
   /** FACULTY only, ownership-gated — DRAFT/REJECTED quizzes only. */
   @Roles(ROLE.FACULTY)
   @Get(':id/rooms/suggest')
-  suggest(@Param('id') id: string, @CurrentUser() actor: AuthenticatedUser) {
-    return this.roomSuggestionService.suggestForQuiz(id, actor);
+  suggest(
+    @Param('id') id: string,
+    @Query('empty_columns') emptyColumns: string | undefined,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.roomSuggestionService.suggestForQuiz(id, actor, emptyColumns === 'true');
   }
 
   /** FACULTY (ownership-gated, DRAFT/REJECTED) or ADMIN (unscoped, additionally while SUBMITTED — swapping an unavailable room during review) — saves the chosen room set + optional backup room onto the quiz. */

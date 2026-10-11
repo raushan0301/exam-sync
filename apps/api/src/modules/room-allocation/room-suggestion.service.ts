@@ -5,12 +5,15 @@ import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService } from '../conflict-engine';
 import { RoomsService } from '../rooms';
+import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
+import { fewestRoomsPlan, PoolRoom, RoomPlan, spreadEvenly, togetherPlan } from './room-suggestion-planner';
 import { QuizzesService, QuizOwnershipService } from '../quiz';
 
 /** Never a real exam_session id — passed as the `examSessionId` a conflict check excludes, so a quiz-stage check (no real session yet) excludes nothing and compares against every booking. */
 const NIL_EXAM_SESSION_ID = '00000000-0000-0000-0000-000000000000';
 
-export type RoomSuggestionStrategy = 'FEWEST_ROOMS' | 'SEQUENTIAL' | 'BALANCED_SPREAD';
+/** SEQUENTIAL was retired (the building/floor rule now applies to every strategy); old saved requests may still carry it. */
+export type RoomSuggestionStrategy = 'FEWEST_ROOMS' | 'BALANCED_SPREAD';
 
 export interface SuggestedRoom {
   roomId: string;
@@ -29,6 +32,25 @@ export interface RoomSuggestionResult {
   totalCapacity: number;
   utilizationPercent: number;
   rooms: SuggestedRoom[];
+  /** "Building B · floors 0–1" — where these rooms are. */
+  location: string;
+  spansBuildings: boolean;
+  /**
+   * Present ONLY when fewer rooms are possible by giving up "stay in one building, floor by floor":
+   * the person is asked which they prefer. Absent means staying together costs nothing extra.
+   */
+  alternative?: RoomSuggestionAlternative;
+}
+
+export interface RoomSuggestionAlternative {
+  label: string;
+  description: string;
+  roomCount: number;
+  totalCapacity: number;
+  utilizationPercent: number;
+  rooms: SuggestedRoom[];
+  location: string;
+  spansBuildings: boolean;
 }
 
 export interface AvailableRoomOption {
@@ -41,6 +63,8 @@ export interface AvailableRoomOption {
 
 export interface RoomSuggestionResponse {
   totalStudents: number;
+  /** True when room sizes count only the usable seats (every second column left empty). */
+  emptyColumns: boolean;
   /** True when even every available room together can't seat totalStudents — no strategy below can fully satisfy the request. */
   shortfall: boolean;
   availableRoomCount: number;
@@ -71,9 +95,10 @@ export class RoomSuggestionService {
     private readonly roomsService: RoomsService,
     private readonly quizzesService: QuizzesService,
     private readonly quizOwnershipService: QuizOwnershipService,
+    private readonly roomHolds: RoomHoldsService,
   ) {}
 
-  async suggest(examSessionId: string, actor: AuthenticatedUser): Promise<RoomSuggestionResponse> {
+  async suggest(examSessionId: string, actor: AuthenticatedUser, emptyColumns = false): Promise<RoomSuggestionResponse> {
     const session = await this.examSessionsService.findById(examSessionId);
     if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
       throw new NotFoundException();
@@ -94,7 +119,10 @@ export class RoomSuggestionService {
       throw new ConflictException('This session has no ASSIGNED students to size room suggestions for.');
     }
 
-    return this.buildResponse(totalStudents, session.sessionDate, session.startTime, session.endTime, examSessionId);
+    const attachedQuizIds = (
+      await this.prisma.examSessionQuiz.findMany({ where: { examSessionId, isActiveAttachment: true }, select: { quizId: true } })
+    ).map((a) => a.quizId);
+    return this.buildResponse(totalStudents, session.sessionDate, session.startTime, session.endTime, examSessionId, emptyColumns, attachedQuizIds);
   }
 
   /**
@@ -107,7 +135,7 @@ export class RoomSuggestionService {
    * exam-session-stage suggestion faculty will see again later once real
    * students are ASSIGNED.
    */
-  async suggestForQuiz(quizId: string, actor: AuthenticatedUser): Promise<RoomSuggestionResponse> {
+  async suggestForQuiz(quizId: string, actor: AuthenticatedUser, emptyColumns = false): Promise<RoomSuggestionResponse> {
     const quiz = await this.quizzesService.findById(quizId);
     if (!(await this.quizOwnershipService.isOwnerOrCoInstructor(quiz, actor))) {
       throw new NotFoundException();
@@ -124,26 +152,30 @@ export class RoomSuggestionService {
       throw new ConflictException('Set preferred_date and preferred_time on the quiz before requesting room suggestions.');
     }
 
-    return this.buildResponse(quiz.studentCount, quiz.preferredDate, quiz.preferredTime, addMinutes(quiz.preferredTime, quiz.durationMinutes ?? 120), NIL_EXAM_SESSION_ID);
+    return this.buildResponse(quiz.studentCount, quiz.preferredDate, quiz.preferredTime, addMinutes(quiz.preferredTime, quiz.durationMinutes ?? 120), NIL_EXAM_SESSION_ID, emptyColumns, [quiz.id]);
   }
 
-  private async buildResponse(
-    totalStudents: number,
+  /**
+   * Rooms free for a window, each with the seats still free in it: active, not blocked, not booked by another session,
+   * counting only usable seats (kept columns when empty columns are planned) minus seats other quizzes hold. Shared by the
+   * suggestions and by the "more rooms" request, so both see the same availability.
+   */
+  async availablePool(
     sessionDate: Date,
     startTime: Date,
     endTime: Date,
     excludeExamSessionId: string,
-  ): Promise<RoomSuggestionResponse> {
+    emptyColumns: boolean,
+    ownQuizIds: string[],
+  ): Promise<PoolRoom[]> {
     const candidates = await this.roomsService.findAvailable({
       date: sessionDate.toISOString().slice(0, 10),
       start_time: startTime.toISOString().slice(11, 16),
       end_time: endTime.toISOString().slice(11, 16),
     });
 
-    // findAvailable only checks room.status + room_availability blocks —
-    // it does NOT check exam_session_rooms bookings (see its own doc
-    // comment). Re-check every candidate against real bookings via the
-    // same Conflict Engine `allocate` itself uses, so a room already
+    // findAvailable only checks room.status + room_availability blocks (it does NOT check exam_session_rooms bookings).
+    // Re-check every candidate against real bookings via the same Conflict Engine `allocate` itself uses, so a room already
     // allocated to another overlapping session is never "suggested".
     const conflictResult = await this.conflictEngine.checkRoomAllocation({
       examSessionId: excludeExamSessionId,
@@ -155,14 +187,36 @@ export class RoomSuggestionService {
     const conflictingRoomIds = new Set(conflictResult.hard.map((d) => d.roomId).filter(Boolean));
     const available = candidates.filter((r) => !conflictingRoomIds.has(r.id));
 
-    const seatCounts = await this.getActiveSeatCounts(available.map((r) => r.id));
-    const pool = available.map((r) => ({
-      roomId: r.id,
-      building: r.building,
-      floor: r.floor,
-      roomNumber: r.roomNumber,
-      capacity: seatCounts.get(r.id) ?? 0,
-    }));
+    const seatCounts = await this.roomHolds.usableSeatCounts(this.prisma, available.map((r) => r.id), emptyColumns);
+    // Seats other quizzes already hold (for an overlapping time) are not free to suggest.
+    const heldByOthers = await this.roomHolds.heldSeatsByRoom(
+      this.prisma,
+      available.map((r) => r.id),
+      { date: sessionDate, start: startTime, end: endTime },
+      ownQuizIds,
+    );
+    return available
+      .map((r) => ({
+        roomId: r.id,
+        building: r.building,
+        floor: r.floor,
+        roomNumber: r.roomNumber,
+        capacity: Math.max(0, (seatCounts.get(r.id) ?? 0) - (heldByOthers.get(r.id) ?? 0)),
+      }))
+      .filter((r) => r.capacity > 0);
+  }
+
+  private async buildResponse(
+    totalStudents: number,
+    sessionDate: Date,
+    startTime: Date,
+    endTime: Date,
+    excludeExamSessionId: string,
+    emptyColumns: boolean,
+    /** Quizzes whose held seats still count as free here: the quiz being planned, or the quizzes attached to this session. */
+    ownQuizIds: string[],
+  ): Promise<RoomSuggestionResponse> {
+    const pool = await this.availablePool(sessionDate, startTime, endTime, excludeExamSessionId, emptyColumns, ownQuizIds);
 
     const totalAvailableCapacity = pool.reduce((sum, r) => sum + r.capacity, 0);
     const shortfall = totalAvailableCapacity < totalStudents;
@@ -173,146 +227,81 @@ export class RoomSuggestionService {
 
     return {
       totalStudents,
+      emptyColumns,
       shortfall,
       availableRoomCount: pool.length,
-      strategies: [
-        this.fewestRooms(pool, totalStudents),
-        this.sequential(pool, totalStudents),
-        this.balancedSpread(pool, totalStudents),
-      ],
+      strategies: [this.fewestRooms(pool, totalStudents), this.balancedSpread(pool, totalStudents)],
       allRooms,
     };
   }
 
-  private async getActiveSeatCounts(roomIds: string[]): Promise<Map<string, number>> {
-    if (roomIds.length === 0) return new Map();
-    const grouped = await this.prisma.roomSeat.groupBy({
-      by: ['roomId'],
-      where: { roomId: { in: roomIds }, isActive: true },
-      _count: { id: true },
-    });
-    const counts = new Map<string, number>(roomIds.map((id) => [id, 0]));
-    for (const g of grouped) counts.set(g.roomId, g._count.id);
-    return counts;
-  }
-
-  private summarize(
-    strategy: RoomSuggestionStrategy,
-    label: string,
-    description: string,
-    rooms: SuggestedRoom[],
-  ): RoomSuggestionResult {
-    const totalCapacity = rooms.reduce((sum, r) => sum + r.capacity, 0);
-    const totalAllocated = rooms.reduce((sum, r) => sum + r.allocated, 0);
+  /** Common summary numbers for a plan, shared by the main result and its alternative. */
+  private figures(plan: RoomPlan) {
+    const totalCapacity = plan.rooms.reduce((sum, r) => sum + r.capacity, 0);
+    const totalAllocated = plan.rooms.reduce((sum, r) => sum + r.allocated, 0);
     return {
-      strategy,
-      label,
-      description,
-      roomCount: rooms.length,
+      roomCount: plan.rooms.length,
       totalCapacity,
       utilizationPercent: totalCapacity === 0 ? 0 : Math.round((totalAllocated / totalCapacity) * 100),
-      rooms,
+      rooms: plan.rooms.map((r) => ({
+        roomId: r.roomId,
+        building: r.building,
+        floor: r.floor,
+        roomNumber: r.roomNumber,
+        capacity: r.capacity,
+        allocated: r.allocated,
+      })),
+      location: plan.location,
+      spansBuildings: plan.spansBuildings,
     };
   }
 
-  /** Fewest classes possible: largest-capacity rooms first, fill each to capacity, stop as soon as enough seats exist. */
-  private fewestRooms(
-    pool: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[],
-    totalStudents: number,
-  ): RoomSuggestionResult {
-    const sorted = [...pool].sort((a, b) => b.capacity - a.capacity);
-    const rooms = this.greedyFill(sorted, totalStudents, 'MAX_FILL');
-    return this.summarize(
-      'FEWEST_ROOMS',
-      'Fewest Classes',
-      'Uses the largest available rooms first, filling each one before moving to the next. Minimizes how many classrooms you need, but packs students in tightly.',
-      rooms,
-    );
+  /** The alternative is offered only when it needs FEWER rooms than staying together. */
+  private alternativeFor(
+    together: RoomPlan,
+    fewest: RoomPlan,
+    label: string,
+    description: string,
+  ): RoomSuggestionAlternative | undefined {
+    if (fewest.rooms.length === 0 || fewest.rooms.length >= together.rooms.length) return undefined;
+    return { label, description, ...this.figures(fewest) };
   }
 
-  /** Adjacent/contiguous rooms: building then room-number order, fill each to capacity — easier for students/invigilators to find. */
-  private sequential(
-    pool: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[],
-    totalStudents: number,
-  ): RoomSuggestionResult {
-    const sorted = [...pool].sort(
-      (a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }),
-    );
-    const rooms = this.greedyFill(sorted, totalStudents, 'MAX_FILL');
-    return this.summarize(
-      'SEQUENTIAL',
-      'Sequential (Adjacent Rooms)',
-      'Picks rooms in building/floor/room-number order, so the chosen classes are next to each other — easier for students to find and for invigilators to cover. May use more rooms than the fewest-classes option.',
-      rooms,
-    );
+  /** Fewest classes while staying together: one building if it fits, floors filled from the ground up. */
+  private fewestRooms(pool: PoolRoom[], totalStudents: number): RoomSuggestionResult {
+    const together = togetherPlan(pool, totalStudents);
+    return {
+      strategy: 'FEWEST_ROOMS',
+      label: 'Fewest Classes',
+      description:
+        'Stays in one building if it fits and fills each floor, ground first, before using the next — filling each room before moving on. Packs students in tightly.',
+      ...this.figures(together),
+      alternative: this.alternativeFor(
+        together,
+        fewestRoomsPlan(pool, totalStudents),
+        'Fewest rooms overall',
+        'Uses the largest rooms wherever they are — fewer rooms, but they may be in different buildings or floors.',
+      ),
+    };
   }
 
-  /** Anti-cheating friendly: fewest rooms that fit, but spread students evenly rather than filling each to the brim. */
-  private balancedSpread(
-    pool: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[],
-    totalStudents: number,
-  ): RoomSuggestionResult {
-    const sorted = [...pool].sort((a, b) => b.capacity - a.capacity);
-    const minimalSet = this.greedyFill(sorted, totalStudents, 'MAX_FILL');
-    if (minimalSet.length === 0) {
-      return this.summarize(
-        'BALANCED_SPREAD',
-        'Balanced Spread',
-        'Uses the same minimal set of rooms as "Fewest Classes" but spreads students evenly across them instead of filling each to the brim — leaves more empty seats between students in every room, reducing the opportunity to copy from a neighbor.',
-        [],
-      );
-    }
-    // Redistribute the same total evenly across the same room set,
-    // capped at each room's own capacity (a room can never hold more
-    // than it physically has).
-    let remaining = totalStudents;
-    const withShare = minimalSet.map((r) => ({ ...r, share: 0 }));
-    // Simple even split with remainder handed out one at a time, largest-capacity room first.
-    const base = Math.floor(totalStudents / withShare.length);
-    for (const r of withShare) {
-      r.share = Math.min(base, r.capacity);
-      remaining -= r.share;
-    }
-    for (const r of withShare) {
-      if (remaining <= 0) break;
-      const room = r.capacity > r.share ? r : null;
-      if (room) {
-        const add = Math.min(remaining, room.capacity - room.share);
-        room.share += add;
-        remaining -= add;
-      }
-    }
-    const rooms = withShare.map((r) => ({
-      roomId: r.roomId,
-      building: r.building,
-      floor: r.floor,
-      roomNumber: r.roomNumber,
-      capacity: r.capacity,
-      allocated: r.share,
-    }));
-    return this.summarize(
-      'BALANCED_SPREAD',
-      'Balanced Spread',
-      'Uses the same minimal set of rooms as "Fewest Classes" but spreads students evenly across them instead of filling each to the brim — leaves more empty seats between students in every room, reducing the opportunity to copy from a neighbor.',
-      rooms,
-    );
-  }
-
-  private greedyFill(
-    sorted: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[],
-    totalStudents: number,
-    _mode: 'MAX_FILL',
-  ): SuggestedRoom[] {
-    const rooms: SuggestedRoom[] = [];
-    let remaining = totalStudents;
-    for (const r of sorted) {
-      if (remaining <= 0) break;
-      if (r.capacity <= 0) continue;
-      const allocated = Math.min(remaining, r.capacity);
-      rooms.push({ roomId: r.roomId, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated });
-      remaining -= allocated;
-    }
-    return rooms;
+  /** Same rooms as "Fewest Classes" but students spread evenly rather than filling each to the brim — more empty seats in every room. */
+  private balancedSpread(pool: PoolRoom[], totalStudents: number): RoomSuggestionResult {
+    const together = spreadEvenly(togetherPlan(pool, totalStudents), totalStudents);
+    const fewest = spreadEvenly(fewestRoomsPlan(pool, totalStudents), totalStudents);
+    return {
+      strategy: 'BALANCED_SPREAD',
+      label: 'Balanced Spread',
+      description:
+        'Uses the same rooms as "Fewest Classes" (one building, floor by floor) but spreads students evenly across them instead of filling each to the brim — more empty seats between students, so less chance to copy from a neighbour.',
+      ...this.figures(together),
+      alternative: this.alternativeFor(
+        together,
+        fewest,
+        'Fewest rooms overall',
+        'Spreads students evenly over the fewest possible rooms, wherever they are — fewer rooms, but they may be in different buildings or floors.',
+      ),
+    };
   }
 }
 

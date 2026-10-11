@@ -128,6 +128,51 @@ export function describeNotification(eventType: string, payload: Record<string, 
         body: `You have been assigned as ${role} for ${quoted(str(p.session_name))}${room ? ` in room ${room}` : ''}${when}.`,
       };
     }
+    case 'ROOM_HOLD_RELEASED': {
+      const date = str(p.hold_date);
+      const start = str(p.start_time).slice(0, 5);
+      const reason =
+        p.reason === 'SESSION_CANCELLED'
+          ? 'the exam session was cancelled'
+          : p.reason === 'TIME_CHANGED'
+            ? 'the exam session was created for a different date or time'
+            : 'they are no longer needed';
+      return {
+        title: 'Held rooms released',
+        body: `The rooms held for ${quoted(str(p.quiz_title))}${date ? ` on ${formatDate(date)}${start ? ` at ${start}` : ''}` : ''} were released because ${reason}. Room availability is checked again when you request rooms.`,
+      };
+    }
+    case 'BACKUP_ROOM_USED': {
+      const gone = str(p.unavailable_room);
+      const session = str(p.session_name);
+      return {
+        title: 'Backup room used',
+        body: `${gone ? `Room ${gone} was unavailable` : 'A held room was unavailable'}${session ? ` for ${quoted(session)}` : ''}, so the backup room ${str(p.backup_room)} was used instead.`,
+      };
+    }
+    case 'ROOM_REQUEST_SUBMITTED': {
+      const count = Number(p.room_count) || 0;
+      const reason = str(p.reason);
+      return {
+        title: 'More rooms requested',
+        body: `${str(p.faculty_name) || 'A faculty member'} asked for ${count > 0 ? `${count} more room${count === 1 ? '' : 's'}` : 'more rooms'} for ${quoted(str(p.session_name))} during seating.${reason ? ` Reason: ${reason}` : ''} Review it under Room Requests.`,
+      };
+    }
+    case 'ROOM_REQUEST_APPROVED': {
+      const rooms = str(p.rooms);
+      const note = str(p.note);
+      return {
+        title: 'More rooms approved',
+        body: `Your request for more rooms for ${quoted(str(p.session_name))} was approved${rooms ? `: ${rooms} added` : ''}. Students in rooms that are not finalized were re-split — generate seating for those rooms again.${note ? ` Admin note: ${note}` : ''}`,
+      };
+    }
+    case 'ROOM_REQUEST_REJECTED': {
+      const note = str(p.note);
+      return {
+        title: 'More rooms declined',
+        body: `Your request for more rooms for ${quoted(str(p.session_name))} was declined${note ? `: ${note}` : '.'} Seating continues as before.`,
+      };
+    }
     case 'INVIGILATOR_REMOVED': {
       const room = str(p.room_label);
       const reason = str(p.reason);

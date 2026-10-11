@@ -23,9 +23,12 @@ export interface TimeInputProps {
 const HOURS_12 = Array.from({ length: 12 }, (_, i) => i + 1); // 1..12
 const MINUTES = Array.from({ length: 60 }, (_, i) => i); // 0..59
 
+/** What an unchosen part falls back to the moment the user picks any one part (9:00 AM). */
+const DEFAULT_PARTS = { hour12: 9, minute: 0, period: 'AM' } as const;
+
 function parse(value: string): { hour12: number; minute: number; period: 'AM' | 'PM' } {
   const match = value.match(/^(\d{1,2}):(\d{2})/);
-  if (!match) return { hour12: 9, minute: 0, period: 'AM' };
+  if (!match) return { ...DEFAULT_PARTS };
   const hour24 = Number(match[1]);
   const minute = Number(match[2]);
   const period: 'AM' | 'PM' = hour24 >= 12 ? 'PM' : 'AM';
@@ -56,6 +59,8 @@ export function TimeInput({ id, label, ariaLabel, description, error, required, 
   const autoId = useId();
   const fieldId = id ?? autoId;
   const { hour12, minute, period } = parse(value);
+  // No time chosen yet: show faded "--" placeholders instead of a real-looking 9:00 AM, so it is obvious a choice is still needed.
+  const unset = !/^(\d{1,2}):(\d{2})/.test(value);
 
   function update(next: Partial<{ hour12: number; minute: number; period: 'AM' | 'PM' }>) {
     onChange(
@@ -79,11 +84,16 @@ export function TimeInput({ id, label, ariaLabel, description, error, required, 
       >
         <select
           aria-label="Hour"
-          value={hour12}
+          value={unset ? '' : hour12}
           disabled={disabled}
           onChange={(e) => update({ hour12: Number(e.target.value) })}
-          className={cn(selectClass, error && 'border-danger-border')}
+          className={cn(selectClass, unset && 'text-text-subtle', error && 'border-danger-border')}
         >
+          {unset && (
+            <option value="" disabled hidden>
+              --
+            </option>
+          )}
           {HOURS_12.map((h) => (
             <option key={h} value={h}>
               {h}
@@ -93,11 +103,16 @@ export function TimeInput({ id, label, ariaLabel, description, error, required, 
         <span className="text-text-muted" aria-hidden="true">:</span>
         <select
           aria-label="Minute"
-          value={minute}
+          value={unset ? '' : minute}
           disabled={disabled}
           onChange={(e) => update({ minute: Number(e.target.value) })}
-          className={cn(selectClass, error && 'border-danger-border')}
+          className={cn(selectClass, unset && 'text-text-subtle', error && 'border-danger-border')}
         >
+          {unset && (
+            <option value="" disabled hidden>
+              --
+            </option>
+          )}
           {MINUTES.map((m) => (
             <option key={m} value={m}>
               {String(m).padStart(2, '0')}
@@ -106,11 +121,16 @@ export function TimeInput({ id, label, ariaLabel, description, error, required, 
         </select>
         <select
           aria-label="AM or PM"
-          value={period}
+          value={unset ? '' : period}
           disabled={disabled}
           onChange={(e) => update({ period: e.target.value as 'AM' | 'PM' })}
-          className={cn(selectClass, error && 'border-danger-border')}
+          className={cn(selectClass, unset && 'text-text-subtle', error && 'border-danger-border')}
         >
+          {unset && (
+            <option value="" disabled hidden>
+              --
+            </option>
+          )}
           <option value="AM">AM</option>
           <option value="PM">PM</option>
         </select>

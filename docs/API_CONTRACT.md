@@ -122,6 +122,41 @@ Notifications: `SUSPENSION_REQUESTED` → every ADMIN; `SUSPENSION_APPROVED` / `
 | POST | `/rooms/{id}/availability-blocks` | ADMIN | `{date, start_time, end_time, reason}` |
 | GET | `/rooms/available` | ADMIN | query `{date, start_time, end_time, min_capacity}` |
 
+## Room Suggestion
+
+| Method | Endpoint | Auth | Notes |
+|---|---|---|---|
+| GET | `/quizzes/{id}/rooms/suggest` | FACULTY (owner) | quiz-stage plan, sized by the declared student count and preferred slot. Query `empty_columns=true` sizes rooms by usable seats only (every second column left empty) |
+| GET | `/exam-sessions/{id}/rooms/suggest` | FACULTY (owner) | session-stage plan, sized by the real assigned students; same `empty_columns` query |
+
+Two strategies are returned (`FEWEST_ROOMS`, `BALANCED_SPREAD`; `SEQUENTIAL` is retired). Both use the default location rule: **one building if it fits** (the one needing the fewest rooms, then the fewest floors, then by name), **floors filled from the ground up one at a time**, and several buildings only when no single building is big enough (biggest first). Each result carries `location` and `spansBuildings`. When fewer rooms are possible by leaving the building/floor order, the result also carries an `alternative` ("fewest rooms overall") and the client must ask the person which they prefer — nothing is chosen for them. Only building and floor numbers are used; there is no notion of distance.
+
+## Room Holds (seat-based, from quiz approval)
+
+Approving a quiz (`POST /quizzes/{id}/approve`) **holds the seats** of its requested rooms for its date and time (`room_holds`): the quiz's student count is split across the requested rooms in proportion to their free seats, and — when `backup_locked` — the backup room is held for the biggest main share. Holds count **seats, not whole rooms**, so several quizzes meant for one combined exam can hold the same room as long as the seats fit. Approval is refused with `409` (and rolled back) when a room is unusable or the seats are already held by other quizzes. Holds are checked under a row lock on the rooms.
+
+- `POST /quizzes/{id}/rooms/request` and `POST /exam-sessions/{id}/rooms/request` accept `backup_locked` (quiz only) and `empty_columns` (the "leave every second seat column empty?" answer; sizes rooms by usable seats and becomes the session's seating default).
+- Suggestions and allocation treat seats held by *other* quizzes as unavailable.
+- **Released** (`RELEASED`, with a reason) when the session is created for a different date or time (`TIME_CHANGED`, faculty notified `ROOM_HOLD_RELEASED`) or the session is cancelled (`SESSION_CANCELLED`). **Consumed** when rooms are allocated to the session. A hold lapses by itself once its exam window has passed.
+- `POST /exam-sessions/{id}/rooms/allocate-preapproved`: a held main room that is unavailable at allocation is replaced by the quiz's backup room automatically; the faculty and every admin are notified (`BACKUP_ROOM_USED`).
+- `GET /quizzes/{id}` includes `roomHolds` (active holds only).
+
+## Request More Rooms (during seating)
+
+A faculty owner asks for more rooms after seating has started (session `SEATING_GENERATION` or `READY_FOR_FINALIZATION`) while at least one room's seating is not yet finalized. The session goes **back to the Rooms step** (`ROOM_ALLOCATION`) so seating pauses (`seating/regenerate` and `finalize` return `409`); the asked-for rooms are **locked** (seat holds tagged with the request) if free. An ADMIN approves — possibly **changing the rooms** — or declines; on decline or withdrawal the session returns to its previous status exactly as it was. At most one `PENDING` request per session.
+
+| Method | Endpoint | Auth | Notes |
+|---|---|---|---|
+| GET | `/exam-sessions/{id}/rooms/extra` | FACULTY (owner) | shortfall for students outside finalized rooms (`studentsToPlace`, `fullSeats`, `usableSeats`, `seatsNeeded`, `trigger`), the nearest free rooms (same building and floor first, then the nearest floor, then other buildings), `pending`, `latestRejected`. Query `empty_columns=true|false` re-sizes for that answer |
+| POST | `/exam-sessions/{id}/room-requests` | FACULTY (owner) | `{room_ids[], reason (>=10 chars), empty_columns?}`. `409` when not in seating, one is pending, everything is finalized, or a room is already in the session |
+| GET | `/room-requests` | ADMIN (all), FACULTY (own) | `status`, `exam_session_id`, cursor; each row carries labels, live availability of the asked rooms, current rooms with `finalized`, `studentsToPlace` |
+| GET | `/room-requests/{id}` | ADMIN, FACULTY (own) | plus `options` (free rooms an admin could swap in) |
+| POST | `/room-requests/{id}/cancel` | FACULTY (owner) | withdraw; locks freed |
+| POST | `/room-requests/{id}/approve` | ADMIN | `{room_ids?, note?}`. Adds the rooms and **re-splits every student who is not in a finalized room** across the not-finalized rooms plus the new ones (every room keeps a mix of subjects; rooms already in the session are never dropped); records exact membership (`exam_session_room_students`) so finalized rooms keep their students; supersedes the not-finalized rooms' seating plans (they show "not generated yet" and are generated again the normal way); session returns to `SEATING_GENERATION`. `409` when a room is unavailable or seats still do not cover the students |
+| POST | `/room-requests/{id}/reject` | ADMIN | `{note}` (required); session returns to its previous status |
+
+Notifications: `ROOM_REQUEST_SUBMITTED` (every admin), `ROOM_REQUEST_APPROVED` / `ROOM_REQUEST_REJECTED` (the requesting faculty). Cancelling a session withdraws a pending request. `POST /exam-sessions/{id}/rooms/allocate` and `.../rooms/reject` refuse (`409`) while such a request is pending.
+
 ## Room Allocation
 
 | Method | Endpoint | Auth | Errors |

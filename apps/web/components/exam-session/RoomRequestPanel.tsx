@@ -1,8 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Card, Badge, Button, Alert, SkeletonText, ErrorState } from '@/components/ui';
+import { Card, Button, Alert, SkeletonText, ErrorState } from '@/components/ui';
 import { RoomPicker } from '@/components/rooms/RoomPicker';
+import { EmptyColumnsQuestion, RoomSuggestionCards, roomStrategyLabel } from '@/components/rooms/RoomSuggestionCards';
+import type { EmptyColumnsAnswer, LocationChoice } from '@/components/rooms/RoomSuggestionCards';
 import { useRoomSuggestions } from '@/lib/queries/useRoomSuggestions';
 import { useRequestRooms, useAllocatePreApprovedRooms } from '@/lib/mutations/useRoomAllocationMutations';
 import { mapError } from '@/lib/error-mapping';
@@ -32,7 +34,11 @@ export interface RoomRequestPanelProps {
  */
 export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanelProps) {
   const canRequest = session.status === 'ASSIGNING_STUDENTS' && !readOnly;
-  const suggestionsQuery = useRoomSuggestions(session.id, canRequest);
+  const [emptyColumns, setEmptyColumns] = useState<EmptyColumnsAnswer>('unset');
+  const [locationChoice, setLocationChoice] = useState<LocationChoice | null>(null);
+  const hasApprovedRooms = session.quizzes.length > 0 && session.quizzes.every((q) => (q.requestedRoomIds ?? []).length > 0);
+  // The approved-room shortcut still needs the room list for display (columns do not matter there); the suggestion builder asks first.
+  const suggestionsQuery = useRoomSuggestions(session.id, canRequest && (hasApprovedRooms || emptyColumns !== 'unset'), emptyColumns === 'yes');
   const requestMutation = useRequestRooms(session.id);
   const allocatePreApprovedMutation = useAllocatePreApprovedRooms(session.id);
 
@@ -55,16 +61,33 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
     const first = suggestionsQuery.data.strategies.find((s) => s.roomCount > 0) ?? suggestionsQuery.data.strategies[0];
     if (first) {
       setSelectedStrategy(first.strategy);
-      setRoomIds(first.rooms.map((r) => r.roomId));
+      // Two ways to place the rooms: the person must choose — nothing is picked for them.
+      setLocationChoice(first.alternative ? null : 'together');
+      setRoomIds(first.alternative ? [] : first.rooms.map((r) => r.roomId));
     }
   }, [suggestionsQuery.data]);
 
-  function pickStrategy(result: RoomSuggestionResult) {
-    setSelectedStrategy(result.strategy);
-    setRoomIds(result.rooms.map((r) => r.roomId));
-    if (result.rooms.some((r) => r.roomId === backupRoomId)) {
+  function applyRooms(rooms: { roomId: string }[]) {
+    setRoomIds(rooms.map((r) => r.roomId));
+    if (rooms.some((r) => r.roomId === backupRoomId)) {
       setBackupRoomId('');
     }
+  }
+
+  function pickStrategy(result: RoomSuggestionResult) {
+    setSelectedStrategy(result.strategy);
+    if (result.alternative) {
+      setLocationChoice(null);
+      setRoomIds([]);
+    } else {
+      setLocationChoice('together');
+      applyRooms(result.rooms);
+    }
+  }
+
+  function chooseLocation(result: RoomSuggestionResult, choice: LocationChoice) {
+    setLocationChoice(choice);
+    applyRooms(choice === 'together' || !result.alternative ? result.rooms : result.alternative.rooms);
   }
 
   async function onSubmitRequest() {
@@ -72,6 +95,7 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
       await requestMutation.mutateAsync({
         room_ids: roomIds,
         backup_room_id: backupRoomId || undefined,
+        empty_columns: emptyColumns === 'yes',
         strategy: selectedStrategy ?? undefined,
       });
     } catch {
@@ -90,7 +114,7 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
   if (session.status === 'ROOM_ALLOCATION') {
     return (
       <Alert color="info" title="Room request pending admin approval">
-        {session.roomAllocationStrategy && <>Strategy used: {strategyLabel(session.roomAllocationStrategy)}. </>}
+        {session.roomAllocationStrategy && <>Strategy used: {roomStrategyLabel(session.roomAllocationStrategy)}. </>}
         Waiting for an admin to review live availability and approve or reject this request.
       </Alert>
     );
@@ -151,10 +175,22 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
     );
   }
 
+  const emptyColumnsQuestion = <EmptyColumnsQuestion name={`session-empty-columns-${session.id}`} value={emptyColumns} onChange={setEmptyColumns} />;
+
+  if (emptyColumns === 'unset') {
+    return (
+      <div className="flex flex-col gap-3">
+        {rejectionBanner}
+        {emptyColumnsQuestion}
+      </div>
+    );
+  }
+
   if (suggestionsQuery.isLoading) {
     return (
       <div className="flex flex-col gap-3">
         {rejectionBanner}
+        {emptyColumnsQuestion}
         <Card padding="dense">
           <SkeletonText lines={4} />
         </Card>
@@ -167,6 +203,7 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
     return (
       <div className="flex flex-col gap-3">
         {rejectionBanner}
+        {emptyColumnsQuestion}
         <ErrorState
           title="Couldn't load room suggestions"
           description={mapped.description}
@@ -182,6 +219,7 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
   return (
     <div className="flex flex-col gap-4">
       {rejectionBanner}
+      {emptyColumnsQuestion}
 
       <p className="text-sm text-text-muted">
         {data.totalStudents} student{data.totalStudents === 1 ? '' : 's'} assigned to this session · {data.availableRoomCount} room
@@ -195,17 +233,14 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
         </Alert>
       )}
 
-      <div className="grid gap-3 sm:grid-cols-3">
-        {data.strategies.map((s) => (
-          <StrategyCard
-            key={s.strategy}
-            result={s}
-            totalStudents={data.totalStudents}
-            selected={selectedStrategy === s.strategy}
-            onSelect={() => pickStrategy(s)}
-          />
-        ))}
-      </div>
+      <RoomSuggestionCards
+        strategies={data.strategies}
+        totalStudents={data.totalStudents}
+        selectedStrategy={selectedStrategy}
+        locationChoice={locationChoice}
+        onPickStrategy={pickStrategy}
+        onChooseLocation={chooseLocation}
+      />
 
       <RoomPicker
         allRooms={data.allRooms}
@@ -229,67 +264,4 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
       </div>
     </div>
   );
-}
-
-function StrategyCard({
-  result,
-  totalStudents,
-  selected,
-  onSelect,
-}: {
-  result: RoomSuggestionResult;
-  totalStudents: number;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const covers = result.totalCapacity >= totalStudents;
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`flex flex-col gap-2 rounded border p-3 text-left transition-colors ${
-        selected ? 'border-primary-600 bg-primary-50' : 'border-border hover:border-border-strong'
-      }`}
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-semibold text-text">{result.label}</span>
-        {selected && <Badge color="success">Selected</Badge>}
-      </div>
-      <p className="text-xs text-text-muted">{result.description}</p>
-      <div className="flex flex-col gap-1">
-        <div className="flex justify-between text-xs text-text-muted">
-          <span>{result.roomCount} class{result.roomCount === 1 ? '' : 'es'}</span>
-          <span>{result.utilizationPercent}% filled</span>
-        </div>
-        <div className="h-2 w-full overflow-hidden rounded-full bg-surface-muted">
-          <div
-            className={`h-full rounded-full ${covers ? 'bg-primary-600' : 'bg-danger-600'}`}
-            style={{ width: `${Math.min(100, result.utilizationPercent)}%` }}
-          />
-        </div>
-        {!covers && <p className="text-xs text-danger-text">Falls short — only {result.totalCapacity} of {totalStudents} seats.</p>}
-      </div>
-      <ul className="flex flex-col gap-0.5 text-xs text-text-muted">
-        {result.rooms.slice(0, 4).map((r) => (
-          <li key={r.roomId}>
-            {r.building} {r.roomNumber} — {r.allocated}/{r.capacity}
-          </li>
-        ))}
-        {result.rooms.length > 4 && <li>+ {result.rooms.length - 4} more</li>}
-      </ul>
-    </button>
-  );
-}
-
-function strategyLabel(strategy: string): string {
-  switch (strategy) {
-    case 'FEWEST_ROOMS':
-      return 'Fewest Classes';
-    case 'SEQUENTIAL':
-      return 'Sequential (Adjacent Rooms)';
-    case 'BALANCED_SPREAD':
-      return 'Balanced Spread';
-    default:
-      return strategy;
-  }
 }

@@ -75,7 +75,7 @@ describe('describeNotification — clear title + sentence for every event', () =
   });
 
   it('never throws and never shows "undefined" for missing or odd payloads', () => {
-    for (const type of ['QUIZ_APPROVED', 'QUIZ_REJECTED', 'SEAT_ASSIGNED', 'EXAM_SESSION_RESCHEDULED', 'EXAM_SESSION_CANCELLED', 'INCIDENT_STATUS_UPDATED', 'REPORT_READY', 'SUSPENSION_REQUESTED', 'SUSPENSION_APPROVED', 'SUSPENSION_REJECTED', 'INVIGILATOR_ASSIGNED', 'INVIGILATOR_REMOVED']) {
+    for (const type of ['QUIZ_APPROVED', 'QUIZ_REJECTED', 'SEAT_ASSIGNED', 'EXAM_SESSION_RESCHEDULED', 'EXAM_SESSION_CANCELLED', 'INCIDENT_STATUS_UPDATED', 'REPORT_READY', 'SUSPENSION_REQUESTED', 'SUSPENSION_APPROVED', 'SUSPENSION_REJECTED', 'INVIGILATOR_ASSIGNED', 'INVIGILATOR_REMOVED', 'ROOM_HOLD_RELEASED', 'BACKUP_ROOM_USED', 'ROOM_REQUEST_SUBMITTED', 'ROOM_REQUEST_APPROVED', 'ROOM_REQUEST_REJECTED']) {
       for (const payload of [undefined, null, {}, { message: 42 }]) {
         const { title, body } = describeNotification(type, payload as never);
         expect(title).toBeTruthy();
@@ -145,5 +145,29 @@ describe('describeNotification — clear title + sentence for every event', () =
     expect(r.title).toBe('Invigilation rescheduled');
     expect(r.body).toContain('“Finals”, which you invigilate in room B-107, B-108, has been rescheduled to');
     expect(r.body).toContain('10:00–12:00');
+  });
+
+  it('describes held-room releases and the automatic backup room', () => {
+    const released = describeNotification('ROOM_HOLD_RELEASED', { quiz_title: 'DBMS', hold_date: '2027-03-01', start_time: '09:00', reason: 'TIME_CHANGED' });
+    expect(released.title).toBe('Held rooms released');
+    expect(released.body).toContain('The rooms held for “DBMS”');
+    expect(released.body).toContain('different date or time');
+    expect(describeNotification('ROOM_HOLD_RELEASED', { quiz_title: 'DBMS', reason: 'SESSION_CANCELLED' }).body).toContain('the exam session was cancelled');
+
+    expect(describeNotification('BACKUP_ROOM_USED', { session_name: 'Finals', unavailable_room: 'B-105', backup_room: 'B-204' })).toEqual({
+      title: 'Backup room used',
+      body: 'Room B-105 was unavailable for “Finals”, so the backup room B-204 was used instead.',
+    });
+  });
+
+  it('describes the "more rooms" request, approval and decline', () => {
+    expect(describeNotification('ROOM_REQUEST_SUBMITTED', { faculty_name: 'Jaskirat Singh', session_name: 'Finals', room_count: 1, reason: 'Too many students.' }).body).toBe(
+      'Jaskirat Singh asked for 1 more room for “Finals” during seating. Reason: Too many students. Review it under Room Requests.',
+    );
+    expect(describeNotification('ROOM_REQUEST_APPROVED', { session_name: 'Finals', rooms: 'B-201', note: 'ok' }).body).toContain('approved: B-201 added.');
+    expect(describeNotification('ROOM_REQUEST_REJECTED', { session_name: 'Finals', note: 'No free room.' })).toEqual({
+      title: 'More rooms declined',
+      body: 'Your request for more rooms for “Finals” was declined: No free room. Seating continues as before.',
+    });
   });
 });

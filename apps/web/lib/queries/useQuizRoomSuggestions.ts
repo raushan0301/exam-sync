@@ -6,11 +6,11 @@ import { hasStoredSession } from '../token-storage';
 import { queryKeys } from './queryKeys';
 import type { RoomSuggestionResponse, RoomAvailabilityPreview } from './types';
 
-/** GET /quizzes/{id}/rooms/suggest — FACULTY, ownership-gated, DRAFT/REJECTED only. */
-export function useQuizRoomSuggestions(quizId: string, enabled = true) {
+/** GET /quizzes/{id}/rooms/suggest — FACULTY, ownership-gated, DRAFT/REJECTED only. `emptyColumns` sizes rooms by usable seats only. */
+export function useQuizRoomSuggestions(quizId: string, enabled = true, emptyColumns = false) {
   return useQuery({
-    queryKey: queryKeys.quizRoomSuggestions(quizId),
-    queryFn: () => apiFetch<RoomSuggestionResponse>(`/quizzes/${quizId}/rooms/suggest`),
+    queryKey: queryKeys.quizRoomSuggestions(quizId, emptyColumns),
+    queryFn: () => apiFetch<RoomSuggestionResponse>(`/quizzes/${quizId}/rooms/suggest${emptyColumns ? '?empty_columns=true' : ''}`),
     enabled: hasStoredSession() && enabled && !!quizId,
   });
 }

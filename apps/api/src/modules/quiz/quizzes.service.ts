@@ -17,6 +17,7 @@ import {
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
+import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 import {
   cursorFindManyArgs,
@@ -77,6 +78,17 @@ export interface QuizAllocatedRoom {
  */
 export interface QuizDetail extends Quiz {
   examSession: { id: string; status: string; rooms: QuizAllocatedRoom[] } | null;
+  /** Seats currently held for this quiz (approved, rooms not allocated yet) — main rooms and, when locked, the backup. */
+  roomHolds: QuizRoomHold[];
+}
+
+export interface QuizRoomHold {
+  roomId: string;
+  kind: 'MAIN' | 'BACKUP';
+  seatsHeld: number;
+  holdDate: Date;
+  startTime: Date;
+  endTime: Date;
 }
 
 /**
@@ -104,6 +116,7 @@ export class QuizzesService {
     private readonly approvalHistoryService: QuizApprovalHistoryService,
     private readonly notificationsOutbox: NotificationsOutboxService,
     private readonly enrollmentsService: EnrollmentsService,
+    private readonly roomHolds: RoomHoldsService,
   ) {}
 
   /**
@@ -223,7 +236,17 @@ export class QuizzesService {
         }
       : null;
 
-    return { ...quiz, examSession };
+    const holds = await this.roomHolds.activeHoldsForQuiz(this.prisma, id);
+    const roomHolds: QuizRoomHold[] = holds.map((h) => ({
+      roomId: h.roomId,
+      kind: h.kind,
+      seatsHeld: h.seatsHeld,
+      holdDate: h.holdDate,
+      startTime: h.startTime,
+      endTime: h.endTime,
+    }));
+
+    return { ...quiz, examSession, roomHolds };
   }
 
   async getBatchIds(quizId: string): Promise<string[]> {
@@ -525,6 +548,10 @@ export class QuizzesService {
         where: { id },
         data: { status: QuizStatus.APPROVED, version: { increment: 1 } },
       });
+
+      // Approval keeps the requested rooms' seats free for this quiz's exam window until a session allocates them.
+      // If another quiz already holds those seats this throws 409 and the whole approval rolls back — swap a room, then approve.
+      await this.roomHolds.placeForApprovedQuiz(tx, updated);
 
       await this.approvalHistoryService.record(
         {

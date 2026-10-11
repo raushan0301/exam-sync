@@ -139,4 +139,32 @@ describe('renderMessage', () => {
       body: '"Finals", which you invigilate in room B-107, has been rescheduled to 2027-02-01 10:00-12:00.',
     });
   });
+
+  it('renders held-room releases and the automatic backup room', () => {
+    expect(
+      renderMessage('ROOM_HOLD_RELEASED', { quiz_title: 'DBMS', hold_date: '2027-03-01', start_time: '09:00', reason: 'TIME_CHANGED' }),
+    ).toEqual({
+      title: 'Held rooms released',
+      body: 'The rooms held for "DBMS" on 2027-03-01 09:00 were released: the exam session was created for a different date or time. Availability will be checked again when you request rooms.',
+    });
+    expect(renderMessage('ROOM_HOLD_RELEASED', { quiz_title: 'DBMS', reason: 'SESSION_CANCELLED' }).body).toContain('the exam session was cancelled.');
+    expect(renderMessage('BACKUP_ROOM_USED', { session_name: 'Finals', unavailable_room: 'B-105', backup_room: 'B-204' })).toEqual({
+      title: 'Backup room used',
+      body: 'Room B-105 was unavailable for "Finals", so the backup room B-204 was used instead.',
+    });
+  });
+
+  it('renders the "more rooms" request, approval and decline', () => {
+    expect(renderMessage('ROOM_REQUEST_SUBMITTED', { faculty_name: 'Jaskirat Singh', session_name: 'Finals', room_count: 2, reason: 'Too many students.' })).toEqual({
+      title: 'More rooms requested',
+      body: 'Jaskirat Singh asked for 2 more rooms for "Finals" during seating. Reason: Too many students. Review it under Room Requests.',
+    });
+    expect(renderMessage('ROOM_REQUEST_APPROVED', { session_name: 'Finals', rooms: 'B-201', note: 'ok' }).body).toBe(
+      'Your request for more rooms for "Finals" was approved: B-201 added. Students in rooms that are not finalized were re-split — generate seating for those rooms again. Note: ok',
+    );
+    expect(renderMessage('ROOM_REQUEST_REJECTED', { session_name: 'Finals', note: 'No free room.' })).toEqual({
+      title: 'More rooms declined',
+      body: 'Your request for more rooms for "Finals" was declined. Reason: No free room. Seating continues as before.',
+    });
+  });
 });

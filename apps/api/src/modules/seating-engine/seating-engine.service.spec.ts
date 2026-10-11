@@ -24,6 +24,8 @@ function buildPrismaMock() {
     examSessionRoomQuiz: { findMany: jest.fn() },
     quizStudentAssignment: { findMany: jest.fn() },
     student: { findMany: jest.fn() },
+    examSessionRoomStudent: { findMany: jest.fn().mockResolvedValue([]) },
+    examSessionRoomRequest: { findFirst: jest.fn().mockResolvedValue(null) },
     roomSeat: { findMany: jest.fn() },
     room: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'room-1', building: 'B', roomNumber: '201' }) },
     seatingPlan: { findUnique: jest.fn(), findFirst: jest.fn(), findMany: jest.fn() },
@@ -175,6 +177,48 @@ describe('SeatingEngineService — Phase 13 (generation/validation NestJS wiring
 
       const seatedIds = prisma.__tx.seatingAssignment.createMany.mock.calls[0][0].data.map((a: any) => a.seatId).sort();
       expect(seatedIds).toEqual(['seat-1', 'seat-3']);
+    });
+  });
+
+  describe('rooms re-split after a "more rooms" request', () => {
+    it('seats exactly the students recorded for the room, ignoring the derived per-quiz slicing', async () => {
+      examSessionsService.findById.mockResolvedValue(sessionInProgress);
+      prisma.seatingPlan.findFirst.mockResolvedValue(null);
+      prisma.examSessionRoom.findUnique.mockResolvedValue({ id: 'esr-1', roomId: 'room-1', examSessionId: 's1' });
+      prisma.examSessionRoomQuiz.findMany.mockResolvedValue([{ examSessionRoomId: 'esr-1', quizId: 'quiz-1', studentCount: 2 }]);
+      prisma.examSessionRoomStudent.findMany.mockResolvedValue([
+        { studentId: 'stu-9', quizId: 'quiz-1' },
+        { studentId: 'stu-7', quizId: 'quiz-1' },
+      ]);
+      quizzesService.findById.mockResolvedValue({ id: 'quiz-1', subjectId: 'subj-1' });
+      prisma.student.findMany.mockResolvedValue([
+        { id: 'stu-9', batchId: 'batch-A', rollNumber: '9' },
+        { id: 'stu-7', batchId: 'batch-A', rollNumber: '7' },
+      ]);
+      prisma.roomSeat.findMany.mockResolvedValue([
+        { id: 'seat-1', rowIndex: 0, colIndex: 0, isActive: true, isAccessible: false },
+        { id: 'seat-2', rowIndex: 0, colIndex: 1, isActive: true, isAccessible: false },
+      ]);
+      prisma.__tx.seatingPlan.create.mockResolvedValue({ id: 'plan-1', status: SeatingPlanStatus.DRAFT, strategy: 'SEQUENTIAL' });
+      prisma.__tx.seatingAssignment.findMany.mockResolvedValue([]);
+      prisma.__tx.seatingPlan.update.mockResolvedValue({ id: 'plan-1', status: SeatingPlanStatus.VALIDATED, strategy: 'SEQUENTIAL' });
+      prisma.examSessionRoom.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+      prisma.seatingPlan.findMany.mockResolvedValue([{ roomId: 'room-1' }]);
+
+      await service.generate('s1', { room_id: 'room-1', strategy: 'SEQUENTIAL' }, admin);
+
+      const seated = prisma.__tx.seatingAssignment.createMany.mock.calls[0][0].data.map((a: any) => a.studentId).sort();
+      expect(seated).toEqual(['stu-7', 'stu-9']);
+      expect(prisma.quizStudentAssignment.findMany).not.toHaveBeenCalled(); // not derived from the quiz roster any more
+    });
+
+    it('pauses regenerate and finalize while a request for more rooms waits for the admin', async () => {
+      prisma.examSessionRoomRequest.findFirst.mockResolvedValue({ id: 'req-1' });
+      examSessionsService.findById.mockResolvedValue(sessionInProgress);
+      prisma.seatingPlan.findUnique.mockResolvedValue({ id: 'plan-1', examSessionId: 's1', roomId: 'room-1', status: SeatingPlanStatus.VALIDATED });
+
+      await expect(service.regenerate('s1', { room_id: 'room-1', strategy: 'SEQUENTIAL' }, admin)).rejects.toThrow(/Seating is paused/);
+      await expect(service.finalize('plan-1', admin)).rejects.toThrow(/Seating is paused/);
     });
   });
 

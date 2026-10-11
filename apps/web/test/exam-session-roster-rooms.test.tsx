@@ -227,6 +227,7 @@ describe('Room request + admin approval', () => {
     const { unmount } = renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
 
     await screen.findByText('Midterm Session');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
     await screen.findByText(/Fewest Classes/i);
     await userEvent.click(screen.getByRole('button', { name: /submit room request for approval/i }));
 

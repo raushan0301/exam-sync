@@ -4,7 +4,7 @@ import { http, HttpResponse } from 'msw';
 import { setTokens } from '@/lib/token-storage';
 import { renderWithProviders } from './utils/renderWithProviders';
 import { server } from './msw/server';
-import { API_BASE_URL, VALID_ACCESS_TOKEN, VALID_REFRESH_TOKEN, setMockQuizzes, setMockIncidents, setMockSuspensionRequests } from './msw/handlers';
+import { API_BASE_URL, VALID_ACCESS_TOKEN, VALID_REFRESH_TOKEN, setMockQuizzes, setMockIncidents, setMockSuspensionRequests, setMockRoomRequests } from './msw/handlers';
 import AdminDashboardPage from '@/app/admin/dashboard/page';
 
 vi.mock('next/navigation', () => ({
@@ -160,5 +160,32 @@ describe('Admin dashboard', () => {
     // Only the 2 PENDING ones count; the approved one is history.
     expect(await screen.findByText('Awaiting your decision')).toBeInTheDocument();
     expect(label.closest('a')).toHaveTextContent('2');
+  });
+
+  it('shows how many requests for more rooms are waiting, linking to the Room Requests queue', async () => {
+    signInAsAdmin();
+    setMockQuizzes([]);
+    setMockIncidents([]);
+    setMockSuspensionRequests([]);
+    const base = {
+      examSessionId: 's1', requestedByFacultyId: 'f1', reason: 'Late additions to the roster.', trigger: 'TOO_MANY_STUDENTS' as const, previousStatus: 'SEATING_GENERATION',
+      emptyColumns: null, requestedRoomIds: [], approvedRoomIds: [], reviewedByAdminId: null, reviewNote: null, reviewedAt: null,
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', examSessionName: 'Exam', examSessionDate: '2026-03-01',
+      examSessionStartTime: '09:00:00', examSessionEndTime: '10:00:00', examSessionStatus: 'ROOM_ALLOCATION', facultyName: 'Dr. Smith', facultyEmployeeCode: 'E001',
+      requestedRooms: [], approvedRoomLabels: [], currentRooms: [], studentsToPlace: 10,
+    };
+    setMockRoomRequests([
+      { ...base, id: 'r1', status: 'PENDING' },
+      { ...base, id: 'r2', status: 'PENDING' },
+      { ...base, id: 'r3', status: 'APPROVED' },
+    ]);
+
+    renderWithProviders(<AdminDashboardPage />);
+
+    const label = await screen.findByText('Room Requests');
+    expect(label.closest('a')).toHaveAttribute('href', '/admin/room-requests');
+    expect(await screen.findByText('Faculty asking for more rooms')).toBeInTheDocument();
+    expect(label.closest('a')).toHaveTextContent('2'); // only the two PENDING ones count
+    setMockRoomRequests([]);
   });
 });

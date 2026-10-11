@@ -104,4 +104,11 @@ describe('nav config data shape', () => {
     const item = ADMIN_NAV.find((e) => e.label === 'Suspension Requests');
     expect(item && !isNavGroup(item) ? item.href : undefined).toBe('/admin/suspension-requests');
   });
+
+  it('ADMIN nav lists Room Requests right under Suspension Requests', () => {
+    const labels = ADMIN_NAV.map((e) => e.label);
+    expect(labels.indexOf('Room Requests')).toBe(labels.indexOf('Suspension Requests') + 1);
+    const item = ADMIN_NAV.find((e) => e.label === 'Room Requests');
+    expect(item && !isNavGroup(item) ? item.href : undefined).toBe('/admin/room-requests');
+  });
 });

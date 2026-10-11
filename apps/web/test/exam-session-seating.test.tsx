@@ -273,6 +273,32 @@ describe('Seating generation', () => {
   });
 });
 
+describe('Seating — empty-column default from the room request', () => {
+  it.each([
+    [true, /yes — leave every second column empty/i],
+    [false, /no — use every column/i],
+  ])('pre-selects the answer given when rooms were requested (emptyColumnsPlanned=%s) and lets Generate go straight away', async (planned, label) => {
+    setUpBaseFixtures();
+    setMockExamSessions([makeSession({ emptyColumnsPlanned: planned })]);
+    const room = makeRoom();
+    setMockExamSessionRooms([{ ...room, allocatedCapacity: 2 }]); // 2 students fit even with empty columns
+    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
+
+    await screen.findByText('Midterm Session');
+    expect(await screen.findByLabelText(label)).toBeChecked();
+    expect(screen.getByRole('button', { name: /generate seating/i })).toBeEnabled();
+  });
+
+  it('still asks when the question was never answered', async () => {
+    setUpBaseFixtures();
+    renderWithProviders(<ExamSessionDetailView sessionId="session-1" />);
+
+    await screen.findByText('Midterm Session');
+    expect(await screen.findByLabelText(/no — use every column/i)).not.toBeChecked();
+    expect(screen.getByRole('button', { name: /generate seating/i })).toBeDisabled();
+  });
+});
+
 describe('Seating — score explanation', () => {
   it('explains the Soft Constraint Score in plain words next to the number', async () => {
     setUpBaseFixtures();

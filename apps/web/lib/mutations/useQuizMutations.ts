@@ -100,6 +100,10 @@ export interface RequestQuizRoomsInput {
   room_ids: string[];
   backup_room_id?: string;
   strategy?: string;
+  /** Hold the backup room's seats too once approved. */
+  backup_locked?: boolean;
+  /** The "leave every second seat column empty?" answer. */
+  empty_columns?: boolean;
   /** ADMIN only — a short note explaining an adjustment, shown back to the faculty. Ignored server-side when the caller is FACULTY. */
   admin_note?: string;
 }

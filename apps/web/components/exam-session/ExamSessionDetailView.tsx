@@ -17,6 +17,9 @@ import { useSuspensionRequests } from '@/lib/queries/useSuspensionRequests';
 import { ConflictResultDisplay } from './ConflictResultDisplay';
 import { RoomRequestPanel } from './RoomRequestPanel';
 import { RoomApprovalPanel } from './RoomApprovalPanel';
+import { RequestMoreRoomsDialog } from './RequestMoreRoomsDialog';
+import { RoomRequestDeclinedNotice, RoomRequestPendingPanel } from './RoomRequestStatusPanel';
+import { useExtraRooms, useRoomRequests } from '@/lib/queries/useRoomRequests';
 import { RosterPanel } from './RosterPanel';
 import { SeatingPanel } from './SeatingPanel';
 import { InvigilatorPanel } from './InvigilatorPanel';
@@ -61,6 +64,15 @@ export function ExamSessionDetailView({ sessionId, role = 'FACULTY' }: ExamSessi
   // Newest request first — drives the banner and whether "Request Suspension" is still available.
   const latestSuspension = useSuspensionRequests({ examSessionId: sessionId, limit: 1 }).data?.items[0];
   const suspensionPending = latestSuspension?.status === 'PENDING';
+  // "More rooms" requests: while one is pending the session sits in the Rooms step and seating is paused.
+  const roomRequestsQuery = useRoomRequests({ examSessionId: sessionId, limit: 5 });
+  const roomRequests = roomRequestsQuery.data?.items ?? [];
+  const pendingRoomRequest = roomRequests.find((r) => r.status === 'PENDING');
+  const declinedRoomRequest = roomRequests[0]?.status === 'REJECTED' ? roomRequests[0] : undefined;
+  const [moreRoomsOpen, setMoreRoomsOpen] = useState(false);
+  const seatingStarted = sessionQuery.data?.status === 'SEATING_GENERATION' || sessionQuery.data?.status === 'READY_FOR_FINALIZATION';
+  const extraRoomsQuery = useExtraRooms(sessionId, !readOnly && seatingStarted);
+  const canRequestMoreRooms = !readOnly && !!extraRoomsQuery.data?.canRequest;
   const [startOpen, setStartOpen] = useState(false);
   const [completeOpen, setCompleteOpen] = useState(false);
 
@@ -216,7 +228,13 @@ export function ExamSessionDetailView({ sessionId, role = 'FACULTY' }: ExamSessi
 
       <Card header={<h2 className="text-sm font-semibold text-text">Rooms</h2>} padding="dense">
         <div className="flex flex-col gap-3">
-          {readOnly ? <RoomApprovalPanel session={session} /> : <RoomRequestPanel session={session} readOnly={readOnly} />}
+          {pendingRoomRequest ? (
+            <RoomRequestPendingPanel request={pendingRoomRequest} isAdmin={readOnly} />
+          ) : readOnly ? (
+            <RoomApprovalPanel session={session} />
+          ) : (
+            <RoomRequestPanel session={session} readOnly={readOnly} />
+          )}
           {session.rooms.length === 0 ? (
             <p className="text-sm text-text-muted">No rooms allocated yet.</p>
           ) : (
@@ -237,7 +255,26 @@ export function ExamSessionDetailView({ sessionId, role = 'FACULTY' }: ExamSessi
       </Card>
 
       <Card header={<h2 className="text-sm font-semibold text-text">Seating</h2>} padding="dense">
-        <SeatingPanel session={session} readOnly={readOnly} />
+        <div className="flex flex-col gap-4">
+          {declinedRoomRequest && !pendingRoomRequest && <RoomRequestDeclinedNotice request={declinedRoomRequest} />}
+          {canRequestMoreRooms && !pendingRoomRequest && (
+            <div className="flex items-center justify-between gap-3 rounded border border-border p-3">
+              <p className="text-xs text-text-muted">
+                Not enough seats, or want a roomier layout? Ask for more rooms — seating pauses until an admin decides, and finalized rooms are never touched.
+              </p>
+              <Button variant="secondary" size="sm" onClick={() => setMoreRoomsOpen(true)}>
+                Request more rooms
+              </Button>
+            </div>
+          )}
+          <SeatingPanel
+            session={session}
+            readOnly={readOnly}
+            paused={!!pendingRoomRequest}
+            onRequestMoreRooms={canRequestMoreRooms ? () => setMoreRoomsOpen(true) : undefined}
+          />
+        </div>
+        {canRequestMoreRooms && <RequestMoreRoomsDialog open={moreRoomsOpen} onOpenChange={setMoreRoomsOpen} session={session} />}
       </Card>
 
       <Card header={<h2 className="text-sm font-semibold text-text">Invigilators</h2>} padding="dense">

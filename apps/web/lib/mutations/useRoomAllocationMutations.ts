@@ -11,6 +11,8 @@ export interface RequestRoomsInput {
   room_ids: string[];
   backup_room_id?: string;
   strategy?: string;
+  /** The "leave every second seat column empty?" answer — becomes the session's seating default. */
+  empty_columns?: boolean;
 }
 
 /**

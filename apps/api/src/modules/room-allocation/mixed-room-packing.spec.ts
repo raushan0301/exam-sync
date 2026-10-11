@@ -57,4 +57,15 @@ describe('packMixed — every room gets a mix of every subject', () => {
   it('throws when the seats cannot cover the students', () => {
     expect(() => packMixed([{ quizId: 'A', count: 40 }], rooms)).toThrow();
   });
+
+  it('useAllRooms keeps every given room in play instead of using the fewest', () => {
+    const groups = [{ quizId: 'A', count: 10 }, { quizId: 'B', count: 8 }]; // 18 would fit the 24-seat room alone
+    const fewest = packMixed(groups, rooms);
+    const all = packMixed(groups, rooms, { useAllRooms: true });
+
+    expect(new Set(fewest.map((p) => p.roomId))).toEqual(new Set(['R1']));
+    expect(new Set(all.map((p) => p.roomId))).toEqual(new Set(['R1', 'R2']));
+    expect(totalIn(all, 'R1') + totalIn(all, 'R2')).toBe(18);
+    expect(totalIn(all, 'R2')).toBeLessThanOrEqual(15);
+  });
 });

@@ -112,6 +112,46 @@ export function renderMessage(
             body: `You are no longer assigned to invigilate "${str(payload.session_name)}"${room ? ` in room ${room}` : ''}.`,
           };
     }
+    case 'ROOM_HOLD_RELEASED': {
+      const quiz = str(payload.quiz_title);
+      const when = [str(payload.hold_date), str(payload.start_time)].filter(Boolean).join(' ');
+      return {
+        title: 'Held rooms released',
+        body: `The rooms held for "${quiz}"${when ? ` on ${when}` : ''} were released: ${releaseReasonText(payload.reason)} Availability will be checked again when you request rooms.`,
+      };
+    }
+    case 'BACKUP_ROOM_USED': {
+      const session = str(payload.session_name);
+      return {
+        title: 'Backup room used',
+        body: `${str(payload.unavailable_room) ? `Room ${str(payload.unavailable_room)} was unavailable` : 'A held room was unavailable'}${
+          session ? ` for "${session}"` : ''
+        }, so the backup room ${str(payload.backup_room)} was used instead.`,
+      };
+    }
+    case 'ROOM_REQUEST_SUBMITTED': {
+      const count = Number(payload.room_count) || 0;
+      return {
+        title: 'More rooms requested',
+        body: `${str(payload.faculty_name) || 'A faculty member'} asked for ${count > 0 ? `${count} more room${count === 1 ? '' : 's'}` : 'more rooms'} for "${str(
+          payload.session_name,
+        )}" during seating. Reason: ${str(payload.reason)} Review it under Room Requests.`,
+      };
+    }
+    case 'ROOM_REQUEST_APPROVED': {
+      const rooms = str(payload.rooms);
+      return {
+        title: 'More rooms approved',
+        body: `Your request for more rooms for "${str(payload.session_name)}" was approved${
+          rooms ? `: ${rooms} added` : ''
+        }. Students in rooms that are not finalized were re-split — generate seating for those rooms again.${str(payload.note) ? ` Note: ${str(payload.note)}` : ''}`,
+      };
+    }
+    case 'ROOM_REQUEST_REJECTED':
+      return {
+        title: 'More rooms declined',
+        body: `Your request for more rooms for "${str(payload.session_name)}" was declined. Reason: ${str(payload.note)} Seating continues as before.`,
+      };
     case 'INCIDENT_STATUS_UPDATED':
       // Admin notifications carry a complete, specific sentence (and title) written by
       // the incidents service; the generic wording is only the fallback for payloads without one.
@@ -132,6 +172,14 @@ export function renderMessage(
       throw new Error(`Unknown notification event_type: ${String(exhaustiveCheck)}`);
     }
   }
+}
+
+function releaseReasonText(reason: unknown): string {
+  return reason === 'SESSION_CANCELLED'
+    ? 'the exam session was cancelled.'
+    : reason === 'TIME_CHANGED'
+      ? 'the exam session was created for a different date or time.'
+      : 'they are no longer needed.';
 }
 
 function roleLabel(role: unknown): string {

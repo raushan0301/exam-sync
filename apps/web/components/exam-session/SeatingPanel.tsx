@@ -74,17 +74,27 @@ export interface SeatingPanelProps {
   session: ExamSessionDetail;
   /** Faculty-lifecycle-ownership change: ADMIN is now read-only for scheduling data — pass `true` to hide Generate/Finalize actions, keeping only the seat map itself. */
   readOnly?: boolean;
+  /** A request for more rooms is waiting for the admin: nothing may be generated, changed or finalized until it is decided. */
+  paused?: boolean;
+  /** Opens the "Request more rooms" dialog — offered where seats run short. Omit when more rooms cannot be requested. */
+  onRequestMoreRooms?: () => void;
 }
 
-export function SeatingPanel({ session, readOnly = false }: SeatingPanelProps) {
+export function SeatingPanel({ session, readOnly = false, paused = false, onRequestMoreRooms }: SeatingPanelProps) {
   if (session.rooms.length === 0) {
     return <EmptyState title="No rooms allocated yet" description="Allocate rooms to this session before seating can be generated." />;
   }
 
   return (
     <div className="flex flex-col gap-4">
+      {paused && (
+        <Alert color="warning" title="Seating is paused">
+          A request for more rooms is waiting for admin approval. Once it is decided, the students of rooms that are not finalized are re-split and you generate
+          their seating again the usual way. Withdraw the request in the Rooms step to carry on right now.
+        </Alert>
+      )}
       {session.rooms.map((room) => (
-        <RoomSeatingCard key={room.id} session={session} room={room} readOnly={readOnly} />
+        <RoomSeatingCard key={room.id} session={session} room={room} readOnly={readOnly} paused={paused} onRequestMoreRooms={onRequestMoreRooms} />
       ))}
     </div>
   );
@@ -94,10 +104,14 @@ function RoomSeatingCard({
   session,
   room,
   readOnly,
+  paused,
+  onRequestMoreRooms,
 }: {
   session: ExamSessionDetail;
   room: ExamSessionRoom;
   readOnly: boolean;
+  paused: boolean;
+  onRequestMoreRooms?: () => void;
 }) {
   const [planId, setPlanId] = useState<string | null>(null);
   const [strategy, setStrategy] = useState<SeatingStrategyName>('SEQUENTIAL');
@@ -106,8 +120,10 @@ function RoomSeatingCard({
   const [view, setView] = useState<'grid' | 'list'>('grid');
   const [finalizeOpen, setFinalizeOpen] = useState(false);
   // Asked before generating: leave every second column empty? Must be answered — no silent default.
-  const [columnChoice, setColumnChoice] = useState<ColumnChoice>('unset');
-  const [newColumnChoice, setNewColumnChoice] = useState<ColumnChoice>('unset');
+  // The answer given when rooms were requested is pre-selected (still changeable per room); never answered = ask.
+  const plannedChoice: ColumnChoice = session.emptyColumnsPlanned === true ? 'skip' : session.emptyColumnsPlanned === false ? 'keep' : 'unset';
+  const [columnChoice, setColumnChoice] = useState<ColumnChoice>(plannedChoice);
+  const [newColumnChoice, setNewColumnChoice] = useState<ColumnChoice>(plannedChoice);
 
   const generateMutation = useGenerateSeating(session.id);
   const regenerateMutation = useRegenerateSeating(session.id);
@@ -122,7 +138,7 @@ function RoomSeatingCard({
   const subjectsQuery = useSubjects({ all: true });
   const batchesQuery = useBatches({ all: true });
 
-  const canGenerate = session.status === 'SEATING_GENERATION' && !readOnly;
+  const canGenerate = session.status === 'SEATING_GENERATION' && !readOnly && !paused;
 
   // A plan generated earlier (before a page reload, or by someone else) is found again from the server, so
   // this card never offers a fresh "Generate" for a room that already has seating — which would only hand
@@ -132,6 +148,11 @@ function RoomSeatingCard({
   useEffect(() => {
     if (!planId && currentPlanId) setPlanId(currentPlanId);
   }, [planId, currentPlanId]);
+  // A re-split after "more rooms" supersedes this room's old seating: follow the server to the current plan (none = "not generated yet").
+  const shownPlanStatus = planQuery.data?.status;
+  useEffect(() => {
+    if (shownPlanStatus === 'SUPERSEDED' && currentPlanQuery.isSuccess && currentPlanId !== planId) setPlanId(currentPlanId);
+  }, [shownPlanStatus, currentPlanQuery.isSuccess, currentPlanId, planId]);
 
   async function onGenerate() {
     try {
@@ -151,7 +172,7 @@ function RoomSeatingCard({
       });
       setPlanId(result.seating_plan_id);
       setChangingStrategy(false);
-      setNewColumnChoice('unset');
+      setNewColumnChoice(plannedChoice);
     } catch {
       // surfaced below via regenerateMutation.error
     }
@@ -172,8 +193,8 @@ function RoomSeatingCard({
 
   const plan = planQuery.data;
   const isReadOnly = plan ? READ_ONLY_STATUSES.has(plan.status) : false;
-  const canFinalize = plan?.status === 'VALIDATED' && !readOnly;
-  const canChangeStrategy = plan ? CAN_CHANGE_STRATEGY_STATUSES.has(plan.status) && !readOnly : false;
+  const canFinalize = plan?.status === 'VALIDATED' && !readOnly && !paused;
+  const canChangeStrategy = plan ? CAN_CHANGE_STRATEGY_STATUSES.has(plan.status) && !readOnly && !paused : false;
 
   // The "one subject — spread by roll number" notice is stored as a violation-report entry; show it as
   // information, not as a violation.
@@ -234,7 +255,7 @@ function RoomSeatingCard({
         )}
         {!planId && !currentPlanQuery.isLoading && !readOnly && (
           <div className="flex flex-col gap-3">
-            {!canGenerate && (
+            {!canGenerate && !paused && (
               <Alert color="warning" title="Seating cannot be generated right now">
                 {`Exam session is in status "${session.status}" and seating can only be generated while SEATING_GENERATION.`}
               </Alert>
@@ -254,6 +275,7 @@ function RoomSeatingCard({
               seats={seatsQuery.data ?? []}
               students={room.allocatedCapacity}
               disabled={!canGenerate}
+              onRequestMoreRooms={canGenerate ? onRequestMoreRooms : undefined}
             />
             <RoomLayoutPreview
               roomLabel={`Room ${room.roomNumber}`}
@@ -312,6 +334,15 @@ function RoomSeatingCard({
               </Alert>
             )}
 
+            {plan.status === 'FAILED' && onRequestMoreRooms && !paused && (
+              <div className="flex items-center gap-2">
+                <Button type="button" variant="secondary" size="sm" onClick={onRequestMoreRooms}>
+                  Request more rooms
+                </Button>
+                <span className="text-xs text-text-muted">if this room cannot seat everyone assigned to it</span>
+              </div>
+            )}
+
             {plan.status === 'FAILED' && reportedViolations.length > 0 && (
               <Alert color="danger" title="Hard constraint violations">
                 <ul className="list-disc pl-4 text-xs">
@@ -337,7 +368,7 @@ function RoomSeatingCard({
                 {!changingStrategy ? (
                   <div className="flex items-center justify-between">
                     <p className="text-xs text-text-muted">Not happy with this arrangement? You can try a different strategy before finalizing.</p>
-                    <Button variant="secondary" size="sm" onClick={() => { setNewStrategy(STRATEGY_OPTIONS.some((o) => o.value === plan.strategy) ? (plan.strategy as SeatingStrategyName) : 'SEQUENTIAL'); setNewColumnChoice('unset'); setChangingStrategy(true); }}>
+                    <Button variant="secondary" size="sm" onClick={() => { setNewStrategy(STRATEGY_OPTIONS.some((o) => o.value === plan.strategy) ? (plan.strategy as SeatingStrategyName) : 'SEQUENTIAL'); setNewColumnChoice(plannedChoice); setChangingStrategy(true); }}>
                       Change Strategy
                     </Button>
                   </div>
@@ -356,6 +387,7 @@ function RoomSeatingCard({
                       onChange={setNewColumnChoice}
                       seats={seatsQuery.data ?? []}
                       students={room.allocatedCapacity}
+                      onRequestMoreRooms={onRequestMoreRooms}
                     />
                     {regenerateMutation.isError && (
                       <Alert color="danger" title="Couldn't regenerate seating">
@@ -469,6 +501,7 @@ function ColumnGapQuestion({
   seats,
   students,
   disabled,
+  onRequestMoreRooms,
 }: {
   name: string;
   value: ColumnChoice;
@@ -476,6 +509,8 @@ function ColumnGapQuestion({
   seats: { colIndex: number; isActive: boolean }[];
   students: number;
   disabled?: boolean;
+  /** Offered when empty columns would not leave enough seats — the way out is more rooms. */
+  onRequestMoreRooms?: () => void;
 }) {
   const usable = withoutAlternateColumns(seats).filter((s) => s.isActive).length;
   const total = seats.filter((s) => s.isActive).length;
@@ -496,6 +531,14 @@ function ColumnGapQuestion({
         Yes — leave every second column empty
         {!fits && <span className="text-xs text-text-muted">(not enough seats: {usable} usable for {students} students)</span>}
       </label>
+      {!fits && onRequestMoreRooms && (
+        <div className="flex items-center gap-2">
+          <Button type="button" variant="secondary" size="sm" onClick={onRequestMoreRooms}>
+            Request more rooms
+          </Button>
+          <span className="text-xs text-text-muted">to make room for the empty-column layout</span>
+        </div>
+      )}
       {value === 'unset' && <p className="text-xs text-warning">Choose one to continue.</p>}
     </fieldset>
   );

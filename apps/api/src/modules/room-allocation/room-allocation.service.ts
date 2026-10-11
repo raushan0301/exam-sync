@@ -1,9 +1,18 @@
 import { packMixed } from './mixed-room-packing';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { ExamSession, ExamSessionStatus, Prisma, QuizStudentAssignmentStatus } from '@exam-sync/db';
+import {
+  ExamSession,
+  ExamSessionStatus,
+  NotificationEventType,
+  NotificationRecipientType,
+  Prisma,
+  QuizStudentAssignmentStatus,
+} from '@exam-sync/db';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
-import { AuthenticatedUser } from '../../common/auth/auth.types';
+import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
+import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
+import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService, ConflictDetail } from '../conflict-engine';
 import { RoomsService } from '../rooms';
@@ -89,6 +98,8 @@ export class RoomAllocationService {
     private readonly examSessionOwnershipService: ExamSessionOwnershipService,
     private readonly quizzesService: QuizzesService,
     private readonly quizOwnershipService: QuizOwnershipService,
+    private readonly roomHolds: RoomHoldsService,
+    private readonly notificationsOutbox: NotificationsOutboxService,
   ) {}
 
   /**
@@ -130,6 +141,7 @@ export class RoomAllocationService {
           backupRoomId: dto.backup_room_id ?? null,
           roomAllocationStrategy: dto.strategy ?? null,
           roomRejectionReason: null,
+          ...(dto.empty_columns !== undefined ? { emptyColumnsPlanned: dto.empty_columns } : {}),
           version: { increment: 1 },
         },
       });
@@ -367,6 +379,9 @@ export class RoomAllocationService {
       data: {
         requestedRoomIds: dto.room_ids,
         backupRoomId: dto.backup_room_id ?? null,
+        // Whether the backup is locked too once approved; the faculty picks, an ADMIN may change it while reviewing.
+        backupRoomLocked: dto.backup_room_id ? (dto.backup_locked ?? quiz.backupRoomLocked) : false,
+        emptyColumnsPlanned: dto.empty_columns ?? quiz.emptyColumnsPlanned,
         roomAllocationStrategy: dto.strategy ?? null,
         // A FACULTY resubmission supersedes whatever the admin last said
         // about the OLD request — only an ADMIN's own edit sets a note.
@@ -388,6 +403,7 @@ export class RoomAllocationService {
         `This session has no pending room request to reject (current status "${session.status}").`,
       );
     }
+    await this.assertNoPendingExtraRoomRequest(examSessionId);
 
     const updated = await this.prisma.$transaction(async (tx) => {
       const result = await tx.examSession.update({
@@ -446,6 +462,7 @@ export class RoomAllocationService {
         `Exam session is in status "${session.status}" and rooms can only be allocated while ROOM_ALLOCATION (pending a faculty room request).`,
       );
     }
+    await this.assertNoPendingExtraRoomRequest(examSessionId);
 
     const groups = await this.getStudentGroupsByQuiz(examSessionId);
     const totalStudents = groups.reduce((sum, g) => sum + g.count, 0);
@@ -498,7 +515,7 @@ export class RoomAllocationService {
       );
     }
 
-    const candidateRoomIds = [...new Set(attachments.flatMap((a) => a.quiz.requestedRoomIds))];
+    let candidateRoomIds = [...new Set(attachments.flatMap((a) => a.quiz.requestedRoomIds))];
 
     const groups = await this.getStudentGroupsByQuiz(examSessionId);
     const totalStudents = groups.reduce((sum, g) => sum + g.count, 0);
@@ -506,7 +523,32 @@ export class RoomAllocationService {
       throw new ConflictException('This session has no ASSIGNED students to allocate rooms for.');
     }
 
-    return this.performAllocation(examSessionId, session, groups, totalStudents, candidateRoomIds, actor);
+    // A held main room that is gone now (inactive, blocked, taken by another session) is replaced by the quiz's backup
+    // room automatically, when that backup is itself fine. Both the faculty and the admins are told.
+    const slot = { date: session.sessionDate, start: session.startTime, end: session.endTime };
+    const failing = new Set((await this.roomHolds.roomIssues(this.prisma, candidateRoomIds, slot, examSessionId)).map((i) => i.roomId));
+    const swaps: { quizTitle: string; ownerFacultyId: string; unavailableRoomId: string; backupRoomId: string }[] = [];
+    if (failing.size > 0) {
+      const backupIds = [...new Set(attachments.map((a) => a.quiz.backupRoomId).filter((id): id is string => !!id))];
+      const backupFailing = new Set((await this.roomHolds.roomIssues(this.prisma, backupIds, slot, examSessionId)).map((i) => i.roomId));
+      for (const { quiz } of attachments) {
+        const lost = quiz.requestedRoomIds.filter((id) => failing.has(id));
+        if (lost.length === 0 || !quiz.backupRoomId || backupFailing.has(quiz.backupRoomId) || candidateRoomIds.includes(quiz.backupRoomId)) continue;
+        candidateRoomIds = [...candidateRoomIds.filter((id) => id !== lost[0]), quiz.backupRoomId];
+        failing.delete(lost[0]);
+        swaps.push({ quizTitle: quiz.title, ownerFacultyId: quiz.createdByFacultyId, unavailableRoomId: lost[0], backupRoomId: quiz.backupRoomId });
+      }
+    }
+
+    return this.performAllocation(
+      examSessionId,
+      session,
+      groups,
+      totalStudents,
+      candidateRoomIds,
+      actor,
+      swaps.length > 0 ? (tx) => this.notifyBackupUsed(tx, session, swaps) : undefined,
+    );
   }
 
   private async performAllocation(
@@ -516,6 +558,7 @@ export class RoomAllocationService {
     totalStudents: number,
     candidateRoomIds: string[],
     actor: AuthenticatedUser,
+    afterInTransaction?: (tx: Prisma.TransactionClient) => Promise<void>,
   ): Promise<ExamSession> {
     const updatedSession = await this.prisma
       .$transaction(async (tx) => {
@@ -547,7 +590,21 @@ export class RoomAllocationService {
           });
         }
 
-        const activeSeatCounts = await this.getActiveSeatCounts(tx, candidateRoomIds);
+        // Seats other quizzes hold in these rooms (for an overlapping time) are not available to this session;
+        // this session's own quizzes' holds are the ones being turned into the real allocation.
+        const sessionQuizIds = groups.map((g) => g.quizId);
+        const heldByOthers = await this.roomHolds.heldSeatsByRoom(
+          tx,
+          candidateRoomIds,
+          { date: session.sessionDate, start: session.startTime, end: session.endTime },
+          sessionQuizIds,
+        );
+        const activeSeatCounts = new Map(
+          [...(await this.getActiveSeatCounts(tx, candidateRoomIds)).entries()].map(([roomId, seats]) => [
+            roomId,
+            Math.max(0, seats - (heldByOthers.get(roomId) ?? 0)),
+          ]),
+        );
         const totalCapacity = candidateRoomIds.reduce(
           (sum, id) => sum + (activeSeatCounts.get(id) ?? 0),
           0,
@@ -613,6 +670,15 @@ export class RoomAllocationService {
           }
         }
 
+        // The real booking now exists, so the seats held for these quizzes have done their job.
+        await this.roomHolds.consumeForQuizzes(tx, sessionQuizIds);
+
+        // The "empty columns?" answer given when rooms were requested becomes the seating default: any "yes" wins,
+        // "no" when every quiz said no, left unset when nobody was asked.
+        const planned = await tx.quiz.findMany({ where: { id: { in: sessionQuizIds } }, select: { emptyColumnsPlanned: true } });
+        const answers = planned.map((q) => q.emptyColumnsPlanned).filter((a): a is boolean => a !== null);
+        const emptyColumnsPlanned = session.emptyColumnsPlanned ?? (answers.length === 0 ? null : answers.some(Boolean));
+
         const updated = await tx.examSession.update({
           where: { id: examSessionId },
           data: {
@@ -620,6 +686,7 @@ export class RoomAllocationService {
             requestedRoomIds: [],
             backupRoomId: null,
             roomRejectionReason: null,
+            emptyColumnsPlanned,
             version: { increment: 1 },
           },
         });
@@ -636,11 +703,69 @@ export class RoomAllocationService {
           tx,
         );
 
+        if (afterInTransaction) await afterInTransaction(tx);
+
         return updated;
       })
       .catch((err) => this.mapExclusionViolation(err));
 
     return updatedSession;
+  }
+
+  /** A session sent back to the Rooms step by a "more rooms" request is decided under Room Requests, never through the first-allocation actions. */
+  private async assertNoPendingExtraRoomRequest(examSessionId: string): Promise<void> {
+    const pending = await this.prisma.examSessionRoomRequest.findFirst({
+      where: { examSessionId, status: 'PENDING' },
+      select: { id: true },
+    });
+    if (pending) {
+      throw new ConflictException('This session is waiting on a "more rooms" request — approve or decline it under Room Requests.');
+    }
+  }
+
+  /** Tells the quiz's faculty member and every admin which backup room replaced which unavailable room. */
+  private async notifyBackupUsed(
+    tx: Prisma.TransactionClient,
+    session: ExamSession,
+    swaps: { quizTitle: string; ownerFacultyId: string; unavailableRoomId: string; backupRoomId: string }[],
+  ): Promise<void> {
+    const rooms = await tx.room.findMany({
+      where: { id: { in: swaps.flatMap((s) => [s.unavailableRoomId, s.backupRoomId]) } },
+      select: { id: true, building: true, roomNumber: true },
+    });
+    const label = (id: string) => {
+      const room = rooms.find((r) => r.id === id);
+      return room ? `${room.building}-${room.roomNumber}` : '';
+    };
+    const admins = await tx.user.findMany({ where: { roles: { some: { role: { name: ROLE.ADMIN } } } }, select: { id: true } });
+    const faculty = await tx.faculty.findMany({
+      where: { id: { in: swaps.map((s) => s.ownerFacultyId) } },
+      select: { id: true, userId: true },
+    });
+    for (const swap of swaps) {
+      const payload = {
+        exam_session_id: session.id,
+        session_name: session.name,
+        quiz_title: swap.quizTitle,
+        unavailable_room: label(swap.unavailableRoomId),
+        backup_room: label(swap.backupRoomId),
+      };
+      const owner = faculty.find((f) => f.id === swap.ownerFacultyId);
+      const recipients: { type: NotificationRecipientType; id: string }[] = [
+        ...(owner ? [{ type: NotificationRecipientType.FACULTY, id: owner.userId }] : []),
+        ...admins.map((a) => ({ type: NotificationRecipientType.ADMIN, id: a.id })),
+      ];
+      for (const recipient of recipients) {
+        await this.notificationsOutbox.queue(tx, {
+          recipientType: recipient.type,
+          recipientId: recipient.id,
+          eventType: NotificationEventType.BACKUP_ROOM_USED,
+          entityId: `${session.id}:${swap.unavailableRoomId}`,
+          entityVersion: swap.backupRoomId,
+          payload,
+        });
+      }
+    }
   }
 
   private async resolveCandidateRoomIds(

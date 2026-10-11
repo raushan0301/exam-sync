@@ -150,6 +150,7 @@ export class SeatingEngineService {
     if (!(await this.examSessionOwnershipService.isOwnerOrCoInstructor(examSessionId, actor))) {
       throw new NotFoundException(); // IDOR-safe — mirrors quizzes.service.ts's own PATCH convention.
     }
+    await this.assertSeatingNotPaused(examSessionId);
 
     const examSessionRoom = await this.prisma.examSessionRoom.findUnique({
       where: { roomId_examSessionId: { roomId: dto.room_id, examSessionId } },
@@ -364,6 +365,7 @@ export class SeatingEngineService {
         `Seating plan is in status "${plan.status}" and can only be finalized from VALIDATED.`,
       );
     }
+    await this.assertSeatingNotPaused(plan.examSessionId);
 
     const { students, seats } = await this.resolveCohort(plan.examSessionId, undefined, plan.roomId);
     const persistedAssignments = await this.prisma.seatingAssignment.findMany({
@@ -460,6 +462,14 @@ export class SeatingEngineService {
     return updated;
   }
 
+  /** Seating is paused while a "more rooms" request waits for the admin: its students are about to be re-split, so nothing may be generated or finalized. */
+  private async assertSeatingNotPaused(examSessionId: string): Promise<void> {
+    const pending = await this.prisma.examSessionRoomRequest.findFirst({ where: { examSessionId, status: 'PENDING' }, select: { id: true } });
+    if (pending) {
+      throw new ConflictException('Seating is paused while a request for more rooms waits for admin approval. Cancel the request to carry on.');
+    }
+  }
+
   private async findById(planId: string): Promise<SeatingPlan> {
     const plan = await this.prisma.seatingPlan.findUnique({ where: { id: planId } });
     if (!plan) {
@@ -494,7 +504,32 @@ export class SeatingEngineService {
     const students: StudentToSeatInput[] = [];
     const seenStudentIds = new Set<string>();
 
-    for (const entry of thisRoomBreakdown) {
+    // After a "more rooms" request the exact students of each room are recorded (so finalized rooms can never shift while
+    // the others are re-split). Rooms without such rows — every session that never had extra rooms — derive their students
+    // the original way below.
+    const explicitMembers = await this.prisma.examSessionRoomStudent.findMany({
+      where: { examSessionRoomId: resolvedExamSessionRoomId },
+      orderBy: [{ quizId: 'asc' }, { studentId: 'asc' }],
+    });
+    if (explicitMembers.length > 0) {
+      const subjectByQuiz = new Map<string, string>();
+      for (const quizId of new Set(explicitMembers.map((m) => m.quizId))) {
+        subjectByQuiz.set(quizId, (await this.quizzesService.findById(quizId)).subjectId);
+      }
+      for (const member of explicitMembers) {
+        if (seenStudentIds.has(member.studentId)) continue; // BR-025: one seat per plan
+        seenStudentIds.add(member.studentId);
+        students.push({
+          studentId: member.studentId,
+          quizId: member.quizId,
+          subjectId: subjectByQuiz.get(member.quizId) ?? '',
+          batchId: '', // filled in below
+          requiresAccessibleSeat: false,
+        });
+      }
+    }
+
+    for (const entry of explicitMembers.length > 0 ? [] : thisRoomBreakdown) {
       const allRoomsForQuiz = await this.prisma.examSessionRoomQuiz.findMany({
         where: { quizId: entry.quizId, examSessionRoom: { examSessionId } },
         include: { examSessionRoom: true },

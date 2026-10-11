@@ -5,6 +5,7 @@ import { PrismaModule } from './common/prisma/prisma.module';
 import { AuditHookModule } from './common/audit/audit-hook.module';
 import { ImportJobsModule } from './common/import-jobs/import-jobs.module';
 import { NotificationsOutboxModule } from './common/notifications-outbox/notifications-outbox.module';
+import { RoomHoldsModule } from './common/room-holds/room-holds.module';
 import { QueueModule } from './common/queue/queue.module';
 import { HealthModule } from './modules/health/health.module';
 import { AuthModule } from './modules/auth/auth.module';
@@ -44,6 +45,7 @@ import { AdministrationModule } from './modules/administration/administration.mo
     AuditHookModule,
     ImportJobsModule,
     NotificationsOutboxModule,
+    RoomHoldsModule,
     QueueModule,
     HealthModule,
     AuthModule,

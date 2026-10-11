@@ -3,10 +3,11 @@
 import { useState } from 'react';
 import { Card, Alert, Button, Textarea, SkeletonText, ErrorState } from '@/components/ui';
 import { RoomAvailabilityCalendar } from '@/components/rooms/RoomAvailabilityCalendar';
+import { BackupLockChoice } from '@/components/rooms/RoomSuggestionCards';
 import { useQuizRoomConflicts } from '@/lib/queries/useQuizRoomSuggestions';
 import { useRequestQuizRooms } from '@/lib/mutations/useQuizMutations';
 import { mapError } from '@/lib/error-mapping';
-import type { Quiz } from '@/lib/queries/types';
+import type { Quiz, QuizDetail } from '@/lib/queries/types';
 
 /** "HH:MM" from either a full ISO datetime (preferredTime is stored on the 1970-01-01 base date) or an already-bare "HH:MM[:SS]" string. */
 function toHHMM(time: string): string {
@@ -85,6 +86,21 @@ export function QuizRoomConflictPanel({ quiz, canSwap = false }: QuizRoomConflic
     }
   }
 
+  async function setBackupLock(next: boolean) {
+    if (!data) return;
+    try {
+      await requestMutation.mutateAsync({
+        room_ids: data.requestedRooms.map((r) => r.roomId),
+        backup_room_id: data.backupRoom?.roomId,
+        backup_locked: next,
+        strategy: data.strategy ?? undefined,
+        admin_note: note.trim() || undefined,
+      });
+    } catch {
+      // surfaced below via requestMutation.error
+    }
+  }
+
   async function swapBackupRoom(newRoomId: string | undefined) {
     if (!data) return;
     try {
@@ -99,8 +115,29 @@ export function QuizRoomConflictPanel({ quiz, canSwap = false }: QuizRoomConflic
     }
   }
 
+  // Seats held for this quiz once approved — shown by room name, with the backup marked.
+  const holds = (quiz as QuizDetail).roomHolds ?? [];
+  const roomName = (roomId: string) => {
+    const row = data.requestedRooms.find((r) => r.roomId === roomId) ?? (data.backupRoom?.roomId === roomId ? data.backupRoom : null);
+    return row ? `${row.building} ${row.roomNumber}` : 'a room';
+  };
+
   return (
     <div className="flex flex-col gap-4">
+      {holds.length > 0 && (
+        <Alert color="success" title="Seats are held for this quiz">
+          {holds.map((h) => `${roomName(h.roomId)}: ${h.seatsHeld} seats${h.kind === 'BACKUP' ? ' (backup)' : ''}`).join(' · ')} — kept free for this exam window until the
+          rooms are allocated to its exam session. They are released if the session is created for a different time or is cancelled.
+        </Alert>
+      )}
+
+      {quiz.status === 'SUBMITTED' && hasRoomRequest && (
+        <Alert color="info" title="Approving holds these rooms">
+          On approval the seats of the requested rooms (and the backup room, if locked below) are held for this quiz&apos;s date and time, so no other quiz can take them.
+          If another quiz already holds those seats, approval is refused and you can swap a room first.
+        </Alert>
+      )}
+
       {data.studentConflicts.length > 0 && (
         <Alert color="danger" title="Student schedule conflict (BR-019)">
           <div className="flex flex-col gap-1">
@@ -206,6 +243,14 @@ export function QuizRoomConflictPanel({ quiz, canSwap = false }: QuizRoomConflic
           </li>
         ))}
       </ul>
+      {data.backupRoom && canSwap && quiz.status === 'SUBMITTED' && (
+        <BackupLockChoice
+          name={`admin-backup-lock-${quiz.id}`}
+          value={quiz.backupRoomLocked ?? false}
+          onChange={setBackupLock}
+          disabled={requestMutation.isPending}
+        />
+      )}
       {data.backupRoom && (
         <div className="rounded border border-border p-2 text-sm">
           <p className="text-xs font-medium text-text-muted">Backup room (faculty-nominated)</p>

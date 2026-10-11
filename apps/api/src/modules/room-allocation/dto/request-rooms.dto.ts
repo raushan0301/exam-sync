@@ -1,4 +1,4 @@
-import { ArrayNotEmpty, ArrayUnique, IsArray, IsOptional, IsString, IsUUID, MinLength } from 'class-validator';
+import { ArrayNotEmpty, ArrayUnique, IsArray, IsBoolean, IsOptional, IsString, IsUUID, MinLength } from 'class-validator';
 
 /**
  * `POST /exam-sessions/{id}/rooms/request` (FACULTY, ownership-gated).
@@ -25,6 +25,16 @@ export class RequestRoomsDto {
   @IsString()
   @MinLength(1)
   strategy?: string;
+
+  /** Hold the backup room's seats too once the quiz is approved (the faculty picks; an ADMIN may change it while reviewing). */
+  @IsOptional()
+  @IsBoolean()
+  backup_locked?: boolean;
+
+  /** Answer to "leave every second seat column empty?" — sizes the rooms and becomes the seating default. */
+  @IsOptional()
+  @IsBoolean()
+  empty_columns?: boolean;
 
   /** ADMIN only — a short note explaining an adjustment (room swap, backup removed), shown back to the faculty. Ignored when the caller is FACULTY. */
   @IsOptional()

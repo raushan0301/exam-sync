@@ -90,6 +90,7 @@ model User {
   incidentActions            IncidentHistory[]
   requestedReportJobs        ReportJob[]
   reviewedSuspensionRequests ExamSessionSuspensionRequest[] @relation("SuspensionReviewedBy")
+  reviewedRoomRequests       ExamSessionRoomRequest[]       @relation("RoomRequestReviewedBy")
   auditLogEntries            AuditLog[]
 
   @@map("users")
@@ -406,6 +407,7 @@ model Faculty {
   attendanceChanges  AttendanceHistory[]
   reportedIncidents  Incident[]
   suspensionRequests ExamSessionSuspensionRequest[]
+  roomRequests       ExamSessionRoomRequest[]
 
   @@index([departmentId])
   @@map("faculty")
@@ -582,6 +584,10 @@ model Quiz {
   /// what actually gets allocated.
   requestedRoomIds       String[]   @default([]) @map("requested_room_ids") @db.Uuid
   backupRoomId           String?    @map("backup_room_id") @db.Uuid
+  /// Lock the backup room too once the quiz is approved (the faculty picks, the admin may change at approval).
+  backupRoomLocked       Boolean    @default(false) @map("backup_room_locked")
+  /// Answer to "leave every second seat column empty?" when rooms were requested; null = not asked.
+  emptyColumnsPlanned    Boolean?   @map("empty_columns_planned")
   roomAllocationStrategy String?    @map("room_allocation_strategy")
   /// Set whenever an ADMIN adjusts this room request (swaps a room,
   /// drops the backup room) while reviewing — a short note explaining why,
@@ -602,6 +608,7 @@ model Quiz {
   batches                QuizBatch[]
   approvalHistory        QuizApprovalHistory[]
   sessionAttachments     ExamSessionQuiz[]
+  roomHolds              RoomHold[]
   studentAssignments     QuizStudentAssignment[]
   examSessionRoomQuizzes ExamSessionRoomQuiz[]
   seatingAssignments     SeatingAssignment[]
@@ -735,6 +742,8 @@ model ExamSession {
   /// request — admin can keep, drop, or swap it in for a primary room
   /// that turns out to be unavailable at approval time.
   backupRoomId           String?           @map("backup_room_id") @db.Uuid
+  /// Session-level default for "leave every second seat column empty?" (null = not asked); pre-selected at seating time.
+  emptyColumnsPlanned    Boolean?          @map("empty_columns_planned")
   /// Which RoomSuggestionService strategy the faculty picked when
   /// building `requestedRoomIds` — display-only, shown to the admin
   /// during review.
@@ -758,6 +767,7 @@ model ExamSession {
   incidents          Incident[]
   reportJobs         ReportJob[]
   suspensionRequests ExamSessionSuspensionRequest[]
+  roomRequests       ExamSessionRoomRequest[]
 
   @@index([status])
   @@map("exam_sessions")
@@ -921,6 +931,7 @@ model Room {
   seats              RoomSeat[]
   availabilityBlocks RoomAvailability[]
   sessionAllocations ExamSessionRoom[]
+  holds              RoomHold[]
   backupForSessions  ExamSession[]      @relation("ExamSessionBackupRoom")
   backupForQuizzes   Quiz[]             @relation("QuizBackupRoom")
   seatingPlans       SeatingPlan[]
@@ -1022,6 +1033,7 @@ model ExamSessionRoom {
   examSession   ExamSession           @relation(fields: [examSessionId], references: [id])
   room          Room                  @relation(fields: [roomId], references: [id])
   quizBreakdown ExamSessionRoomQuiz[]
+  students      ExamSessionRoomStudent[]
 
   @@unique([roomId, examSessionId])
   @@index([examSessionId])
@@ -1184,6 +1196,16 @@ enum NotificationEventType {
   INVIGILATOR_ASSIGNED
   /// An invigilator duty ended: the assignment was removed, or the session was cancelled — sent to that faculty.
   INVIGILATOR_REMOVED
+  /// Rooms held for an approved quiz were released (session created for another time, or the session was cancelled) — sent to the quiz's faculty.
+  ROOM_HOLD_RELEASED
+  /// A main room was unavailable at allocation and the quiz's backup room was used instead — sent to the faculty and the admins.
+  BACKUP_ROOM_USED
+  /// A faculty member asked for more rooms during seating — fans out to every ADMIN.
+  ROOM_REQUEST_SUBMITTED
+  /// The admin approved the extra rooms — sent to the requesting faculty.
+  ROOM_REQUEST_APPROVED
+  /// The admin declined the extra rooms — sent to the requesting faculty.
+  ROOM_REQUEST_REJECTED
   INCIDENT_STATUS_UPDATED
   /// Phase 19 — ARCHITECTURE.md §AV/line 809: exports are "delivered via
   /// signed URL + notification". Added here (additive enum member, same
@@ -1705,4 +1727,112 @@ enum AuditAction {
   UPDATE
   DEACTIVATE
   REACTIVATE
+}
+
+enum RoomHoldKind {
+  MAIN
+  BACKUP
+}
+
+enum RoomHoldStatus {
+  /// Seats are held for the quiz; counts against the room's free seats for overlapping times.
+  ACTIVE
+  /// The rooms were allocated to a session — the real booking (exam_session_rooms) replaces the hold.
+  CONSUMED
+  /// Given up: the session was created for another time, was cancelled, or the quiz stopped needing the room.
+  RELEASED
+}
+
+/// Seats of a room held for an APPROVED quiz in its exam window, from approval until the rooms are allocated to a
+/// session. Counted by seats, not whole rooms, so several quizzes meant for one combined exam can hold the same room
+/// as long as the seats add up (the check runs under a row lock on the room).
+model RoomHold {
+  id            String         @id @default(uuid()) @db.Uuid
+  roomId        String         @map("room_id") @db.Uuid
+  quizId        String         @map("quiz_id") @db.Uuid
+  /// Set when the hold was placed for a pending "more rooms" request (released if it is declined or cancelled, consumed when approved).
+  requestId     String?        @map("request_id") @db.Uuid
+  kind          RoomHoldKind
+  seatsHeld     Int            @map("seats_held")
+  holdDate      DateTime       @map("hold_date") @db.Date
+  startTime     DateTime       @map("start_time") @db.Time
+  endTime       DateTime       @map("end_time") @db.Time
+  status        RoomHoldStatus @default(ACTIVE)
+  releaseReason String?        @map("release_reason")
+  releasedAt    DateTime?      @map("released_at")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  room    Room                    @relation(fields: [roomId], references: [id])
+  quiz    Quiz                    @relation(fields: [quizId], references: [id])
+  request ExamSessionRoomRequest? @relation(fields: [requestId], references: [id])
+
+  @@index([roomId, holdDate, status])
+  @@index([requestId])
+  @@index([quizId, status])
+  @@map("room_holds")
+}
+
+enum RoomRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  /// The faculty withdrew the request (or the session was cancelled) before an admin decided.
+  CANCELLED
+}
+
+enum RoomRequestTrigger {
+  TOO_MANY_STUDENTS
+  NO_ROOM_FOR_EMPTY_COLUMNS
+  OTHER
+}
+
+/// A faculty member's request for MORE rooms during seating (before every room's seating is finalized). While it is
+/// PENDING the session is sent back to the Rooms step (ROOM_ALLOCATION) so seating pauses; on approval the new rooms are
+/// added and students of rooms that are not finalized are re-split; on decline or cancel the session returns to
+/// `previousStatus` exactly as it was. At most one PENDING request per session (partial unique index).
+model ExamSessionRoomRequest {
+  id                   String             @id @default(uuid()) @db.Uuid
+  examSessionId        String             @map("exam_session_id") @db.Uuid
+  requestedByFacultyId String             @map("requested_by_faculty_id") @db.Uuid
+  reason               String
+  trigger              RoomRequestTrigger
+  status               RoomRequestStatus  @default(PENDING)
+  /// The session status to restore if the request is declined or cancelled.
+  previousStatus       ExamSessionStatus  @map("previous_status")
+  /// The "leave every second seat column empty?" answer given with the request (null = not asked).
+  emptyColumns         Boolean?           @map("empty_columns")
+  requestedRoomIds     String[]           @default([]) @map("requested_room_ids") @db.Uuid
+  /// The rooms actually added (the admin may have changed the requested ones).
+  approvedRoomIds      String[]           @default([]) @map("approved_room_ids") @db.Uuid
+  reviewedByAdminId    String?            @map("reviewed_by_admin_id") @db.Uuid
+  reviewNote           String?            @map("review_note")
+  reviewedAt           DateTime?          @map("reviewed_at")
+  createdAt            DateTime           @default(now()) @map("created_at")
+  updatedAt            DateTime           @updatedAt @map("updated_at")
+
+  examSession        ExamSession @relation(fields: [examSessionId], references: [id])
+  requestedByFaculty Faculty     @relation(fields: [requestedByFacultyId], references: [id])
+  reviewedByAdmin    User?       @relation("RoomRequestReviewedBy", fields: [reviewedByAdminId], references: [id])
+  holds              RoomHold[]
+
+  @@index([examSessionId, status])
+  @@index([status, createdAt])
+  @@map("exam_session_room_requests")
+}
+
+/// Exactly which students sit in which allocated room, per quiz. Written when rooms are re-split after a "more rooms"
+/// request, so finalized rooms keep their students while the others are re-split. Rooms without rows here (every
+/// session that never had extra rooms) still derive their students the original way.
+model ExamSessionRoomStudent {
+  examSessionRoomId String   @map("exam_session_room_id") @db.Uuid
+  quizId            String   @map("quiz_id") @db.Uuid
+  studentId         String   @map("student_id") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  examSessionRoom ExamSessionRoom @relation(fields: [examSessionRoomId], references: [id], onDelete: Cascade)
+
+  @@id([examSessionRoomId, quizId, studentId])
+  @@index([studentId])
+  @@map("exam_session_room_students")
 }

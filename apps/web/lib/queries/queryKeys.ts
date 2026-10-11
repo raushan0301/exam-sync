@@ -8,7 +8,7 @@ export const queryKeys = {
   quizzes: (params?: Record<string, string | undefined>) => ['quizzes', 'list', params ?? {}] as const,
   quiz: (id: string) => ['quizzes', 'detail', id] as const,
   quizApprovalHistory: (id: string) => ['quizzes', 'approval-history', id] as const,
-  quizRoomSuggestions: (id: string) => ['quizzes', id, 'rooms', 'suggest'] as const,
+  quizRoomSuggestions: (id: string, emptyColumns = false) => ['quizzes', id, 'rooms', 'suggest', emptyColumns] as const,
   quizRoomConflicts: (id: string) => ['quizzes', id, 'rooms', 'conflicts'] as const,
   eligibleStudentCount: (params: Record<string, string | undefined>) => ['quizzes', 'eligible-student-count', params] as const,
   incidents: (params?: Record<string, string | undefined>) => ['incidents', 'list', params ?? {}] as const,
@@ -29,6 +29,9 @@ export const queryKeys = {
 
   examSessions: (params?: Record<string, string | undefined>) => ['exam-sessions', 'list', params ?? {}] as const,
   examSession: (id: string) => ['exam-sessions', 'detail', id] as const,
+  roomRequests: (params?: Record<string, string | undefined>) => ['room-requests', 'list', params ?? {}] as const,
+  roomRequest: (id: string) => ['room-requests', 'detail', id] as const,
+  extraRooms: (examSessionId: string, emptyColumns?: boolean) => ['exam-sessions', examSessionId, 'rooms', 'extra', emptyColumns ?? 'default'] as const,
   suspensionRequests: (params?: Record<string, string | undefined>) => ['suspension-requests', 'list', params ?? {}] as const,
   examSessionConflicts: (id: string) => ['exam-sessions', 'conflicts', id] as const,
   examSessionRoster: (id: string, params?: Record<string, string | undefined>) =>
@@ -37,7 +40,7 @@ export const queryKeys = {
   rooms: (params?: Record<string, string | undefined>) => ['rooms', 'list', params ?? {}] as const,
   room: (id: string) => ['rooms', 'detail', id] as const,
   availableRooms: (params?: Record<string, string | undefined>) => ['rooms', 'available', params ?? {}] as const,
-  roomSuggestions: (examSessionId: string) => ['exam-sessions', examSessionId, 'rooms', 'suggest'] as const,
+  roomSuggestions: (examSessionId: string, emptyColumns = false) => ['exam-sessions', examSessionId, 'rooms', 'suggest', emptyColumns] as const,
   roomAvailabilityPreview: (examSessionId: string) => ['exam-sessions', examSessionId, 'rooms', 'preview'] as const,
   roomsAvailabilityCalendar: (params?: Record<string, string | undefined>) =>
     ['rooms', 'availability-calendar', params ?? {}] as const,

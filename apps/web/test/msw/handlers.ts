@@ -103,6 +103,8 @@ export interface MockQuiz {
   semester: number;
   requestedRoomIds?: string[];
   backupRoomId?: string | null;
+  backupRoomLocked?: boolean;
+  emptyColumnsPlanned?: boolean | null;
   roomAllocationStrategy?: string | null;
   roomAdjustmentNote?: string | null;
   version?: number;
@@ -373,6 +375,8 @@ export interface MockExamSession {
     | 'COMPLETED'
     | 'CANCELLED';
   createdByAdminId: string;
+  /** The "empty columns?" answer given with the room request — pre-selected at seating time. */
+  emptyColumnsPlanned?: boolean | null;
   version: number;
   /** Mock-only convenience: ids of currently-attached quizzes, resolved against QUIZZES for the detail response. */
   quizIds: string[];
@@ -413,6 +417,70 @@ export interface MockSuspensionRequest {
   facultyName: string;
   facultyEmployeeCode: string;
 }
+/** A "more rooms" request as the mocked API returns it (`GET /room-requests`). */
+export interface MockRoomRequest {
+  id: string;
+  examSessionId: string;
+  requestedByFacultyId: string;
+  reason: string;
+  trigger: 'TOO_MANY_STUDENTS' | 'NO_ROOM_FOR_EMPTY_COLUMNS' | 'OTHER';
+  status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
+  previousStatus: string;
+  emptyColumns: boolean | null;
+  requestedRoomIds: string[];
+  approvedRoomIds: string[];
+  reviewedByAdminId: string | null;
+  reviewNote: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  examSessionName: string;
+  examSessionDate: string;
+  examSessionStartTime: string;
+  examSessionEndTime: string;
+  examSessionStatus: string;
+  facultyName: string;
+  facultyEmployeeCode: string;
+  requestedRooms: { roomId: string; label: string; capacity: number; freeSeats: number; available: boolean; reason?: string }[];
+  approvedRoomLabels: string[];
+  currentRooms: { roomId: string; label: string; allocated: number; finalized: boolean }[];
+  studentsToPlace: number;
+}
+
+export let ROOM_REQUESTS: MockRoomRequest[] = [];
+export function setMockRoomRequests(items: MockRoomRequest[]) {
+  ROOM_REQUESTS = items;
+}
+/** The last body the mocked `POST /exam-sessions/{id}/room-requests` and approve/reject calls received. */
+export let LAST_ROOM_REQUEST_BODY: Record<string, unknown> | null = null;
+export let LAST_ROOM_REQUEST_ACTION: { action: string; id: string; body: Record<string, unknown> | null } | null = null;
+/** What `GET /exam-sessions/{id}/rooms/extra` returns — tests override pieces of it. */
+export let EXTRA_ROOMS_STATE: Record<string, unknown> = {};
+export function setMockExtraRoomsState(state: Record<string, unknown>) {
+  EXTRA_ROOMS_STATE = state;
+}
+export function defaultExtraRoomsState(over: Record<string, unknown> = {}) {
+  return {
+    canRequest: true,
+    blockedReason: null,
+    pending: null,
+    latestRejected: null,
+    studentsToPlace: 30,
+    fullSeats: 20,
+    usableSeats: 20,
+    emptyColumns: false,
+    seatsNeeded: 10,
+    trigger: 'TOO_MANY_STUDENTS',
+    rooms: [],
+    suggestion: { rooms: [{ roomId: 'room-x', building: 'B', floor: 0, roomNumber: '201', capacity: 20, allocated: 10 }], location: 'Building B · floor 0', spansBuildings: false },
+    allRooms: [
+      { roomId: 'room-x', building: 'B', floor: 0, roomNumber: '201', capacity: 20 },
+      { roomId: 'room-y', building: 'B', floor: 1, roomNumber: '305', capacity: 40 },
+    ],
+    ...over,
+  };
+}
+
 export let SUSPENSION_REQUESTS: MockSuspensionRequest[] = [];
 export function setMockSuspensionRequests(items: MockSuspensionRequest[]) {
   SUSPENSION_REQUESTS = items;
@@ -691,6 +759,67 @@ function toExamSessionDetailResponse(session: MockExamSession) {
   };
 }
 
+/** Held seats per quiz id, returned on `GET /quizzes/{id}` as `roomHolds`. */
+let QUIZ_ROOM_HOLDS: Record<string, { roomId: string; kind: 'MAIN' | 'BACKUP'; seatsHeld: number; holdDate: string; startTime: string; endTime: string }[]> = {};
+export function setMockQuizRoomHolds(holds: typeof QUIZ_ROOM_HOLDS) {
+  QUIZ_ROOM_HOLDS = holds;
+}
+
+/** The last body the mocked `POST /quizzes/{id}/rooms/request` received, so tests can check what the screen sent. */
+let LAST_QUIZ_ROOM_REQUEST_BODY: Record<string, unknown> | null = null;
+export function getLastQuizRoomRequestBody() {
+  return LAST_QUIZ_ROOM_REQUEST_BODY;
+}
+
+/** When true the mocked room suggestions include a "fewest rooms overall" alternative, so tests can exercise the either/or choice. */
+let ROOM_SUGGESTION_ALTERNATIVE = false;
+export function setMockRoomSuggestionAlternative(value: boolean) {
+  ROOM_SUGGESTION_ALTERNATIVE = value;
+}
+
+type MockSuggestedRoom = { roomId: string; building: string; floor: number; roomNumber: string; capacity: number; allocated: number };
+
+/** Mirrors the API's response shape: two strategies, each with a location summary and (optionally) an alternative. */
+function buildRoomSuggestionResponse(totalStudents: number, emptyColumns: boolean) {
+  const available = ROOMS.filter((r) => r.status === 'ACTIVE').map((r) => ({ ...r, capacity: emptyColumns ? Math.ceil(r.capacity / 2) : r.capacity }));
+  const sorted = [...available].sort((a, b) => b.capacity - a.capacity);
+  const rooms: MockSuggestedRoom[] = [];
+  let remaining = totalStudents;
+  for (const r of sorted) {
+    if (remaining <= 0) break;
+    const allocated = Math.min(remaining, r.capacity);
+    rooms.push({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated });
+    remaining -= allocated;
+  }
+  const totalCapacity = rooms.reduce((sum, r) => sum + r.capacity, 0);
+  const location = rooms.length > 0 ? `Building ${rooms[0].building} · floor ${rooms[0].floor}` : '';
+  const figures = {
+    roomCount: rooms.length,
+    totalCapacity,
+    utilizationPercent: totalCapacity === 0 ? 0 : Math.round((totalStudents / totalCapacity) * 100),
+    rooms,
+    location,
+    spansBuildings: false,
+  };
+  const alternative = ROOM_SUGGESTION_ALTERNATIVE && rooms.length > 0
+    ? { label: 'Fewest rooms overall', description: 'Largest rooms wherever they are.', ...figures, roomCount: Math.max(1, rooms.length - 1), rooms: rooms.slice(0, Math.max(1, rooms.length - 1)), location: 'Building Z · floor 3', spansBuildings: true }
+    : undefined;
+  const strategy = (key: string, label: string, description: string) => ({ strategy: key, label, description, ...figures, ...(alternative ? { alternative } : {}) });
+  return {
+    totalStudents,
+    emptyColumns,
+    shortfall: totalCapacity < totalStudents,
+    availableRoomCount: available.length,
+    strategies: [
+      strategy('FEWEST_ROOMS', 'Fewest Classes', 'Stays in one building, floor by floor.'),
+      strategy('BALANCED_SPREAD', 'Balanced Spread', 'Same rooms, spread evenly.'),
+    ],
+    allRooms: [...available]
+      .sort((a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }))
+      .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity })),
+  };
+}
+
 export const handlers = [
   http.post(`${API_BASE_URL}/auth/login`, async ({ request }) => {
     const body = (await request.json()) as { email: string; password: string };
@@ -841,7 +970,7 @@ export const handlers = [
           })),
         }
       : null;
-    return HttpResponse.json({ ...quiz, examSession });
+    return HttpResponse.json({ ...quiz, examSession, roomHolds: QUIZ_ROOM_HOLDS[quiz.id] ?? [] });
   }),
 
   http.patch(`${API_BASE_URL}/quizzes/:id`, async ({ request, params }) => {
@@ -1560,6 +1689,113 @@ export const handlers = [
     return HttpResponse.json(toExamSessionResponse(EXAM_SESSIONS[idx]));
   }),
 
+  // -- "Request more rooms" during seating --------------------------------------
+  http.get(`${API_BASE_URL}/room-requests`, ({ request }) => {
+    const url = new URL(request.url);
+    const status = url.searchParams.get('status');
+    const sessionId = url.searchParams.get('exam_session_id');
+    const limit = Math.min(Number(url.searchParams.get('limit') ?? 25), 200);
+    const cursor = url.searchParams.get('cursor');
+    let items = [...ROOM_REQUESTS].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (status) items = items.filter((r) => r.status === status);
+    if (sessionId) items = items.filter((r) => r.examSessionId === sessionId);
+    const start = cursor ? items.findIndex((r) => r.id === cursor) + 1 : 0;
+    const page = items.slice(start, start + limit);
+    return HttpResponse.json({ items: page, next_cursor: start + limit < items.length ? page[page.length - 1].id : null });
+  }),
+
+  http.get(`${API_BASE_URL}/room-requests/:id`, ({ params }) => {
+    const req = ROOM_REQUESTS.find((r) => r.id === params.id);
+    if (!req) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    return HttpResponse.json({
+      ...req,
+      options: [
+        { roomId: 'room-z', building: 'B', floor: 2, roomNumber: '410', capacity: 30 },
+        { roomId: 'room-y', building: 'B', floor: 1, roomNumber: '305', capacity: 40 },
+      ],
+    });
+  }),
+
+  http.get(`${API_BASE_URL}/exam-sessions/:id/rooms/extra`, () => HttpResponse.json(EXTRA_ROOMS_STATE.canRequest === undefined ? defaultExtraRoomsState() : EXTRA_ROOMS_STATE)),
+
+  http.post(`${API_BASE_URL}/exam-sessions/:id/room-requests`, async ({ request, params }) => {
+    const idx = EXAM_SESSIONS.findIndex((s) => s.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const body = (await request.json()) as { room_ids: string[]; reason: string; empty_columns?: boolean };
+    LAST_ROOM_REQUEST_BODY = body;
+    if (ROOM_REQUESTS.some((r) => r.examSessionId === params.id && r.status === 'PENDING')) {
+      return HttpResponse.json({ message: 'A request for more rooms is already waiting for admin approval for this session.' }, { status: 409 });
+    }
+    const session = EXAM_SESSIONS[idx];
+    const created: MockRoomRequest = {
+      id: nextId('roomreq'),
+      examSessionId: session.id,
+      requestedByFacultyId: 'fac-1',
+      reason: body.reason,
+      trigger: 'TOO_MANY_STUDENTS',
+      status: 'PENDING',
+      previousStatus: session.status,
+      emptyColumns: body.empty_columns ?? null,
+      requestedRoomIds: body.room_ids,
+      approvedRoomIds: [],
+      reviewedByAdminId: null,
+      reviewNote: null,
+      reviewedAt: null,
+      createdAt: NOW(),
+      updatedAt: NOW(),
+      examSessionName: session.name,
+      examSessionDate: session.sessionDate,
+      examSessionStartTime: session.startTime,
+      examSessionEndTime: session.endTime,
+      examSessionStatus: 'ROOM_ALLOCATION',
+      facultyName: 'Jaskirat Singh',
+      facultyEmployeeCode: 'FAC001',
+      requestedRooms: body.room_ids.map((roomId) => ({ roomId, label: `B-${roomId}`, capacity: 20, freeSeats: 20, available: true })),
+      approvedRoomLabels: [],
+      currentRooms: [{ roomId: 'room-1', label: 'A-101', allocated: 10, finalized: true }, { roomId: 'room-2', label: 'A-102', allocated: 30, finalized: false }],
+      studentsToPlace: 30,
+    };
+    ROOM_REQUESTS = [...ROOM_REQUESTS, created];
+    EXAM_SESSIONS[idx] = { ...session, status: 'ROOM_ALLOCATION', version: session.version + 1, updatedAt: NOW() };
+    return HttpResponse.json(created, { status: 201 });
+  }),
+
+  http.post(`${API_BASE_URL}/room-requests/:id/cancel`, ({ params }) => {
+    const idx = ROOM_REQUESTS.findIndex((r) => r.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const req = ROOM_REQUESTS[idx];
+    LAST_ROOM_REQUEST_ACTION = { action: 'cancel', id: req.id, body: null };
+    ROOM_REQUESTS[idx] = { ...req, status: 'CANCELLED', updatedAt: NOW() };
+    const sIdx = EXAM_SESSIONS.findIndex((s) => s.id === req.examSessionId);
+    if (sIdx !== -1) EXAM_SESSIONS[sIdx] = { ...EXAM_SESSIONS[sIdx], status: req.previousStatus as MockExamSession['status'] };
+    return HttpResponse.json(ROOM_REQUESTS[idx]);
+  }),
+
+  http.post(`${API_BASE_URL}/room-requests/:id/approve`, async ({ request, params }) => {
+    const idx = ROOM_REQUESTS.findIndex((r) => r.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const body = ((await request.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+    const req = ROOM_REQUESTS[idx];
+    LAST_ROOM_REQUEST_ACTION = { action: 'approve', id: req.id, body };
+    ROOM_REQUESTS[idx] = { ...req, status: 'APPROVED', approvedRoomIds: (body.room_ids as string[] | undefined) ?? req.requestedRoomIds, reviewNote: (body.note as string | undefined) ?? null, reviewedAt: NOW(), updatedAt: NOW() };
+    const sIdx = EXAM_SESSIONS.findIndex((s) => s.id === req.examSessionId);
+    if (sIdx !== -1) EXAM_SESSIONS[sIdx] = { ...EXAM_SESSIONS[sIdx], status: 'SEATING_GENERATION' };
+    return HttpResponse.json(ROOM_REQUESTS[idx]);
+  }),
+
+  http.post(`${API_BASE_URL}/room-requests/:id/reject`, async ({ request, params }) => {
+    const idx = ROOM_REQUESTS.findIndex((r) => r.id === params.id);
+    if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
+    const body = (await request.json()) as { note?: string };
+    if (!body.note?.trim()) return HttpResponse.json({ message: 'Please explain why the request is being declined.' }, { status: 400 });
+    const req = ROOM_REQUESTS[idx];
+    LAST_ROOM_REQUEST_ACTION = { action: 'reject', id: req.id, body };
+    ROOM_REQUESTS[idx] = { ...req, status: 'REJECTED', reviewNote: body.note, reviewedAt: NOW(), updatedAt: NOW() };
+    const sIdx = EXAM_SESSIONS.findIndex((s) => s.id === req.examSessionId);
+    if (sIdx !== -1) EXAM_SESSIONS[sIdx] = { ...EXAM_SESSIONS[sIdx], status: req.previousStatus as MockExamSession['status'] };
+    return HttpResponse.json(ROOM_REQUESTS[idx]);
+  }),
+
   // -- Suspension requests: faculty ask, admin decides (replaces the old direct faculty cancel) --------
   http.get(`${API_BASE_URL}/suspension-requests`, ({ request }) => {
     const url = new URL(request.url);
@@ -1793,47 +2029,14 @@ export const handlers = [
   }),
 
   // -- Quiz-stage room suggestion + request (before any exam session exists) --
-  http.get(`${API_BASE_URL}/quizzes/:id/rooms/suggest`, ({ params }) => {
+  http.get(`${API_BASE_URL}/quizzes/:id/rooms/suggest`, ({ request, params }) => {
     const quiz = QUIZZES.find((q) => q.id === params.id);
     if (!quiz) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
     const totalStudents = quiz.studentCount ?? 0;
     if (totalStudents === 0) {
       return HttpResponse.json({ message: 'Set student_count on the quiz before requesting room suggestions.' }, { status: 409 });
     }
-    const available = ROOMS.filter((r) => r.status === 'ACTIVE');
-    const sorted = [...available].sort((a, b) => b.capacity - a.capacity);
-    const rooms: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number; allocated: number }[] = [];
-    let remaining = totalStudents;
-    for (const r of sorted) {
-      if (remaining <= 0) break;
-      const allocated = Math.min(remaining, r.capacity);
-      rooms.push({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated });
-      remaining -= allocated;
-    }
-    const totalCapacity = rooms.reduce((sum, r) => sum + r.capacity, 0);
-    const strategy = (strategyKey: string, label: string, description: string) => ({
-      strategy: strategyKey,
-      label,
-      description,
-      roomCount: rooms.length,
-      totalCapacity,
-      utilizationPercent: totalCapacity === 0 ? 0 : Math.round((totalStudents / totalCapacity) * 100),
-      rooms,
-    });
-    const allRooms = [...available]
-      .sort((a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }))
-      .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity }));
-    return HttpResponse.json({
-      totalStudents,
-      shortfall: totalCapacity < totalStudents,
-      availableRoomCount: available.length,
-      strategies: [
-        strategy('FEWEST_ROOMS', 'Fewest Classes', 'Largest rooms first, filled to capacity.'),
-        strategy('SEQUENTIAL', 'Sequential (Adjacent Rooms)', 'Building/room-number order.'),
-        strategy('BALANCED_SPREAD', 'Balanced Spread', 'Same rooms, spread evenly.'),
-      ],
-      allRooms,
-    });
+    return HttpResponse.json(buildRoomSuggestionResponse(totalStudents, new URL(request.url).searchParams.get('empty_columns') === 'true'));
   }),
 
   http.post(`${API_BASE_URL}/quizzes/:id/rooms/request`, async ({ request, params }) => {
@@ -1841,11 +2044,21 @@ export const handlers = [
     if (idx === -1) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
     const user = userFromAuthHeader(request);
     const isAdmin = user?.roles?.includes('ADMIN') ?? false;
-    const body = (await request.json()) as { room_ids: string[]; backup_room_id?: string; strategy?: string; admin_note?: string };
+    const body = (await request.json()) as {
+      room_ids: string[];
+      backup_room_id?: string;
+      backup_locked?: boolean;
+      empty_columns?: boolean;
+      strategy?: string;
+      admin_note?: string;
+    };
+    LAST_QUIZ_ROOM_REQUEST_BODY = body;
     QUIZZES[idx] = {
       ...QUIZZES[idx],
       requestedRoomIds: body.room_ids,
       backupRoomId: body.backup_room_id ?? null,
+      backupRoomLocked: body.backup_room_id ? (body.backup_locked ?? QUIZZES[idx].backupRoomLocked ?? false) : false,
+      emptyColumnsPlanned: body.empty_columns ?? QUIZZES[idx].emptyColumnsPlanned ?? null,
       roomAllocationStrategy: body.strategy ?? null,
       roomAdjustmentNote: isAdmin ? (body.admin_note ?? null) : null,
     };
@@ -1887,47 +2100,14 @@ export const handlers = [
   }),
 
   // -- Milestone 7 / room-request-approval: Room Allocation -------------
-  http.get(`${API_BASE_URL}/exam-sessions/:id/rooms/suggest`, ({ params }) => {
+  http.get(`${API_BASE_URL}/exam-sessions/:id/rooms/suggest`, ({ request, params }) => {
     const session = EXAM_SESSIONS.find((s) => s.id === params.id);
     if (!session) return HttpResponse.json({ message: 'Not found' }, { status: 404 });
     const totalStudents = ROSTER.filter((r) => r.examSessionId === session.id && r.status === 'ASSIGNED').length;
     if (totalStudents === 0) {
       return HttpResponse.json({ message: 'This session has no ASSIGNED students to size room suggestions for.' }, { status: 409 });
     }
-    const available = ROOMS.filter((r) => r.status === 'ACTIVE');
-    const sorted = [...available].sort((a, b) => b.capacity - a.capacity);
-    const rooms: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number; allocated: number }[] = [];
-    let remaining = totalStudents;
-    for (const r of sorted) {
-      if (remaining <= 0) break;
-      const allocated = Math.min(remaining, r.capacity);
-      rooms.push({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated });
-      remaining -= allocated;
-    }
-    const totalCapacity = rooms.reduce((sum, r) => sum + r.capacity, 0);
-    const strategy = (strategyKey: string, label: string, description: string) => ({
-      strategy: strategyKey,
-      label,
-      description,
-      roomCount: rooms.length,
-      totalCapacity,
-      utilizationPercent: totalCapacity === 0 ? 0 : Math.round((totalStudents / totalCapacity) * 100),
-      rooms,
-    });
-    const allRooms = [...available]
-      .sort((a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }))
-      .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity }));
-    return HttpResponse.json({
-      totalStudents,
-      shortfall: totalCapacity < totalStudents,
-      availableRoomCount: available.length,
-      strategies: [
-        strategy('FEWEST_ROOMS', 'Fewest Classes', 'Largest rooms first, filled to capacity.'),
-        strategy('SEQUENTIAL', 'Sequential (Adjacent Rooms)', 'Building/room-number order.'),
-        strategy('BALANCED_SPREAD', 'Balanced Spread', 'Same rooms, spread evenly.'),
-      ],
-      allRooms,
-    });
+    return HttpResponse.json(buildRoomSuggestionResponse(totalStudents, new URL(request.url).searchParams.get('empty_columns') === 'true'));
   }),
 
   http.post(`${API_BASE_URL}/exam-sessions/:id/rooms/request`, async ({ request, params }) => {

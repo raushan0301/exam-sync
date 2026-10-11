@@ -9,10 +9,12 @@ import { ExamSessionOwnershipService } from './exam-session-ownership.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
+import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
 
 function buildPrismaMock() {
   const tx = {
-    examSessionQuiz: { update: jest.fn(), upsert: jest.fn(), updateMany: jest.fn(), findMany: jest.fn() },
+    examSessionQuiz: { update: jest.fn(), upsert: jest.fn(), updateMany: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
+    examSessionRoomRequest: { findMany: jest.fn().mockResolvedValue([]), updateMany: jest.fn() },
     examSession: { create: jest.fn(), update: jest.fn() },
     quizStudentAssignment: { findMany: jest.fn().mockResolvedValue([]) },
     student: { findMany: jest.fn().mockResolvedValue([]) },
@@ -55,6 +57,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
   let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let quizOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let facultyService: { findByUserId: jest.Mock };
+  let roomHolds: { activeHoldsForQuiz: jest.Mock; releaseForQuizzes: jest.Mock; releaseForRequest: jest.Mock };
   let service: ExamSessionsService;
 
   beforeEach(() => {
@@ -70,6 +73,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
     examSessionOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
     quizOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
     facultyService = { findByUserId: jest.fn().mockResolvedValue({ id: 'faculty-1' }) };
+    roomHolds = { activeHoldsForQuiz: jest.fn().mockResolvedValue([]), releaseForQuizzes: jest.fn().mockResolvedValue([]), releaseForRequest: jest.fn() };
 
     service = new ExamSessionsService(
       prisma,
@@ -81,6 +85,7 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
       examSessionOwnershipService as unknown as ExamSessionOwnershipService,
       quizOwnershipService as unknown as QuizOwnershipService,
       facultyService as unknown as FacultyService,
+      roomHolds as unknown as RoomHoldsService,
     );
   });
 
@@ -222,6 +227,28 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
         expect.objectContaining({ action: 'UPDATE', entityType: 'ExamSession' }),
         expect.anything(),
       );
+    });
+
+    describe('held rooms vs the session\'s slot', () => {
+      const attach = async (hold: { holdDate: Date; startTime: Date; endTime: Date }) => {
+        prisma.examSession.findUnique.mockResolvedValue(draftSession);
+        prisma.examSessionQuiz.findMany.mockResolvedValue([]);
+        quizzesService.findById.mockResolvedValue({ id: 'quiz-1', title: 'Quiz One', status: QuizStatus.APPROVED });
+        prisma.examSessionQuiz.findFirst.mockResolvedValue(null);
+        prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, version: 2 });
+        roomHolds.activeHoldsForQuiz.mockResolvedValue([hold]);
+        await service.attachAndDetachQuizzes('s1', { add: ['quiz-1'], remove: [] }, admin);
+      };
+
+      it('releases the quiz\'s held rooms (and tells its faculty) when the session is at a DIFFERENT date or time', async () => {
+        await attach({ holdDate: new Date('2026-05-02'), startTime: draftSession.startTime, endTime: draftSession.endTime });
+        expect(roomHolds.releaseForQuizzes).toHaveBeenCalledWith(prisma.__tx, ['quiz-1'], 'TIME_CHANGED', { notify: true });
+      });
+
+      it('keeps the holds when the session is at exactly the approved slot', async () => {
+        await attach({ holdDate: draftSession.sessionDate, startTime: draftSession.startTime, endTime: draftSession.endTime });
+        expect(roomHolds.releaseForQuizzes).toHaveBeenCalledWith(prisma.__tx, [], 'TIME_CHANGED', { notify: true });
+      });
     });
 
     it('detaches a currently-attached quiz (soft — isActiveAttachment=false, never a physical delete)', async () => {
@@ -541,6 +568,27 @@ describe('ExamSessionsService (create, attach/detach, reschedule, cancel — con
         payload: { session_name: 'Finals', room_label: 'B-107', cause: 'SESSION_CANCELLED', reason: 'Venue unavailable' },
       });
       expect(invigilatorNotes[1][1].recipientId).toBe('user-fac-2');
+    });
+
+    it('releases the seats still held for the session\'s quizzes (not yet allocated), reason SESSION_CANCELLED, without a second notification', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+      prisma.__tx.examSessionQuiz.findMany.mockResolvedValue([{ quizId: 'q-a' }, { quizId: 'q-b' }]);
+
+      await service.cancelSession('s1', 'Venue unavailable', admin);
+
+      expect(roomHolds.releaseForQuizzes).toHaveBeenCalledWith(prisma.__tx, ['q-a', 'q-b'], 'SESSION_CANCELLED', { notify: false });
+    });
+
+    it('withdraws a waiting "more rooms" request with the session and frees the rooms it had locked', async () => {
+      prisma.examSession.findUnique.mockResolvedValue(draftSession);
+      prisma.__tx.examSession.update.mockResolvedValue({ ...draftSession, status: ExamSessionStatus.CANCELLED, version: 2 });
+      prisma.__tx.examSessionRoomRequest.findMany.mockResolvedValue([{ id: 'req-1' }]);
+
+      await service.cancelSession('s1', 'Venue unavailable', admin);
+
+      expect(roomHolds.releaseForRequest).toHaveBeenCalledWith(prisma.__tx, 'req-1', 'SESSION_CANCELLED');
+      expect(prisma.__tx.examSessionRoomRequest.updateMany).toHaveBeenCalledWith({ where: { id: { in: ['req-1'] } }, data: { status: 'CANCELLED' } });
     });
 
     it('fans out EXAM_SESSION_CANCELLED notifications to every currently-ASSIGNED student, in the SAME transaction (BR-042)', async () => {
