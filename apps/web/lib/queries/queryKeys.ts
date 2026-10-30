@@ -14,6 +14,7 @@ export const queryKeys = {
   incidents: (params?: Record<string, string | undefined>) => ['incidents', 'list', params ?? {}] as const,
   incident: (id: string) => ['incidents', 'detail', id] as const,
   incidentHistory: (id: string) => ['incidents', 'history', id] as const,
+  navCounts: ['nav-counts'] as const,
   notifications: (params?: Record<string, string | undefined>) =>
     ['notifications', 'list', params ?? {}] as const,
   reportJob: (id: string) => ['report-jobs', 'detail', id] as const,

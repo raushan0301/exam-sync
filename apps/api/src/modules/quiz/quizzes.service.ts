@@ -518,6 +518,12 @@ export class QuizzesService {
     return quiz;
   }
 
+  /** The admin's note about the room request, saved atomically with the decision; no note given leaves the existing one untouched. */
+  private roomNoteData(note?: string): { roomAdjustmentNote?: string } {
+    const trimmed = note?.trim();
+    return trimmed ? { roomAdjustmentNote: trimmed } : {};
+  }
+
   /**
    * `POST /quizzes/{id}/approve` — ADMIN only (role-level, via
    * `@Roles(ADMIN)` at the controller). Requires the caller's last-known
@@ -530,7 +536,7 @@ export class QuizzesService {
    * ALSO (via some other account state) the quiz's creating faculty is
    * blocked — "no self-approval path exists, not just discouraged."
    */
-  async approve(id: string, ifMatchVersion: number, actor: AuthenticatedUser): Promise<Quiz> {
+  async approve(id: string, ifMatchVersion: number, actor: AuthenticatedUser, roomNote?: string): Promise<Quiz> {
     const existing = await this.findById(id);
     await this.assertNotSelfReview(existing, actor);
 
@@ -546,7 +552,7 @@ export class QuizzesService {
     const quiz = await this.prisma.$transaction(async (tx) => {
       const updated = await tx.quiz.update({
         where: { id },
-        data: { status: QuizStatus.APPROVED, version: { increment: 1 } },
+        data: { status: QuizStatus.APPROVED, version: { increment: 1 }, ...this.roomNoteData(roomNote) },
       });
 
       // Approval keeps the requested rooms' seats free for this quiz's exam window until a session allocates them.
@@ -625,7 +631,7 @@ export class QuizzesService {
     const quiz = await this.prisma.$transaction(async (tx) => {
       const updated = await tx.quiz.update({
         where: { id },
-        data: { status: QuizStatus.REJECTED, version: { increment: 1 } },
+        data: { status: QuizStatus.REJECTED, version: { increment: 1 }, ...this.roomNoteData(dto.room_note) },
       });
 
       await this.approvalHistoryService.record(

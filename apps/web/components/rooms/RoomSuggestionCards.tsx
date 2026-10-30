@@ -1,7 +1,9 @@
 'use client';
 
 import { Badge } from '@/components/ui';
-import type { RoomSuggestionAlternative, RoomSuggestionResult, RoomSuggestionStrategy, SuggestedRoom } from '@/lib/queries/types';
+import type { AvailableRoomOption, RoomSuggestionAlternative, RoomSuggestionResult, RoomSuggestionStrategy, SuggestedRoom } from '@/lib/queries/types';
+import { buildCustomPlan, differsFromPlan, type CustomRoomPlan } from '@/lib/room-plan';
+import { SharedRoomNote } from './SharedRoomNote';
 
 /** Which way of placing the rooms the person picked when two differ: stay together, or the fewest rooms overall. */
 export type LocationChoice = 'together' | 'alternative';
@@ -58,6 +60,8 @@ export function RoomSuggestionCards({
   totalStudents,
   selectedStrategy,
   locationChoice,
+  roomIds,
+  allRooms,
   onPickStrategy,
   onChooseLocation,
 }: {
@@ -65,10 +69,17 @@ export function RoomSuggestionCards({
   totalStudents: number;
   selectedStrategy: RoomSuggestionStrategy | null;
   locationChoice: LocationChoice | null;
+  /** The rooms actually in the request right now — when the person edits them by hand, the selected card follows. */
+  roomIds: string[];
+  allRooms: AvailableRoomOption[];
   onPickStrategy: (result: RoomSuggestionResult) => void;
   onChooseLocation: (result: RoomSuggestionResult, choice: LocationChoice) => void;
 }) {
   const selected = strategies.find((s) => s.strategy === selectedStrategy);
+  // The rooms of the plan the person picked; if the request no longer matches them (a room added/removed by hand), show the real split instead.
+  const planRoomIds = !selected ? [] : locationChoice === 'alternative' && selected.alternative ? selected.alternative.rooms.map((r) => r.roomId) : locationChoice === 'together' || !selected.alternative ? selected.rooms.map((r) => r.roomId) : [];
+  const custom: CustomRoomPlan | null =
+    selected && differsFromPlan(planRoomIds, roomIds) ? buildCustomPlan(selected.strategy, roomIds, allRooms, totalStudents) : null;
   return (
     <div className="flex flex-col gap-3">
       <div className="grid gap-3 sm:grid-cols-2">
@@ -78,6 +89,7 @@ export function RoomSuggestionCards({
             result={s}
             totalStudents={totalStudents}
             selected={selectedStrategy === s.strategy}
+            custom={selectedStrategy === s.strategy ? custom : null}
             onSelect={() => onPickStrategy(s)}
           />
         ))}
@@ -130,7 +142,7 @@ function ChoiceOption({
         <span className="font-medium text-text">{title}</span>
         <span className="text-xs text-text-muted">{detail}</span>
         <span className="text-xs text-text-muted">
-          {rooms.slice(0, 5).map((r) => `${r.building}-${r.roomNumber} (${r.allocated}/${r.capacity})`).join(', ')}
+          {rooms.slice(0, 5).map((r) => `${r.building}-${r.roomNumber} (${r.allocated}/${r.capacity})${r.sharedWith?.length ? ' · shared' : ''}`).join(', ')}
           {rooms.length > 5 ? ` + ${rooms.length - 5} more` : ''}
         </span>
       </span>
@@ -142,14 +154,18 @@ function StrategyCard({
   result,
   totalStudents,
   selected,
+  custom,
   onSelect,
 }: {
   result: RoomSuggestionResult;
   totalStudents: number;
   selected: boolean;
+  /** Set on the selected card when the rooms were edited by hand: shown instead of the original suggestion. */
+  custom: CustomRoomPlan | null;
   onSelect: () => void;
 }) {
-  const covers = result.totalCapacity >= totalStudents;
+  const shown = custom ?? result;
+  const covers = shown.totalCapacity >= totalStudents;
   return (
     <button
       type="button"
@@ -160,36 +176,48 @@ function StrategyCard({
     >
       <div className="flex items-center justify-between">
         <span className="text-sm font-semibold text-text">{result.label}</span>
-        {selected && <Badge color="success">Selected</Badge>}
+        {selected && (custom ? <Badge color="warning">Edited by you</Badge> : <Badge color="success">Selected</Badge>)}
       </div>
       <p className="text-xs text-text-muted">{result.description}</p>
-      {result.location && <p className="text-xs font-medium text-text">{result.location}</p>}
+      {custom && (
+        <p className="text-xs text-warning" data-testid="custom-plan-note">
+          Showing the rooms you picked below, split the same way. Click this card again to go back to the suggestion.
+        </p>
+      )}
+      {shown.location && <p className="text-xs font-medium text-text">{shown.location}</p>}
       <div className="flex flex-col gap-1">
         <div className="flex justify-between text-xs text-text-muted">
           <span>
-            {result.roomCount} class{result.roomCount === 1 ? '' : 'es'}
+            {shown.roomCount} class{shown.roomCount === 1 ? '' : 'es'}
           </span>
-          <span>{result.utilizationPercent}% filled</span>
+          <span>{shown.utilizationPercent}% filled</span>
         </div>
         <div className="h-2 w-full overflow-hidden rounded-full bg-surface-muted">
           <div
             className={`h-full rounded-full ${covers ? 'bg-primary-600' : 'bg-danger-600'}`}
-            style={{ width: `${Math.min(100, result.utilizationPercent)}%` }}
+            style={{ width: `${Math.min(100, shown.utilizationPercent)}%` }}
           />
         </div>
         {!covers && (
           <p className="text-xs text-danger-text">
-            Falls short — only {result.totalCapacity} of {totalStudents} seats.
+            Falls short — only {shown.totalCapacity} of {totalStudents} seats.
           </p>
         )}
       </div>
       <ul className="flex flex-col gap-0.5 text-xs text-text-muted">
-        {result.rooms.slice(0, 4).map((r) => (
+        {shown.rooms.length === 0 && <li>No rooms selected.</li>}
+        {shown.rooms.slice(0, 4).map((r) => (
           <li key={r.roomId}>
             {r.building} {r.roomNumber} — {r.allocated}/{r.capacity}
+            <SharedRoomNote sharedWith={r.sharedWith} left={r.capacity} />
           </li>
         ))}
-        {result.rooms.length > 4 && <li>+ {result.rooms.length - 4} more</li>}
+        {shown.rooms.length > 4 && (
+          <li>
+            + {shown.rooms.length - 4} more
+            {shown.rooms.slice(4).some((r) => r.sharedWith?.length) && ' (some shared with other quizzes)'}
+          </li>
+        )}
       </ul>
     </button>
   );

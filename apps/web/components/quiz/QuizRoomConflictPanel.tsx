@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Card, Alert, Button, Textarea, SkeletonText, ErrorState } from '@/components/ui';
 import { RoomAvailabilityCalendar } from '@/components/rooms/RoomAvailabilityCalendar';
 import { BackupLockChoice } from '@/components/rooms/RoomSuggestionCards';
+import { SharedRoomNote } from '@/components/rooms/SharedRoomNote';
 import { useQuizRoomConflicts } from '@/lib/queries/useQuizRoomSuggestions';
 import { useRequestQuizRooms } from '@/lib/mutations/useQuizMutations';
 import { mapError } from '@/lib/error-mapping';
@@ -26,6 +27,9 @@ export interface QuizRoomConflictPanelProps {
   quiz: Quiz;
   /** ADMIN only — lets the admin click an alternative to swap out an unavailable/booked room right here, before approving. */
   canSwap?: boolean;
+  /** The admin's note, owned by the page so Approve/Reject can send it too. Falls back to local state when not supplied. */
+  note?: string;
+  onNoteChange?: (note: string) => void;
 }
 
 /**
@@ -40,11 +44,13 @@ export interface QuizRoomConflictPanelProps {
  * exam-session stage (RoomApprovalPanel), once real students are
  * assigned — this only fixes up the preliminary recommendation.
  */
-export function QuizRoomConflictPanel({ quiz, canSwap = false }: QuizRoomConflictPanelProps) {
+export function QuizRoomConflictPanel({ quiz, canSwap = false, note: noteProp, onNoteChange }: QuizRoomConflictPanelProps) {
   const enabled = quiz.status === 'SUBMITTED' || quiz.status === 'APPROVED';
   const conflictsQuery = useQuizRoomConflicts(quiz.id, enabled);
   const requestMutation = useRequestQuizRooms(quiz.id);
-  const [note, setNote] = useState('');
+  const [localNote, setLocalNote] = useState('');
+  const note = noteProp ?? localNote;
+  const setNote = onNoteChange ?? setLocalNote;
 
   if (!enabled) return null;
 
@@ -195,7 +201,7 @@ export function QuizRoomConflictPanel({ quiz, canSwap = false }: QuizRoomConflic
       {hasRoomRequest && canSwap && (
         <Textarea
           label="Note to faculty (optional)"
-          description="Shown on their quiz page if you swap or remove a room below."
+          description="Saved with your decision (approve or reject) and shown on their quiz page — type it before or after changing a room."
           value={note}
           onChange={(e) => setNote(e.target.value)}
           placeholder="e.g. Backup room removed — it was double-booked for that slot."
@@ -213,6 +219,7 @@ export function QuizRoomConflictPanel({ quiz, canSwap = false }: QuizRoomConflic
               </span>
               <span className={r.available ? 'text-success-text' : 'text-danger-text'}>{r.available ? 'Available' : 'Unavailable'}</span>
             </div>
+            <SharedRoomNote sharedWith={r.sharedWith} />
             {!r.available && (
               <div className="pl-1 text-xs text-text-muted">
                 <p>{r.reason}</p>
@@ -269,6 +276,7 @@ export function QuizRoomConflictPanel({ quiz, canSwap = false }: QuizRoomConflic
               )}
             </div>
           </div>
+          <SharedRoomNote sharedWith={data.backupRoom.sharedWith} className="mt-1 text-xs text-info-text" />
           {!data.backupRoom.available && data.backupRoom.alternatives && data.backupRoom.alternatives.length > 0 && (
             <div className="mt-1 flex flex-wrap items-center gap-2 pl-1 text-xs text-text-muted">
               <span>{canSwap ? 'Swap in:' : 'Alternatives:'}</span>

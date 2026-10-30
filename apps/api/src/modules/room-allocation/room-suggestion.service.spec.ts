@@ -103,7 +103,10 @@ describe('RoomSuggestionService — building/floor rule, retired Sequential, emp
   });
 
   it('does not suggest seats other quizzes already hold (and ignores this quiz\'s own holds)', async () => {
-    prisma.roomHold.findMany.mockResolvedValue([{ roomId: 'r1', seatsHeld: 20 }, { roomId: 'r2', seatsHeld: 25 }]); // r2 fully held by others
+    prisma.roomHold.findMany.mockResolvedValue([
+      { roomId: 'r1', quizId: 'qc', seatsHeld: 20, quiz: { title: 'Quiz C' } },
+      { roomId: 'r2', quizId: 'qc', seatsHeld: 25, quiz: { title: 'Quiz C' } },
+    ]); // r2 fully held by others
     const result = await service.suggestForQuiz('q1', faculty);
 
     const capacityOf = (id: string) => result.allRooms.find((x) => x.roomId === id)?.capacity;
@@ -111,5 +114,16 @@ describe('RoomSuggestionService — building/floor rule, retired Sequential, emp
     expect(capacityOf('r2')).toBeUndefined(); // nothing left, so not offered at all
     const whereArg = prisma.roomHold.findMany.mock.calls[0][0].where.AND[1];
     expect(whereArg.quizId).toEqual({ notIn: ['q1'] }); // the quiz's own holds do not count against it
+  });
+
+  it('says which other quiz a suggested room is shared with, in every list it appears in', async () => {
+    prisma.roomHold.findMany.mockResolvedValue([{ roomId: 'r1', quizId: 'qc', seatsHeld: 20, quiz: { title: 'Quiz C' } }]);
+    const result = await service.suggestForQuiz('q1', faculty);
+
+    const shared = [{ quizId: 'qc', quizTitle: 'Quiz C', seats: 20 }];
+    expect(result.allRooms.find((r) => r.roomId === 'r1')?.sharedWith).toEqual(shared);
+    const suggested = result.strategies.flatMap((s) => s.rooms).find((r) => r.roomId === 'r1');
+    expect(suggested?.sharedWith).toEqual(shared);
+    expect(result.allRooms.find((r) => r.roomId === 'r3')?.sharedWith).toBeUndefined();
   });
 });

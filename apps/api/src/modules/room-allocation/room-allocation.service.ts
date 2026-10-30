@@ -11,7 +11,7 @@ import {
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditHookService } from '../../common/audit/audit-hook.service';
 import { NotificationsOutboxService } from '../../common/notifications-outbox/notifications-outbox.service';
-import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
+import { RoomHoldsService, SharedHold } from '../../common/room-holds/room-holds.service';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
 import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService, ConflictDetail } from '../conflict-engine';
@@ -35,6 +35,8 @@ export interface RoomAvailabilityRow {
   capacity: number;
   available: boolean;
   reason?: string;
+  /** Other approved quizzes already holding seats in this room at this time — the room is shared, not full. */
+  sharedWith?: SharedHold[];
   /** Only populated when `available` is false — same-or-greater-capacity ACTIVE rooms with no conflict, for the admin to swap in. */
   alternatives?: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[];
 }
@@ -185,8 +187,13 @@ export class RoomAllocationService {
       );
     }
 
+    const attached = await this.prisma.examSessionQuiz.findMany({
+      where: { examSessionId, isActiveAttachment: true },
+      select: { quizId: true },
+    });
     return this.buildAvailabilityPreview(
       examSessionId,
+      attached.map((a) => a.quizId),
       session.requestedRoomIds,
       session.backupRoomId,
       session.roomAllocationStrategy,
@@ -259,6 +266,7 @@ export class RoomAllocationService {
 
     const roomPreview = await this.buildAvailabilityPreview(
       excludeExamSessionId,
+      [quizId],
       quiz.requestedRoomIds,
       quiz.backupRoomId,
       quiz.roomAllocationStrategy,
@@ -271,6 +279,8 @@ export class RoomAllocationService {
 
   private async buildAvailabilityPreview(
     excludeExamSessionId: string,
+    /** Quizzes whose held seats are this request's own, so they are not reported as "shared with another quiz". */
+    ownQuizIds: string[],
     requestedRoomIds: string[],
     backupRoomId: string | null,
     strategy: string | null,
@@ -308,6 +318,13 @@ export class RoomAllocationService {
       (r) => !conflictingAltIds.has(r.id) && !allIds.includes(r.id),
     );
 
+    const shared = await this.roomHolds.sharedHoldsByRoom(
+      this.prisma,
+      allIds,
+      { date: sessionDate, start: startTime, end: endTime },
+      ownQuizIds,
+    );
+
     const toRow = (roomId: string): RoomAvailabilityRow => {
       const room = roomsById.get(roomId);
       if (!room) {
@@ -322,6 +339,7 @@ export class RoomAllocationService {
         capacity: room.capacity,
         available: !conflictMessage,
         reason: conflictMessage,
+        ...(shared.has(roomId) ? { sharedWith: shared.get(roomId) } : {}),
       };
       if (conflictMessage) {
         row.alternatives = trulyAvailable

@@ -11,6 +11,8 @@ import {
   setMockSubjects,
   setMockStudents,
   setMockFaculty,
+  setMockNavCounts,
+  setMockSharedHolds,
 } from './test/msw/handlers';
 
 // MSW server lifecycle — every test hits real HTTP endpoints (POST
@@ -26,6 +28,8 @@ afterEach(() => {
   window.localStorage.clear();
   // M3 dashboard fixtures are per-test state too — reset between tests.
   setMockQuizzes([]);
+  setMockNavCounts({});
+  setMockSharedHolds({});
   setMockIncidents([]);
   setMockNotifications([]);
   setMockDepartments([]);

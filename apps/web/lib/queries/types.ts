@@ -369,14 +369,23 @@ export interface ConflictCheckResult {
   warnings: ConflictDetail[];
 }
 
+/** Another approved quiz's seats held in a room at an overlapping time — the room is shared, not full. */
+export interface SharedHold {
+  quizId: string;
+  quizTitle: string;
+  seats: number;
+}
+
 /** GET /exam-sessions/{id}/rooms/suggest — RoomSuggestionService's per-strategy room preview. */
 export interface SuggestedRoom {
   roomId: string;
   building: string;
   floor: number;
   roomNumber: string;
+  /** Seats free for this request — seats other quizzes hold are already left out. */
   capacity: number;
   allocated: number;
+  sharedWith?: SharedHold[];
 }
 
 /** SEQUENTIAL was retired; a request saved earlier may still carry it, so labels handle it, but it is never offered. */
@@ -415,6 +424,7 @@ export interface AvailableRoomOption {
   floor: number;
   roomNumber: string;
   capacity: number;
+  sharedWith?: SharedHold[];
 }
 
 export interface RoomSuggestionResponse {
@@ -437,6 +447,8 @@ export interface RoomAvailabilityRow {
   capacity: number;
   available: boolean;
   reason?: string;
+  /** Other approved quizzes already holding seats in this room at this time. */
+  sharedWith?: SharedHold[];
   alternatives?: { roomId: string; building: string; floor: number; roomNumber: string; capacity: number }[];
 }
 
@@ -473,10 +485,13 @@ export type RoomStatus = 'ACTIVE' | 'MAINTENANCE' | 'INACTIVE';
 export interface RoomBookedRange {
   start_time: string;
   end_time: string;
-  source: 'EXAM_SESSION' | 'AVAILABILITY_BLOCK';
+  source: 'EXAM_SESSION' | 'AVAILABILITY_BLOCK' | 'SEAT_HOLD';
   exam_session_id?: string;
   exam_session_name?: string;
   reason?: string | null;
+  /** SEAT_HOLD only: seats approved quizzes keep free in this slot, and which quizzes. */
+  seats_held?: number;
+  quiz_titles?: string[];
 }
 
 export interface RoomAvailabilityCalendarEntry {

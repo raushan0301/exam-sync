@@ -227,3 +227,42 @@ describe('RoomHoldsService.heldSeatsByRoom', () => {
     expect(where[1].endTime).toEqual({ gt: NINE }); // ...and ends after it starts
   });
 });
+
+describe('sharedHoldsByRoom / runningHoldsOnDay — who else is in the room', () => {
+  it('lists one entry per other quiz in each room, adding up a quiz\'s seats, and leaves the excluded quizzes out', async () => {
+    const { tx, service } = build();
+    tx.roomHold.findMany.mockResolvedValue([
+      { roomId: 'r1', quizId: 'qc', seatsHeld: 2, quiz: { title: 'Quiz C' } },
+      { roomId: 'r1', quizId: 'qc', seatsHeld: 1, quiz: { title: 'Quiz C' } },
+      { roomId: 'r1', quizId: 'qd', seatsHeld: 4, quiz: { title: 'Quiz D' } },
+      { roomId: 'r2', quizId: 'qc', seatsHeld: 5, quiz: { title: 'Quiz C' } },
+    ]);
+
+    const shared = await service.sharedHoldsByRoom(tx, ['r1', 'r2', 'r3'], quizWindow(quiz())!, ['q1']);
+
+    expect(shared.get('r1')).toEqual([
+      { quizId: 'qc', quizTitle: 'Quiz C', seats: 3 },
+      { quizId: 'qd', quizTitle: 'Quiz D', seats: 4 },
+    ]);
+    expect(shared.get('r2')).toEqual([{ quizId: 'qc', quizTitle: 'Quiz C', seats: 5 }]);
+    expect(shared.has('r3')).toBe(false);
+    expect(tx.roomHold.findMany.mock.calls[0][0].where.AND[1].quizId).toEqual({ notIn: ['q1'] });
+  });
+
+  it('timeline: merges holds with the same window in a room into one block with the total seats and all quiz titles', async () => {
+    const { tx, service } = build();
+    const start = new Date('1970-01-01T09:30:00Z');
+    const end = new Date('1970-01-01T11:00:00Z');
+    tx.roomHold.findMany.mockResolvedValue([
+      { roomId: 'r1', startTime: start, endTime: end, seatsHeld: 2, quiz: { title: 'Quiz C' } },
+      { roomId: 'r1', startTime: start, endTime: end, seatsHeld: 3, quiz: { title: 'Quiz D' } },
+      { roomId: 'r1', startTime: new Date('1970-01-01T14:00:00Z'), endTime: new Date('1970-01-01T15:00:00Z'), seatsHeld: 1, quiz: { title: 'Quiz E' } },
+    ]);
+
+    const blocks = await service.runningHoldsOnDay(tx, ['r1'], DATE);
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toMatchObject({ roomId: 'r1', seats: 5, quizTitles: ['Quiz C', 'Quiz D'] });
+    expect(blocks[1]).toMatchObject({ seats: 1, quizTitles: ['Quiz E'] });
+  });
+});

@@ -238,6 +238,8 @@ export function RoomRequestPanel({ session, readOnly = false }: RoomRequestPanel
         totalStudents={data.totalStudents}
         selectedStrategy={selectedStrategy}
         locationChoice={locationChoice}
+        roomIds={roomIds}
+        allRooms={data.allRooms}
         onPickStrategy={pickStrategy}
         onChooseLocation={chooseLocation}
       />

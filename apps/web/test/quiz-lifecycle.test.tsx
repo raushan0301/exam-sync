@@ -16,6 +16,7 @@ import {
   setMockBatches,
   setMockRooms,
   setMockRoomAllocationConflict,
+  setMockSharedHolds,
   setMockEligibleStudentCount,
   VALID_ACCESS_TOKEN,
   VALID_REFRESH_TOKEN,
@@ -314,6 +315,58 @@ describe('Quiz-stage room suggestion', () => {
     await waitFor(() => expect(screen.getByText(/room request saved/i)).toBeInTheDocument());
   });
 
+  it('tells the faculty when a suggested room is shared with another approved quiz at that time', async () => {
+    signInAsAdmin();
+    seedSubjectAndBatch();
+    setMockQuizzes([makeQuiz({ id: 'q-shared', status: 'DRAFT', studentCount: 10 })]);
+    setMockQuizApprovalHistory([]);
+    setMockRooms([ROOM_A]);
+    setMockSharedHolds({ 'room-a': [{ quizId: 'q-c', quizTitle: 'Quiz C', seats: 3 }] });
+
+    renderWithProviders(<QuizDetailView quizId="q-shared" role="FACULTY" />);
+
+    await screen.findByText('Midterm');
+    await userEvent.click(await screen.findByLabelText(/no — use every column/i));
+    await screen.findByText(/Fewest Classes/i);
+    const notes = await screen.findAllByTestId('shared-room-note');
+    expect(notes[0]).toHaveTextContent(/Quiz C holds 3 seats at this time/i);
+  });
+
+  it('the selected strategy card follows hand-made room changes: edited badge, real rooms and seat split, and back to the suggestion on click', async () => {
+    signInAsAdmin();
+    seedSubjectAndBatch();
+    const ROOM_SMALL = { ...ROOM_A, id: 'room-small', roomNumber: '102', capacity: 20 };
+    setMockQuizzes([makeQuiz({ id: 'q-edit', status: 'DRAFT', studentCount: 60 })]);
+    setMockQuizApprovalHistory([]);
+    setMockRooms([ROOM_A, ROOM_SMALL]);
+    const user = userEvent.setup();
+
+    renderWithProviders(<QuizDetailView quizId="q-edit" role="FACULTY" />);
+
+    await screen.findByText('Midterm');
+    await user.click(await screen.findByLabelText(/no — use every column/i));
+    await screen.findByText(/Fewest Classes/i);
+    // As suggested: room 101 holds all 60, nothing edited yet.
+    expect(screen.getAllByText(/A 101 — 60\/100/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Edited by you/i)).not.toBeInTheDocument();
+
+    // Swap by hand: add room 102 from the dropdown, then take 101 out.
+    await user.click(await screen.findByRole('button', { name: /add another room/i }));
+    await user.click(await screen.findByRole('option', { name: /Room 102/i }));
+    await user.click(screen.getByRole('checkbox', { name: /Room 101/i }));
+
+    expect((await screen.findAllByText(/Edited by you/i)).length).toBe(1);
+    expect(screen.getByTestId('custom-plan-note')).toBeInTheDocument();
+    // The card now shows the rooms actually picked — only 20 seats, so it falls short.
+    expect(screen.getAllByText(/A 102 — 20\/20/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Falls short — only 20 of 60 seats/i)).toBeInTheDocument();
+
+    // Clicking the card goes back to the suggestion.
+    await user.click(screen.getByRole('button', { name: /Fewest Classes/i }));
+    await waitFor(() => expect(screen.queryByText(/Edited by you/i)).not.toBeInTheDocument());
+    expect(screen.getAllByText(/A 101 — 60\/100/).length).toBeGreaterThan(0);
+  });
+
   it('with empty columns the rooms are sized by usable seats and the question is shown again on every change', async () => {
     signInAsAdmin();
     seedSubjectAndBatch();
@@ -434,6 +487,77 @@ describe('Quiz-stage room suggestion', () => {
       expect(await screen.findByText(/Approving holds these rooms/i)).toBeInTheDocument();
       await userEvent.click(within(await screen.findByTestId('backup-lock-choice')).getByLabelText(/lock it too/i));
       await waitFor(() => expect(getLastQuizRoomRequestBody()).toMatchObject({ backup_room_id: 'room-b', backup_locked: true }));
+    });
+
+    it('sends the admin\'s note with Approve even when it is typed after the last room change', async () => {
+      signInAsAdmin();
+      seedSubjectAndBatch();
+      setMockQuizzes([makeQuiz({ id: 'q-note-approve', status: 'SUBMITTED', version: 2, requestedRoomIds: ['room-a'], backupRoomId: 'room-b', roomAllocationStrategy: 'FEWEST_ROOMS' })]);
+      setMockQuizApprovalHistory([]);
+      setMockRooms([ROOM_A, ROOM_B]);
+      setMockRoomAllocationConflict(false);
+      let body: unknown = null;
+      server.use(
+        http.post(`${API_BASE_URL}/quizzes/:id/approve`, async ({ request }) => {
+          body = await request.json().catch(() => null);
+          return HttpResponse.json({ id: 'q-note-approve', status: 'APPROVED', version: 3 });
+        }),
+      );
+      const user = userEvent.setup();
+      renderWithProviders(<QuizDetailView quizId="q-note-approve" role="ADMIN" />);
+
+      await screen.findByText('Midterm');
+      await user.click(await screen.findByRole('button', { name: 'Remove' }));
+      await user.type(await screen.findByLabelText(/Note to faculty/i), 'Backup removed - double-booked.');
+      await user.click(screen.getByRole('button', { name: 'Approve' }));
+      await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Approve' }));
+
+      await waitFor(() => expect(body).toEqual({ room_note: 'Backup removed - double-booked.' }));
+    });
+
+    it('sends the admin\'s note with Reject too', async () => {
+      signInAsAdmin();
+      seedSubjectAndBatch();
+      setMockQuizzes([makeQuiz({ id: 'q-note-reject', status: 'SUBMITTED', version: 2, requestedRoomIds: ['room-a'], roomAllocationStrategy: 'FEWEST_ROOMS' })]);
+      setMockQuizApprovalHistory([]);
+      setMockRooms([ROOM_A, ROOM_B]);
+      setMockRoomAllocationConflict(false);
+      let body: unknown = null;
+      server.use(
+        http.post(`${API_BASE_URL}/quizzes/:id/reject`, async ({ request }) => {
+          body = await request.json();
+          return HttpResponse.json({ id: 'q-note-reject', status: 'REJECTED', version: 3 });
+        }),
+      );
+      const user = userEvent.setup();
+      renderWithProviders(<QuizDetailView quizId="q-note-reject" role="ADMIN" />);
+
+      await screen.findByText('Midterm');
+      await user.type(await screen.findByLabelText(/Note to faculty/i), 'Pick a bigger room.');
+      await user.click(screen.getByRole('button', { name: 'Reject' }));
+      const dialog = await screen.findByRole('dialog');
+      await user.type(within(dialog).getByLabelText(/Reason/i), 'Needs more questions.');
+      await user.click(within(dialog).getByRole('button', { name: 'Reject' }));
+
+      await waitFor(() => expect(body).toEqual({ reason: 'Needs more questions.', room_note: 'Pick a bigger room.' }));
+    });
+
+    it('admin is told a requested room is shared with another approved quiz, and the timeline shows the held seats', async () => {
+      signInAsAdmin();
+      seedSubjectAndBatch();
+      setMockQuizzes([makeQuiz({ id: 'q-adm-shared', status: 'SUBMITTED', version: 2, requestedRoomIds: ['room-a'], roomAllocationStrategy: 'FEWEST_ROOMS' })]);
+      setMockQuizApprovalHistory([]);
+      setMockRooms([ROOM_A, ROOM_B]);
+      setMockRoomAllocationConflict(false);
+      setMockSharedHolds({ 'room-a': [{ quizId: 'q-c', quizTitle: 'Quiz C', seats: 1 }] });
+
+      renderWithProviders(<QuizDetailView quizId="q-adm-shared" role="ADMIN" />);
+
+      await screen.findByText('Midterm');
+      expect(await screen.findByTestId('shared-room-note')).toHaveTextContent(/Quiz C holds 1 seat at this time.*shared, not full/i);
+      expect(screen.getByText('Available')).toBeInTheDocument(); // still usable — it is shared, not blocked
+      expect(await screen.findByTitle(/Seats held: 1 seat by Quiz C/i)).toBeInTheDocument();
+      expect(screen.getByText(/Seats held by an approved quiz/i)).toBeInTheDocument();
     });
 
     it('once approved, shows which seats are held in which rooms', async () => {

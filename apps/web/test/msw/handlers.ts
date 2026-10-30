@@ -190,6 +190,14 @@ export function setMockQuizApprovalHistory(items: MockQuizApprovalHistoryEntry[]
 export function setMockIncidents(items: MockIncident[]) {
   INCIDENTS = items;
 }
+export const NAV_COUNTS: Record<string, number> = {};
+export const NAV_SEEN_CALLS: string[] = [];
+export function setMockNavCounts(counts: Record<string, number>) {
+  for (const k of Object.keys(NAV_COUNTS)) delete NAV_COUNTS[k];
+  Object.assign(NAV_COUNTS, counts);
+  NAV_SEEN_CALLS.length = 0;
+}
+
 export function setMockNotifications(items: MockNotification[]) {
   NOTIFICATIONS = items;
 }
@@ -611,6 +619,13 @@ export function setMockRoster(items: MockRosterEntry[]) {
 export function setMockFacultyAssignments(items: MockFacultyAssignment[]) {
   FACULTY_ASSIGNMENTS = items;
 }
+/** Rooms other approved quizzes hold seats in at the requested time: roomId -> who holds how many. */
+export type MockSharedHold = { quizId: string; quizTitle: string; seats: number };
+let SHARED_HOLDS: Record<string, MockSharedHold[]> = {};
+export function setMockSharedHolds(holds: Record<string, MockSharedHold[]>) {
+  SHARED_HOLDS = holds;
+}
+
 export function setMockRoomAllocationConflict(value: boolean) {
   ROOM_ALLOCATION_CONFLICT = value;
 }
@@ -777,7 +792,7 @@ export function setMockRoomSuggestionAlternative(value: boolean) {
   ROOM_SUGGESTION_ALTERNATIVE = value;
 }
 
-type MockSuggestedRoom = { roomId: string; building: string; floor: number; roomNumber: string; capacity: number; allocated: number };
+type MockSuggestedRoom = { roomId: string; building: string; floor: number; roomNumber: string; capacity: number; allocated: number; sharedWith?: MockSharedHold[] };
 
 /** Mirrors the API's response shape: two strategies, each with a location summary and (optionally) an alternative. */
 function buildRoomSuggestionResponse(totalStudents: number, emptyColumns: boolean) {
@@ -788,7 +803,7 @@ function buildRoomSuggestionResponse(totalStudents: number, emptyColumns: boolea
   for (const r of sorted) {
     if (remaining <= 0) break;
     const allocated = Math.min(remaining, r.capacity);
-    rooms.push({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated });
+    rooms.push({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, allocated, ...(SHARED_HOLDS[r.id] ? { sharedWith: SHARED_HOLDS[r.id] } : {}) });
     remaining -= allocated;
   }
   const totalCapacity = rooms.reduce((sum, r) => sum + r.capacity, 0);
@@ -816,7 +831,7 @@ function buildRoomSuggestionResponse(totalStudents: number, emptyColumns: boolea
     ],
     allRooms: [...available]
       .sort((a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }))
-      .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity })),
+      .map((r) => ({ roomId: r.id, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity, ...(SHARED_HOLDS[r.id] ? { sharedWith: SHARED_HOLDS[r.id] } : {}) })),
   };
 }
 
@@ -1248,6 +1263,21 @@ export const handlers = [
     }
     const items = INCIDENT_HISTORY.filter((h) => h.incidentId === params.id);
     return HttpResponse.json(items);
+  }),
+
+  // GET /me/nav-counts — sidebar badge numbers; POST /me/nav-seen clears a "new" badge.
+  http.get(`${API_BASE_URL}/me/nav-counts`, ({ request }) => {
+    const user = userFromAuthHeader(request);
+    if (!user) return HttpResponse.json({ message: 'Unauthorized' }, { status: 401 });
+    return HttpResponse.json({ counts: NAV_COUNTS });
+  }),
+  http.post(`${API_BASE_URL}/me/nav-seen`, async ({ request }) => {
+    const user = userFromAuthHeader(request);
+    if (!user) return HttpResponse.json({ message: 'Unauthorized' }, { status: 401 });
+    const body = (await request.json()) as { key: string };
+    NAV_SEEN_CALLS.push(body.key);
+    NAV_COUNTS[body.key] = 0;
+    return new HttpResponse(null, { status: 204 });
   }),
 
   // GET /me/notifications — self-scoped to the caller, all roles.
@@ -1956,7 +1986,9 @@ export const handlers = [
       room,
       bookedRanges: ROOM_ALLOCATION_CONFLICT
         ? [{ start_time: '09:00:00', end_time: '11:00:00', source: 'EXAM_SESSION' as const, exam_session_name: 'Conflicting Session' }]
-        : [],
+        : SHARED_HOLDS[room.id]
+          ? [{ start_time: '09:30', end_time: '11:00', source: 'SEAT_HOLD' as const, seats_held: SHARED_HOLDS[room.id].reduce((n, h) => n + h.seats, 0), quiz_titles: SHARED_HOLDS[room.id].map((h) => h.quizTitle) }]
+          : [],
     }));
     return HttpResponse.json(items);
   }),
@@ -2080,6 +2112,7 @@ export const handlers = [
         capacity: room.capacity,
         available,
         reason: available ? undefined : 'Room already booked for an overlapping session.',
+        ...(SHARED_HOLDS[room.id] ? { sharedWith: SHARED_HOLDS[room.id] } : {}),
         alternatives: available
           ? undefined
           : ROOMS.filter((r) => r.status === 'ACTIVE' && r.id !== roomId && r.capacity >= room.capacity).map((r) => ({

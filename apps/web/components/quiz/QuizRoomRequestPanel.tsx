@@ -194,6 +194,8 @@ export function QuizRoomRequestPanel({ quiz }: QuizRoomRequestPanelProps) {
         totalStudents={data.totalStudents}
         selectedStrategy={selectedStrategy}
         locationChoice={locationChoice}
+        roomIds={roomIds}
+        allRooms={data.allRooms}
         onPickStrategy={pickStrategy}
         onChooseLocation={chooseLocation}
       />

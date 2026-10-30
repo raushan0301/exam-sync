@@ -30,6 +30,8 @@ export function RoomPicker({ allRooms, totalStudents, roomIds, onChangeRoomIds, 
   const usableRooms = allRooms.filter((r) => r.capacity > 0);
   const roomsById = new Map(usableRooms.map((r) => [r.roomId, r]));
   const selectedRooms = roomIds.map((id) => roomsById.get(id)).filter((r): r is AvailableRoomOption => !!r);
+  // A room kept in the request that is no longer offered for this time (booked, blocked, or every seat held) — shown so it can be removed.
+  const missingRoomIds = roomIds.filter((id) => !roomsById.has(id));
   const selectedCapacity = selectedRooms.reduce((sum, r) => sum + r.capacity, 0);
   const seated = Math.min(selectedCapacity, totalStudents);
   const remaining = Math.max(0, totalStudents - selectedCapacity);
@@ -74,13 +76,18 @@ export function RoomPicker({ allRooms, totalStudents, roomIds, onChangeRoomIds, 
 
       <div className="flex flex-col gap-2 rounded border border-border p-3">
         <p className="text-xs font-medium text-text-muted">Rooms in this request — untick to remove.</p>
-        {selectedRooms.length === 0 ? (
+        {selectedRooms.length === 0 && missingRoomIds.length === 0 ? (
           <p className="text-sm text-text-muted">No rooms selected yet.</p>
         ) : (
           <ul className="flex max-h-56 flex-col gap-1 overflow-y-auto">
             {selectedRooms.map((r) => (
               <li key={r.roomId}>
                 <Checkbox label={roomLabel(r)} checked onChange={() => toggleRoom(r.roomId)} />
+              </li>
+            ))}
+            {missingRoomIds.map((id) => (
+              <li key={id} data-testid="unavailable-room">
+                <Checkbox label="A room that is no longer available at this time — untick to remove it" checked onChange={() => toggleRoom(id)} />
               </li>
             ))}
           </ul>

@@ -17,6 +17,13 @@ export interface NavLeaf {
   label: string;
   /** Present only for items with a real, already-built destination. */
   href?: string;
+  /** Key into `GET /me/nav-counts` — shows that number as a red badge. */
+  badgeKey?: string;
+  /**
+   * Set when the badge means "new since you last opened this page": opening
+   * the page tells the server it was seen, which clears the badge.
+   */
+  seenKey?: 'assignments' | 'invigilation-duties' | 'incidents';
 }
 
 export interface NavGroup {
@@ -54,42 +61,42 @@ export const ADMIN_NAV: NavEntry[] = [
     label: 'Quizzes',
     items: [
       { label: 'All Quizzes', href: '/admin/quizzes' },
-      { label: 'Approval Queue', href: '/admin/quizzes/approval-queue' },
+      { label: 'Approval Queue', href: '/admin/quizzes/approval-queue', badgeKey: 'quizzes.approval' },
     ],
   },
   // Faculty-lifecycle-ownership change: admin no longer creates sessions
   // (that page is gone) — this now points at the read-only "all scheduled
   // sessions" list instead of the old create form.
   { label: 'Exam Sessions', href: '/admin/exam-sessions' },
-  { label: 'Suspension Requests', href: '/admin/suspension-requests' },
-  { label: 'Room Requests', href: '/admin/room-requests' },
+  { label: 'Suspension Requests', href: '/admin/suspension-requests', badgeKey: 'suspension-requests' },
+  { label: 'Room Requests', href: '/admin/room-requests', badgeKey: 'room-requests' },
   { label: 'Rooms', href: '/admin/rooms' },
-  { label: 'Incidents', href: '/admin/incidents' },
+  { label: 'Incidents', href: '/admin/incidents', badgeKey: 'incidents' },
   { label: 'Reports', href: '/admin/reports' },
-  { label: 'Notifications', href: '/admin/notifications' },
+  { label: 'Notifications', href: '/admin/notifications', badgeKey: 'notifications' },
   { label: 'Audit Log', href: '/admin/audit-log' },
   { label: 'System Health', href: '/admin/system-health' },
 ];
 
 export const FACULTY_NAV: NavEntry[] = [
   { label: 'Dashboard', href: '/faculty/dashboard' },
-  { label: 'My Quizzes', href: '/faculty/quizzes' },
-  { label: 'My Assignments', href: '/faculty/assignments' },
+  { label: 'My Quizzes', href: '/faculty/quizzes', badgeKey: 'my-quizzes' },
+  { label: 'My Assignments', href: '/faculty/assignments', badgeKey: 'assignments', seenKey: 'assignments' },
   { label: 'Exam Sessions', href: '/faculty/exam-sessions' },
-  { label: 'My Invigilation Duties', href: '/faculty/invigilation-duties' },
+  { label: 'My Invigilation Duties', href: '/faculty/invigilation-duties', badgeKey: 'invigilation-duties', seenKey: 'invigilation-duties' },
   {
     label: 'Incidents',
     items: [
-      { label: 'My Incidents', href: '/faculty/incidents' },
+      { label: 'My Incidents', href: '/faculty/incidents', badgeKey: 'incidents', seenKey: 'incidents' },
       { label: 'Report Incident', href: '/faculty/incidents/new' },
     ],
   },
-  { label: 'Notifications', href: '/faculty/notifications' },
+  { label: 'Notifications', href: '/faculty/notifications', badgeKey: 'notifications' },
 ];
 
 export const STUDENT_NAV: NavEntry[] = [
   { label: 'Dashboard', href: '/student/dashboard' },
-  { label: 'Notifications', href: '/student/notifications' },
+  { label: 'Notifications', href: '/student/notifications', badgeKey: 'notifications' },
 ];
 
 export const NAV_BY_ROLE: Record<PrimaryRole, NavEntry[]> = {

@@ -1,4 +1,4 @@
-import { IsOptional, IsString } from 'class-validator';
+import { IsOptional, IsString, MaxLength } from 'class-validator';
 
 /**
  * `reason` is deliberately optional at the DTO/shape level — BR-012's
@@ -11,4 +11,10 @@ export class RejectQuizDto {
   @IsOptional()
   @IsString()
   reason?: string;
+
+  /** The admin's note about the room request; saved with the decision and shown to the faculty. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  room_note?: string;
 }

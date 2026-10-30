@@ -43,6 +43,8 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
   const [approveOpen, setApproveOpen] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
+  // The admin's note about the room request — sent with Approve/Reject so it is saved however the admin ordered their clicks.
+  const [roomNote, setRoomNote] = useState('');
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
 
   const updateMutation = useUpdateQuiz(quizId);
@@ -101,7 +103,7 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
 
   async function onApprove() {
     try {
-      await approveMutation.mutateAsync(quiz!.version);
+      await approveMutation.mutateAsync({ version: quiz!.version, roomNote });
       setApproveOpen(false);
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
@@ -114,7 +116,7 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
 
   async function onReject() {
     try {
-      await rejectMutation.mutateAsync(rejectReason);
+      await rejectMutation.mutateAsync({ reason: rejectReason, roomNote });
       setRejectOpen(false);
       setRejectReason('');
     } catch {
@@ -248,7 +250,12 @@ export function QuizDetailView({ quizId, role }: QuizDetailViewProps) {
           }
           padding="dense"
         >
-          <QuizRoomConflictPanel quiz={quiz} canSwap={role === 'ADMIN' && quiz.status === 'SUBMITTED'} />
+          <QuizRoomConflictPanel
+            quiz={quiz}
+            canSwap={role === 'ADMIN' && quiz.status === 'SUBMITTED'}
+            note={roomNote}
+            onNoteChange={setRoomNote}
+          />
         </Card>
       )}
 

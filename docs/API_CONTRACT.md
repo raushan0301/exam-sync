@@ -76,8 +76,8 @@ REST, JSON, `/api/v1` prefix, bearer JWT auth. This is a **contract**, not an im
 | POST | `/quizzes` | FACULTY | `{title, subject_id, batch_ids[], duration_minutes, total_marks, question_count, instructions, quiz_type, preferred_date, preferred_time, academic_year, semester}` | `201`, status=DRAFT | `403` not assigned (BR-010) |
 | PATCH | `/quizzes/{id}` | FACULTY (owner/co-instructor) | partial; requires `If-Match: version` | `200` | `409` version mismatch |
 | POST | `/quizzes/{id}/submit` | FACULTY (owner) | — | status→SUBMITTED | `422` incomplete, `403` reauthorization fails |
-| POST | `/quizzes/{id}/approve` | ADMIN | — | status→APPROVED | `403` if actor is the creator (BR-014), `409` version mismatch (EC-047) |
-| POST | `/quizzes/{id}/reject` | ADMIN | `{reason}` | status→REJECTED | `422` missing reason (BR-003/BR-012) |
+| POST | `/quizzes/{id}/approve` | ADMIN | optional `{room_note}` — saved with the decision as the room note the faculty sees | status→APPROVED | `403` if actor is the creator (BR-014), `409` version mismatch (EC-047) |
+| POST | `/quizzes/{id}/reject` | ADMIN | `{reason, room_note?}` | status→REJECTED | `422` missing reason (BR-003/BR-012) |
 | GET | `/quizzes` | scoped by role | filters: `status, subject_id, faculty_id` | paginated | — |
 | GET | `/quizzes/{id}/approval-history` | ADMIN, owning FACULTY | — | full append-only list | — |
 
@@ -134,6 +134,8 @@ Two strategies are returned (`FEWEST_ROOMS`, `BALANCED_SPREAD`; `SEQUENTIAL` is 
 ## Room Holds (seat-based, from quiz approval)
 
 Approving a quiz (`POST /quizzes/{id}/approve`) **holds the seats** of its requested rooms for its date and time (`room_holds`): the quiz's student count is split across the requested rooms in proportion to their free seats, and — when `backup_locked` — the backup room is held for the biggest main share. Holds count **seats, not whole rooms**, so several quizzes meant for one combined exam can hold the same room as long as the seats fit. Approval is refused with `409` (and rolled back) when a room is unusable or the seats are already held by other quizzes. Holds are checked under a row lock on the rooms.
+
+**Shared rooms are shown, not hidden.** Because holds count seats, a room another approved quiz already holds seats in is still offered, with the other quiz named: `sharedWith: [{ quizId, quizTitle, seats }]` on each room of `GET /quizzes/{id}/rooms/suggest` and `/exam-sessions/{id}/rooms/suggest` (`capacity` there is already the seats left), and on each row of `GET /quizzes/{id}/rooms/conflicts` and `/exam-sessions/{id}/rooms/preview` (the quiz being reviewed is left out). `GET /rooms/availability?date=` adds ranges with `source: 'SEAT_HOLD'`, `seats_held` and `quiz_titles` (holds with the same room and time are merged); they lapse by themselves once their window has passed.
 
 - `POST /quizzes/{id}/rooms/request` and `POST /exam-sessions/{id}/rooms/request` accept `backup_locked` (quiz only) and `empty_columns` (the "leave every second seat column empty?" answer; sizes rooms by usable seats and becomes the session's seating default).
 - Suggestions and allocation treat seats held by *other* quizzes as unavailable.
@@ -204,6 +206,8 @@ Notifications: `ROOM_REQUEST_SUBMITTED` (every admin), `ROOM_REQUEST_APPROVED` /
 |---|---|---|---|
 | GET | `/me/notifications` | self | paginated, own inbox only |
 | PATCH | `/me/notifications/{id}/read` | self | — |
+| GET | `/me/nav-counts` | self | sidebar badge numbers, `{ counts: { <key>: n } }`, shaped by role. ADMIN: `quizzes.approval`, `suspension-requests`, `room-requests`, `incidents` (open), `notifications` (unread). FACULTY: `my-quizzes` (rejected), `assignments`, `invigilation-duties`, `incidents` (new outcomes), `notifications`. STUDENT: `notifications`. `assignments`, `invigilation-duties` and `incidents` mean "new since you last opened the page" |
+| POST | `/me/nav-seen` | self | `{ key: 'assignments' \| 'invigilation-duties' \| 'incidents' }` → 204; clears that "new" badge. 400 for any other key |
 
 ## Reports
 

@@ -26,7 +26,7 @@ function buildPrismaMock() {
     quizStudentAssignment: { groupBy: jest.fn() },
     room: { findMany: jest.fn() },
     quiz: { update: jest.fn().mockImplementation((args: any) => Promise.resolve({ id: args.where.id, ...args.data })) },
-    examSessionQuiz: { findMany: jest.fn(), findFirst: jest.fn() },
+    examSessionQuiz: { findMany: jest.fn().mockResolvedValue([]), findFirst: jest.fn() },
     examSessionRoomRequest: { findFirst: jest.fn().mockResolvedValue(null) },
     $transaction: jest.fn((cb: any) => cb(tx)),
     __tx: tx,
@@ -61,7 +61,7 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
   let examSessionOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
   let quizzesService: { findById: jest.Mock };
   let quizOwnershipService: { isOwnerOrCoInstructor: jest.Mock };
-  let roomHolds: { heldSeatsByRoom: jest.Mock; consumeForQuizzes: jest.Mock; roomIssues: jest.Mock };
+  let roomHolds: { heldSeatsByRoom: jest.Mock; sharedHoldsByRoom: jest.Mock; consumeForQuizzes: jest.Mock; roomIssues: jest.Mock };
   let notificationsOutbox: { queue: jest.Mock };
   let service: RoomAllocationService;
 
@@ -79,6 +79,7 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
     quizOwnershipService = { isOwnerOrCoInstructor: jest.fn().mockResolvedValue(true) };
     roomHolds = {
       heldSeatsByRoom: jest.fn().mockResolvedValue(new Map()),
+      sharedHoldsByRoom: jest.fn().mockResolvedValue(new Map()),
       consumeForQuizzes: jest.fn(),
       roomIssues: jest.fn().mockResolvedValue([]),
     };
@@ -793,6 +794,27 @@ describe('RoomAllocationService — Phase 12 (Best-Fit Decreasing, BR-018/021/02
       quizOwnershipService.isOwnerOrCoInstructor.mockResolvedValue(false);
 
       await expect(service.getQuizRoomConflicts('q1', { id: 'faculty-1', email: 'f@x.com', roles: ['FACULTY'], mustChangePassword: false })).rejects.toThrow(NotFoundException);
+    });
+
+    it('says which other quiz already holds seats in a requested room, leaving this quiz out of it', async () => {
+      quizzesService.findById.mockResolvedValue({
+        id: 'q1',
+        requestedRoomIds: ['room-1'],
+        backupRoomId: null,
+        roomAllocationStrategy: 'FEWEST_ROOMS',
+        preferredDate: new Date('2026-05-01T00:00:00Z'),
+        preferredTime: new Date('1970-01-01T10:00:00Z'),
+        durationMinutes: 60,
+      });
+      prisma.room.findMany.mockResolvedValue([{ id: 'room-1', building: 'A', floor: 1, roomNumber: '101', capacity: 30 }]);
+      roomsService.findAvailable.mockResolvedValue([]);
+      roomHolds.sharedHoldsByRoom.mockResolvedValue(new Map([['room-1', [{ quizId: 'q2', quizTitle: 'Quiz C', seats: 3 }]]]));
+
+      const result = await service.getQuizRoomConflicts('q1', admin);
+
+      expect(result.requestedRooms[0].available).toBe(true);
+      expect(result.requestedRooms[0].sharedWith).toEqual([{ quizId: 'q2', quizTitle: 'Quiz C', seats: 3 }]);
+      expect(roomHolds.sharedHoldsByRoom).toHaveBeenCalledWith(expect.anything(), ['room-1'], expect.anything(), ['q1']);
     });
 
     it('ADMIN sees it unscoped', async () => {

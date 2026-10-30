@@ -576,6 +576,32 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       );
     });
 
+    it('saves the admin\'s room note in the same update as the approval, so the faculty sees it', async () => {
+      prisma.quiz.findUnique.mockResolvedValue(submittedQuiz);
+      facultyService.findByUserId.mockResolvedValue(null);
+      prisma.__tx.quiz.update.mockResolvedValue({ ...submittedQuiz, status: QuizStatus.APPROVED, version: 6 });
+
+      await service.approve('q1', 5, adminActor, '  Backup room removed — double-booked.  ');
+
+      expect(prisma.__tx.quiz.update).toHaveBeenCalledWith({
+        where: { id: 'q1' },
+        data: { status: QuizStatus.APPROVED, version: { increment: 1 }, roomAdjustmentNote: 'Backup room removed — double-booked.' },
+      });
+    });
+
+    it('leaves the existing room note alone when approving without one', async () => {
+      prisma.quiz.findUnique.mockResolvedValue(submittedQuiz);
+      facultyService.findByUserId.mockResolvedValue(null);
+      prisma.__tx.quiz.update.mockResolvedValue({ ...submittedQuiz, status: QuizStatus.APPROVED, version: 6 });
+
+      await service.approve('q1', 5, adminActor, '   ');
+
+      expect(prisma.__tx.quiz.update).toHaveBeenCalledWith({
+        where: { id: 'q1' },
+        data: { status: QuizStatus.APPROVED, version: { increment: 1 } },
+      });
+    });
+
     it('holds the requested rooms\' seats in the SAME transaction as the approval', async () => {
       prisma.quiz.findUnique.mockResolvedValue(submittedQuiz);
       facultyService.findByUserId.mockResolvedValue(null);
@@ -640,6 +666,19 @@ describe('QuizzesService — DRAFT/SUBMITTED/APPROVED/REJECTED lifecycle (Phase 
       await expect(
         service.reject('q1', { reason: 'Self-review attempt' }, adminActor),
       ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('saves the admin\'s room note together with the rejection', async () => {
+      prisma.quiz.findUnique.mockResolvedValue(submittedQuiz);
+      facultyService.findByUserId.mockResolvedValue(null);
+      prisma.__tx.quiz.update.mockResolvedValue({ ...submittedQuiz, status: QuizStatus.REJECTED, version: 6 });
+
+      await service.reject('q1', { reason: 'Insufficient questions', room_note: 'Pick another backup room.' }, adminActor);
+
+      expect(prisma.__tx.quiz.update).toHaveBeenCalledWith({
+        where: { id: 'q1' },
+        data: { status: QuizStatus.REJECTED, version: { increment: 1 }, roomAdjustmentNote: 'Pick another backup room.' },
+      });
     });
 
     it('rejects with a reason, records a REJECTED history row (with the reason), queues a notification, and audits it', async () => {

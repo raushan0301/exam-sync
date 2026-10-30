@@ -5,7 +5,7 @@ import { AuthenticatedUser } from '../../common/auth/auth.types';
 import { ExamSessionsService, ExamSessionOwnershipService } from '../exam-session';
 import { ConflictEngineService } from '../conflict-engine';
 import { RoomsService } from '../rooms';
-import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
+import { RoomHoldsService, SharedHold } from '../../common/room-holds/room-holds.service';
 import { fewestRoomsPlan, PoolRoom, RoomPlan, spreadEvenly, togetherPlan } from './room-suggestion-planner';
 import { QuizzesService, QuizOwnershipService } from '../quiz';
 
@@ -22,6 +22,8 @@ export interface SuggestedRoom {
   roomNumber: string;
   capacity: number;
   allocated: number;
+  /** Other approved quizzes already holding seats here at that time; `capacity` already leaves them out. */
+  sharedWith?: SharedHold[];
 }
 
 export interface RoomSuggestionResult {
@@ -59,6 +61,7 @@ export interface AvailableRoomOption {
   floor: number;
   roomNumber: string;
   capacity: number;
+  sharedWith?: SharedHold[];
 }
 
 export interface RoomSuggestionResponse {
@@ -225,13 +228,28 @@ export class RoomSuggestionService {
       .sort((a, b) => a.building.localeCompare(b.building) || a.floor - b.floor || a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true }))
       .map((r) => ({ roomId: r.roomId, building: r.building, floor: r.floor, roomNumber: r.roomNumber, capacity: r.capacity }));
 
+    // Say which rooms are shared with another approved quiz at this time (their seats are already left out of `capacity`).
+    const shared = await this.roomHolds.sharedHoldsByRoom(
+      this.prisma,
+      pool.map((r) => r.roomId),
+      { date: sessionDate, start: startTime, end: endTime },
+      ownQuizIds,
+    );
+    const withShared = <T extends { roomId: string }>(room: T): T =>
+      shared.has(room.roomId) ? { ...room, sharedWith: shared.get(room.roomId) } : room;
+    const strategies = [this.fewestRooms(pool, totalStudents), this.balancedSpread(pool, totalStudents)].map((strategy) => ({
+      ...strategy,
+      rooms: strategy.rooms.map(withShared),
+      alternative: strategy.alternative && { ...strategy.alternative, rooms: strategy.alternative.rooms.map(withShared) },
+    }));
+
     return {
       totalStudents,
       emptyColumns,
       shortfall,
       availableRoomCount: pool.length,
-      strategies: [this.fewestRooms(pool, totalStudents), this.balancedSpread(pool, totalStudents)],
-      allRooms,
+      strategies,
+      allRooms: allRooms.map(withShared),
     };
   }
 

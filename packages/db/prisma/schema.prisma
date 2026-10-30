@@ -91,6 +91,7 @@ model User {
   requestedReportJobs        ReportJob[]
   reviewedSuspensionRequests ExamSessionSuspensionRequest[] @relation("SuspensionReviewedBy")
   reviewedRoomRequests       ExamSessionRoomRequest[]       @relation("RoomRequestReviewedBy")
+  navSeen                    UserNavSeen[]
   auditLogEntries            AuditLog[]
 
   @@map("users")
@@ -1835,4 +1836,18 @@ model ExamSessionRoomStudent {
   @@id([examSessionRoomId, quizId, studentId])
   @@index([studentId])
   @@map("exam_session_room_students")
+}
+
+/// When a user last opened a sidebar page that shows a "new since you last
+/// looked" badge (faculty assignments, invigilation duties, ...). One row per
+/// (user, key); the badge counts rows created after `seenAt`.
+model UserNavSeen {
+  userId String   @map("user_id") @db.Uuid
+  key    String
+  seenAt DateTime @default(now()) @map("seen_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, key])
+  @@map("user_nav_seen")
 }

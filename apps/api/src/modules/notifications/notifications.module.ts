@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsService } from './notifications.service';
+import { NavCountsService } from './nav-counts.service';
 
 /**
  * NotificationsModule — real implementation (Phase 15,
@@ -15,6 +16,6 @@ import { NotificationsService } from './notifications.service';
  */
 @Module({
   controllers: [NotificationsController],
-  providers: [NotificationsService],
+  providers: [NotificationsService, NavCountsService],
 })
 export class NotificationsModule {}

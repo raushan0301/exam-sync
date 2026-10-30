@@ -10,6 +10,7 @@ import {
   toPaginatedResult,
 } from '../../common/pagination/paginate';
 import { ImportJobsService } from '../../common/import-jobs/import-jobs.service';
+import { RoomHoldsService } from '../../common/room-holds/room-holds.service';
 import { ImportRowResult } from '../../common/import-jobs/import-jobs.types';
 import { parseExcelBuffer } from '../../common/bulk-import/parse-excel';
 import { generateExcelTemplate } from '../../common/bulk-import/generate-template';
@@ -53,6 +54,7 @@ export class RoomsService {
     private readonly prisma: PrismaService,
     private readonly auditHook: AuditHookService,
     private readonly importJobsService: ImportJobsService,
+    private readonly roomHolds: RoomHoldsService,
   ) { }
 
   /**
@@ -328,10 +330,13 @@ export class RoomsService {
       bookedRanges: Array<{
         start_time: string;
         end_time: string;
-        source: 'EXAM_SESSION' | 'AVAILABILITY_BLOCK';
+        source: 'EXAM_SESSION' | 'AVAILABILITY_BLOCK' | 'SEAT_HOLD';
         exam_session_id?: string;
         exam_session_name?: string;
         reason?: string | null;
+        /** SEAT_HOLD only: seats held by approved quizzes (not yet allocated to an exam session) and which quizzes. */
+        seats_held?: number;
+        quiz_titles?: string[];
       }>;
     }>
   > {
@@ -347,7 +352,7 @@ export class RoomsService {
 
     const roomIds = rooms.map((r) => r.id);
 
-    const [sessionBookings, availabilityBlocks] = await Promise.all([
+    const [sessionBookings, availabilityBlocks, seatHolds] = await Promise.all([
       this.prisma.examSessionRoom.findMany({
         where: { roomId: { in: roomIds }, sessionDate: day },
         include: { examSession: { select: { id: true, name: true } } },
@@ -355,6 +360,7 @@ export class RoomsService {
       this.prisma.roomAvailability.findMany({
         where: { roomId: { in: roomIds }, date: day },
       }),
+      this.roomHolds.runningHoldsOnDay(this.prisma, roomIds, day),
     ]);
 
     const timeLabel = (t: Date): string => t.toISOString().slice(11, 16);
@@ -378,6 +384,16 @@ export class RoomsService {
             end_time: timeLabel(b.endTime),
             source: 'AVAILABILITY_BLOCK' as const,
             reason: b.reason,
+          })),
+        // Seats an approved quiz keeps free for this slot: the room is shared, not full.
+        ...seatHolds
+          .filter((h) => h.roomId === room.id)
+          .map((h) => ({
+            start_time: timeLabel(h.start),
+            end_time: timeLabel(h.end),
+            source: 'SEAT_HOLD' as const,
+            seats_held: h.seats,
+            quiz_titles: h.quizTitles,
           })),
       ].sort((a, b) => a.start_time.localeCompare(b.start_time)),
     }));

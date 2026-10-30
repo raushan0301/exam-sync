@@ -11,7 +11,9 @@ import { IconButton } from '@/components/ui/IconButton';
 import { NotificationsBell } from '@/components/shell/NotificationsBell';
 import { useIdentity } from '@/lib/identity/IdentityProvider';
 import { useLogout } from '@/lib/mutations/useLogout';
-import { isNavGroup, type NavEntry } from '@/lib/navigation';
+import { useMarkNavSeen } from '@/lib/mutations/useMarkNavSeen';
+import { useNavCounts } from '@/lib/queries/useNavCounts';
+import { isNavGroup, type NavEntry, type NavLeaf } from '@/lib/navigation';
 
 export interface AppShellProps {
   nav: NavEntry[];
@@ -21,9 +23,43 @@ export interface AppShellProps {
   children: ReactNode;
 }
 
-function NavLink({ item, onNavigate }: { item: { label: string; href?: string }; onNavigate?: () => void }) {
+/** Small red count pill; renders nothing for 0 / unknown so quiet items stay clean. */
+function CountBadge({ count, label }: { count: number; label: string }) {
+  if (count <= 0) return null;
+  return (
+    <span
+      role="status"
+      aria-label={`${count} ${label}`}
+      className="ml-auto flex h-4 min-w-[16px] items-center justify-center rounded-full bg-danger-text px-1 text-[10px] font-semibold leading-none text-white"
+    >
+      {count > 99 ? '99+' : count}
+    </span>
+  );
+}
+
+function badgeLabel(item: NavLeaf): string {
+  return item.seenKey ? `new in ${item.label}` : `waiting in ${item.label}`;
+}
+
+/**
+ * Opening a "new since you looked" page clears its badge. Also fires when new
+ * rows arrive while the page is already open, so the badge never lingers on
+ * the page you are looking at.
+ */
+function useClearBadgeWhenOpen(item: NavLeaf, active: boolean, count: number) {
+  const markSeen = useMarkNavSeen();
+  const mutate = markSeen.mutate;
+  useEffect(() => {
+    if (active && item.seenKey && count > 0) mutate(item.seenKey);
+  }, [active, item.seenKey, count, mutate]);
+}
+
+function NavLink({ item, onNavigate }: { item: NavLeaf; onNavigate?: () => void }) {
   const pathname = usePathname();
   const active = !!item.href && pathname?.startsWith(item.href);
+  const { data: counts } = useNavCounts();
+  const count = item.badgeKey ? (counts?.[item.badgeKey] ?? 0) : 0;
+  useClearBadgeWhenOpen(item, active, count);
 
   if (!item.href) {
     return (
@@ -43,11 +79,12 @@ function NavLink({ item, onNavigate }: { item: { label: string; href?: string };
       onClick={onNavigate}
       aria-current={active ? 'page' : undefined}
       className={cn(
-        'flex min-h-[44px] items-center rounded-md px-3 py-2 text-sm transition-colors duration-150 ease focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500',
+        'flex min-h-[44px] items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors duration-150 ease focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500',
         active ? 'bg-primary-50 font-medium text-primary-700' : 'text-text hover:bg-neutral-100',
       )}
     >
       {item.label}
+      <CountBadge count={count} label={badgeLabel(item)} />
     </Link>
   );
 }
@@ -66,8 +103,10 @@ function NavTree({ nav, onNavigate }: { nav: NavEntry[]; collapsed?: boolean; on
   );
 }
 
-function NavGroupItem({ entry, onNavigate }: { entry: { label: string; items: { label: string; href?: string }[] }; onNavigate?: () => void }) {
+function NavGroupItem({ entry, onNavigate }: { entry: { label: string; items: NavLeaf[] }; onNavigate?: () => void }) {
   const pathname = usePathname();
+  const { data: counts } = useNavCounts();
+  const groupTotal = entry.items.reduce((sum, i) => sum + (i.badgeKey ? (counts?.[i.badgeKey] ?? 0) : 0), 0);
   const containsActive = entry.items.some((i) => i.href && pathname?.startsWith(i.href));
   const [open, setOpen] = useState(containsActive);
   // `containsActive` is recomputed every render from `pathname`, but the
@@ -94,7 +133,11 @@ function NavGroupItem({ entry, onNavigate }: { entry: { label: string; items: { 
         className="flex min-h-[44px] w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm font-medium text-text hover:bg-neutral-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500"
         aria-expanded={open}
       >
-        {entry.label}
+        <span className="flex flex-1 items-center gap-2">
+          {entry.label}
+          {/* Children already show their own numbers when open; the total is for the closed group. */}
+          {!open && <CountBadge count={groupTotal} label={`waiting in ${entry.label}`} />}
+        </span>
         {open ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}
       </button>
       {open && (
@@ -194,6 +237,35 @@ function TopBar({
   );
 }
 
+function BottomBarLink({ entry }: { entry: NavLeaf }) {
+  const pathname = usePathname();
+  const active = !!entry.href && pathname?.startsWith(entry.href);
+  const { data: counts } = useNavCounts();
+  const count = entry.badgeKey ? (counts?.[entry.badgeKey] ?? 0) : 0;
+  useClearBadgeWhenOpen(entry, active, count);
+  return (
+    <Link
+      href={entry.href ?? '#'}
+      aria-disabled={!entry.href}
+      className={cn(
+        'flex min-h-[44px] flex-1 items-center justify-center gap-1 px-1 text-center text-xs',
+        entry.href ? 'text-text' : 'pointer-events-none text-text-subtle opacity-60',
+      )}
+    >
+      {entry.label}
+      {count > 0 && (
+        <span
+          role="status"
+          aria-label={`${count} ${badgeLabel(entry)}`}
+          className="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-danger-text px-1 text-[10px] font-semibold leading-none text-white"
+        >
+          {count > 99 ? '99+' : count}
+        </span>
+      )}
+    </Link>
+  );
+}
+
 const SIDEBAR_EXPANDED_WIDTH = 240;
 const SIDEBAR_COLLAPSED_WIDTH = 64;
 
@@ -265,21 +337,7 @@ export function AppShell({ nav, hasSidebar, sidebarStorageKey = 'exam_sync_sideb
           aria-label="Primary"
           className="flex shrink-0 items-center justify-around border-t border-border bg-surface py-1 md:hidden"
         >
-          {nav.map((entry) =>
-            isNavGroup(entry) ? null : (
-              <Link
-                key={entry.label}
-                href={entry.href ?? '#'}
-                aria-disabled={!entry.href}
-                className={cn(
-                  'flex min-h-[44px] flex-1 items-center justify-center px-1 text-center text-xs',
-                  entry.href ? 'text-text' : 'pointer-events-none text-text-subtle opacity-60',
-                )}
-              >
-                {entry.label}
-              </Link>
-            ),
-          )}
+          {nav.map((entry) => (isNavGroup(entry) ? null : <BottomBarLink key={entry.label} entry={entry} />))}
         </nav>
       )}
     </div>

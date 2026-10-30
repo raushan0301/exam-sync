@@ -34,6 +34,13 @@ export interface QuizForHold {
   emptyColumnsPlanned: boolean | null;
 }
 
+/** Another quiz's seats held in a room for an overlapping time — the room is shared, not full. */
+export interface SharedHold {
+  quizId: string;
+  quizTitle: string;
+  seats: number;
+}
+
 export interface RoomIssue {
   roomId: string;
   message: string;
@@ -123,6 +130,64 @@ export class RoomHoldsService {
     });
     for (const row of rows) held.set(row.roomId, (held.get(row.roomId) ?? 0) + row.seatsHeld);
     return held;
+  }
+
+  /** Running holds on one day for the timeline: per room and time window, the seats held and by which quizzes. */
+  async runningHoldsOnDay(
+    client: Client,
+    roomIds: string[],
+    day: Date,
+  ): Promise<{ roomId: string; start: Date; end: Date; seats: number; quizTitles: string[] }[]> {
+    if (roomIds.length === 0) return [];
+    const rows = await client.roomHold.findMany({
+      where: { AND: [this.stillRunning(), { roomId: { in: roomIds }, holdDate: day }] },
+      select: { roomId: true, startTime: true, endTime: true, seatsHeld: true, quiz: { select: { title: true } } },
+      orderBy: { createdAt: 'asc' },
+    });
+    const merged = new Map<string, { roomId: string; start: Date; end: Date; seats: number; quizTitles: string[] }>();
+    for (const row of rows) {
+      const key = `${row.roomId}|${row.startTime.getTime()}|${row.endTime.getTime()}`;
+      const entry = merged.get(key) ?? { roomId: row.roomId, start: row.startTime, end: row.endTime, seats: 0, quizTitles: [] };
+      entry.seats += row.seatsHeld;
+      if (!entry.quizTitles.includes(row.quiz.title)) entry.quizTitles.push(row.quiz.title);
+      merged.set(key, entry);
+    }
+    return [...merged.values()];
+  }
+
+  /** Who else holds seats in each room for an overlapping window (one entry per quiz), so the screens can say the room is shared. */
+  async sharedHoldsByRoom(
+    client: Client,
+    roomIds: string[],
+    window: HoldWindow,
+    excludeQuizIds: string[] = [],
+  ): Promise<Map<string, SharedHold[]>> {
+    const shared = new Map<string, SharedHold[]>();
+    if (roomIds.length === 0) return shared;
+    const rows = await client.roomHold.findMany({
+      where: {
+        AND: [
+          this.stillRunning(),
+          {
+            roomId: { in: roomIds },
+            holdDate: window.date,
+            startTime: { lt: window.end },
+            endTime: { gt: window.start },
+            quizId: { notIn: excludeQuizIds },
+          },
+        ],
+      },
+      select: { roomId: true, quizId: true, seatsHeld: true, quiz: { select: { title: true } } },
+      orderBy: { createdAt: 'asc' },
+    });
+    for (const row of rows) {
+      const list = shared.get(row.roomId) ?? [];
+      const existing = list.find((h) => h.quizId === row.quizId);
+      if (existing) existing.seats += row.seatsHeld;
+      else list.push({ quizId: row.quizId, quizTitle: row.quiz.title, seats: row.seatsHeld });
+      shared.set(row.roomId, list);
+    }
+    return shared;
   }
 
   /** Problems that make a room unusable in the window (not active, blocked, or already allocated to another session). */

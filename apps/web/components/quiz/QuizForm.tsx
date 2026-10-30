@@ -193,7 +193,7 @@ export function QuizForm({ form, onSubmit, submitLabel, submitting, rootError, a
 
         <div className="grid grid-cols-2 gap-4">
           <FormField<QuizFormValues> name="academic_year" label="Academic Year" required>
-            {(field) => <Input {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} placeholder="2025-26" />}
+            {(field) => <Input {...field} value={(field.value as string) ?? ''} onChange={(e) => field.onChange(e.target.value)} placeholder="2025-2026" />}
           </FormField>
           <FormField<QuizFormValues> name="semester" label="Semester" required>
             {(field) => (

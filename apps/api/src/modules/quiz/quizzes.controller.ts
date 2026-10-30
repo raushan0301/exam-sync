@@ -14,6 +14,7 @@ import { QuizzesService } from './quizzes.service';
 import { CreateQuizDto } from './dto/create-quiz.dto';
 import { UpdateQuizDto } from './dto/update-quiz.dto';
 import { RejectQuizDto } from './dto/reject-quiz.dto';
+import { ApproveQuizDto } from './dto/approve-quiz.dto';
 import { Roles } from '../../common/auth/roles.decorator';
 import { CurrentUser } from '../../common/auth/current-user.decorator';
 import { AuthenticatedUser, ROLE } from '../../common/auth/auth.types';
@@ -115,11 +116,12 @@ export class QuizzesController {
     @Param('id') id: string,
     @Headers('if-match') ifMatch: string | undefined,
     @CurrentUser() actor: AuthenticatedUser,
+    @Body() dto: ApproveQuizDto = {},
   ) {
     if (ifMatch === undefined || ifMatch === '' || Number.isNaN(Number(ifMatch))) {
       throw new BadRequestException('An "If-Match" header carrying the current version is required.');
     }
-    return this.quizzesService.approve(id, Number(ifMatch), actor);
+    return this.quizzesService.approve(id, Number(ifMatch), actor, dto?.room_note);
   }
 
   @Roles(ROLE.ADMIN)

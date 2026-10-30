@@ -39,7 +39,7 @@ describe('RoomsService — Phase 11 (rooms, seats, availability calendar)', () =
     prisma = buildPrismaMock();
     auditHook = { record: jest.fn() };
     importJobsService = { create: jest.fn().mockResolvedValue({ id: 'job-1' }) };
-    service = new RoomsService(prisma, auditHook as unknown as AuditHookService, importJobsService as any);
+    service = new RoomsService(prisma, auditHook as unknown as AuditHookService, importJobsService as any, { runningHoldsOnDay: jest.fn().mockResolvedValue([]) } as any);
   });
 
   describe('create — seat map generation from rows×columns', () => {
@@ -394,6 +394,25 @@ describe('RoomsService — Phase 11 (rooms, seats, availability calendar)', () =
           results: [expect.objectContaining({ row: 2, status: 'FAILURE', error: expect.stringContaining('already exists') })],
         }),
       );
+    });
+  });
+
+  describe('getAvailabilityCalendar — held seats', () => {
+    it('adds a SEAT_HOLD range, with the seats and quiz titles, beside the booked and blocked ranges', async () => {
+      const room = { id: 'room-1', building: 'B', roomNumber: '107', capacity: 42 };
+      prisma.room.findMany.mockResolvedValue([room]);
+      prisma.examSessionRoom = { findMany: jest.fn().mockResolvedValue([]) };
+      prisma.roomAvailability.findMany.mockResolvedValue([]);
+      const holds = { runningHoldsOnDay: jest.fn().mockResolvedValue([
+        { roomId: 'room-1', start: new Date('1970-01-01T09:30:00Z'), end: new Date('1970-01-01T11:00:00Z'), seats: 5, quizTitles: ['Quiz C'] },
+      ]) };
+      service = new RoomsService(prisma, auditHook as unknown as AuditHookService, importJobsService as any, holds as any);
+
+      const [entry] = await service.getAvailabilityCalendar('2026-10-12');
+
+      expect(entry.bookedRanges).toEqual([
+        { start_time: '09:30', end_time: '11:00', source: 'SEAT_HOLD', seats_held: 5, quiz_titles: ['Quiz C'] },
+      ]);
     });
   });
 });

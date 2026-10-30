@@ -98,16 +98,21 @@ export function RoomAvailabilityCalendar({ date, highlightRange, roomId, roomIds
               {bookedRanges.map((range: RoomBookedRange, i: number) => {
                 const left = pct(toMinutes(range.start_time));
                 const width = Math.max(pct(toMinutes(range.end_time)) - left, 1);
+                const when = formatTimeRange(range.start_time, range.end_time);
                 const label =
                   range.source === 'EXAM_SESSION'
-                    ? `Booked: ${range.exam_session_name ?? 'Exam session'} (${formatTimeRange(range.start_time, range.end_time)})`
-                    : `Unavailable: ${range.reason ?? 'Maintenance block'} (${formatTimeRange(range.start_time, range.end_time)})`;
+                    ? `Booked: ${range.exam_session_name ?? 'Exam session'} (${when})`
+                    : range.source === 'SEAT_HOLD'
+                      ? `Seats held: ${range.seats_held ?? 0} seat${range.seats_held === 1 ? '' : 's'} by ${(range.quiz_titles ?? []).join(', ') || 'an approved quiz'} (${when}) — the room is shared, not full`
+                      : `Unavailable: ${range.reason ?? 'Maintenance block'} (${when})`;
                 return (
                   <div
                     key={i}
                     className={cn(
                       'absolute inset-y-0.5 rounded-sm',
-                      range.source === 'EXAM_SESSION' ? 'bg-danger-bg' : 'bg-warning-bg',
+                      range.source === 'EXAM_SESSION' && 'bg-danger-bg',
+                      range.source === 'AVAILABILITY_BLOCK' && 'bg-warning-bg',
+                      range.source === 'SEAT_HOLD' && 'border border-dashed border-primary-500 bg-primary-50',
                     )}
                     style={{ left: `${left}%`, width: `${width}%` }}
                     title={label}
@@ -125,6 +130,9 @@ export function RoomAvailabilityCalendar({ date, highlightRange, roomId, roomIds
         </span>
         <span className="flex items-center gap-1">
           <span className="h-2.5 w-2.5 rounded-sm bg-warning-bg" aria-hidden="true" /> Unavailable (maintenance block)
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="h-2.5 w-2.5 rounded-sm border border-dashed border-primary-500 bg-primary-50" aria-hidden="true" /> Seats held by an approved quiz (room still shared)
         </span>
         {highlightRange && (
           <span className="flex items-center gap-1">

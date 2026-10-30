@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { Card, Button, Alert, Checkbox, SkeletonText, ErrorState, Textarea, Modal } from '@/components/ui';
+import { SharedRoomNote } from '@/components/rooms/SharedRoomNote';
 import { useRoomAvailabilityPreview } from '@/lib/queries/useRoomAvailabilityPreview';
 import { useAllocateRooms, useRejectRoomRequest } from '@/lib/mutations/useRoomAllocationMutations';
 import { mapError } from '@/lib/error-mapping';
@@ -105,6 +106,7 @@ export function RoomApprovalPanel({ session }: RoomApprovalPanelProps) {
                 {r.available ? 'Available' : 'Unavailable'}
               </span>
             </div>
+            <SharedRoomNote sharedWith={r.sharedWith} className="pl-7 text-xs text-info-text" />
             {!r.available && (
               <div className="pl-7 text-xs text-text-muted">
                 <p>{r.reason}</p>

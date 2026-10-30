@@ -69,10 +69,11 @@ export function useSubmitQuiz(id: string) {
 export function useApproveQuiz(id: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (version: number) =>
+    mutationFn: ({ version, roomNote }: { version: number; roomNote?: string }) =>
       apiFetch<Quiz>(`/quizzes/${id}/approve`, {
         method: 'POST',
         headers: { 'If-Match': String(version) },
+        body: roomNote?.trim() ? { room_note: roomNote.trim() } : undefined,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['quizzes', 'list'] });
@@ -86,8 +87,11 @@ export function useApproveQuiz(id: string) {
 export function useRejectQuiz(id: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (reason: string) =>
-      apiFetch<Quiz>(`/quizzes/${id}/reject`, { method: 'POST', body: { reason } }),
+    mutationFn: ({ reason, roomNote }: { reason: string; roomNote?: string }) =>
+      apiFetch<Quiz>(`/quizzes/${id}/reject`, {
+        method: 'POST',
+        body: { reason, ...(roomNote?.trim() ? { room_note: roomNote.trim() } : {}) },
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['quizzes', 'list'] });
       queryClient.invalidateQueries({ queryKey: queryKeys.quiz(id) });
