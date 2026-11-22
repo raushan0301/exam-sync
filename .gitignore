@@ -1,11 +1,42 @@
+# ── Dependencies ──────────────────────────────────────────────────────────────
 node_modules/
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
 dist/
 build/
 .next/
+*.tsbuildinfo
+
+# ── Test / coverage ───────────────────────────────────────────────────────────
 coverage/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Environment / secrets — NEVER commit real credentials ─────────────────────
 .env
 .env.local
 .env.*.local
+.env.production
+.env.staging
+.env.development.local
+infra/docker/.env.production
+
+# ── OS / editor artefacts ─────────────────────────────────────────────────────
 .DS_Store
-*.tsbuildinfo
+Thumbs.db
+.idea/
+.vscode/settings.json
+
+# ── Prisma ────────────────────────────────────────────────────────────────────
+# Generated client is rebuilt on deploy — no need to commit
+packages/db/node_modules/
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.pem
+*.key
+*.p12
+*.pfx

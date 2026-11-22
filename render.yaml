@@ -1,0 +1,40 @@
+## Render Blueprint — Exam-Sync
+## Deploys: NestJS API (web service) + Redis (managed)
+## Docs: https://render.com/docs/blueprint-spec
+
+services:
+  # ── NestJS API ──────────────────────────────────────────────────────────────
+  - type: web
+    name: exam-sync-api
+    runtime: docker
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: .                        # monorepo root (npm ci runs here)
+    plan: free
+    region: singapore                      # closest free region to India
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: DATABASE_URL
+        sync: false                        # set manually in Render dashboard
+      - key: REDIS_URL
+        fromService:
+          name: exam-sync-redis
+          type: redis
+          property: connectionString
+      - key: JWT_ACCESS_SECRET
+        generateValue: true                # Render auto-generates a secure value
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false                        # set to your Vercel URL after deploy
+    healthCheckPath: /health
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  - type: redis
+    name: exam-sync-redis
+    plan: free
+    region: singapore
+    maxmemoryPolicy: noeviction
+
