@@ -8,6 +8,7 @@
     "apps/*"
   ],
   "scripts": {
+    "postinstall": "npm run prisma:generate --workspace=@exam-sync/db",
     "lint": "eslint \"apps/**/*.ts\" \"packages/**/*.ts\" \"workers/**/*.ts\" && npm run lint:boundaries",
     "lint:boundaries": "node scripts/check-module-boundaries.js",
     "typecheck": "npm run typecheck --workspaces --if-present",

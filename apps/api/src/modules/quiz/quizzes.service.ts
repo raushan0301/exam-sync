@@ -276,7 +276,7 @@ export class QuizzesService {
       scopeWhere = {
         OR: [
           { createdByFacultyId: actingFaculty.id },
-          ...coInstructorAssignments.map(({ subjectId, batchId }) => ({
+          ...coInstructorAssignments.map(({ subjectId, batchId }: { subjectId: string; batchId: string }) => ({
             subjectId,
             batches: { some: { batchId } },
           })),
